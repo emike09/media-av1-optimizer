@@ -1,18 +1,18 @@
 # media-av1-optimizer
 Automated AV1 encoding pipeline for video libraries with intelligent stream selection, HDR handling, and queue-based processing.
-# Plex AV1 Optimizer
+# Media AV1 Optimizer
 
-A queue-based, drag-and-drop AV1 encoding pipeline for Plex libraries.
+A queue-based, drag-and-drop AV1 encoding pipeline for video libraries.
 
-Built for high-quality archival compression using **SVT-AV1**, with intelligent stream selection, HDR handling, and safe batch processing.
+Built for high-quality archival compression using **SVT-AV1**, with intelligent stream selection, HDR handling, and safe batch processing. If you have large blu-ray libraries or big video files and want to compress them using the powerful AV1 codec, this script is for you. This script is optimized for the English language.
 
 ---
 
 ## 🚀 Features
 
 * 🎬 **AV1 (SVT-AV1) encoding**
-* ⚡ Fixed high-quality profile (**CRF 10**, preset 4)
-* 📦 **Massive space savings** (5–10x typical reduction)
+* ⚡ High-quality profile (**CRF 10**, preset 4)
+* 📦 **Massive space savings** (5–10x typical reduction) compared to H.265
 * 🧠 Intelligent stream selection:
 
   * Best English audio (TrueHD / DTS-HD / E-AC3 Atmos prioritized)
@@ -47,7 +47,7 @@ Built for high-quality archival compression using **SVT-AV1**, with intelligent 
 
 * Windows
 * PowerShell 7.0+ (tested on 7.6)
-* `ffmpeg` and `ffprobe`
+* `ffmpeg` and `ffprobe` version 8+
 
   * Either in PATH or placed next to the script
 
@@ -77,7 +77,7 @@ Drag video files onto:
 Drop_Encode_AV1.bat
 ```
 
-That’s it.
+That’s it. Files can be dropped into the queue at any time.
 
 ---
 
@@ -148,7 +148,6 @@ Includes:
 * 4K HDR remux (HEVC → AV1)
 * Dolby Vision (skipped)
 * AI-upscaled content (Topaz)
-* Web-DL sources
 * Multi-audio / multi-subtitle cluttered files
 
 ---
@@ -191,8 +190,8 @@ Ideas:
 
 * DV-safe workflows
 * SDR/HDR auto-detection improvements
-* GPU encoding modes
-* Linux/macOS support
+* GPU encoding modes (at this time, software encoding provides the best results)
+* Linux support
 
 ---
 
