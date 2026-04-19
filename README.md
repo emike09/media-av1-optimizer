@@ -7,6 +7,7 @@ A queue-based, drag-and-drop AV1 encoding pipeline for video libraries.
 Built for high-quality archival compression using **SVT-AV1**, with intelligent stream selection, HDR handling, and safe batch processing. If you have large blu-ray libraries or big video files and want to compress them using the powerful AV1 codec, this script is for you. This script is optimized for the English language.
 
 Speed on an RX 9950x3D w/PBO: 1.4x
+
 Highly recommend a 16+ core CPU
 
 ---
