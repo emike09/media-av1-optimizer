@@ -36,6 +36,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$ErrorView = 'NormalView'
 
 # =============================================================================
 # User-configurable settings
@@ -215,7 +216,7 @@ function Get-ExistingQueuedPaths {
         } catch {}
     }
 
-    return $paths
+    return ,$paths
 }
 
 # =============================================================================
@@ -235,6 +236,9 @@ function Add-QueueInputs {
     param([string[]]$Paths)
 
     $existing = Get-ExistingQueuedPaths
+	if ($null -eq $existing) {
+    $existing = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+}
 
     foreach ($p in $Paths) {
         if ([string]::IsNullOrWhiteSpace($p)) { continue }
@@ -279,19 +283,27 @@ function Add-QueueInputs {
 #
 # Requests format, stream, and chapter metadata at maximum JSON depth. The
 # -v error flag suppresses ffprobe's own progress output so only the JSON
-# payload reaches stdout. The --% stop-parsing token passes the input path
-# through without PowerShell re-interpreting any special characters in it.
+# payload reaches stdout. Arguments are passed as an explicit array so
+# PowerShell handles path quoting correctly for all characters in the path.
 # =============================================================================
 function Invoke-FfprobeJson {
     param([string]$InputPath)
 
-    $json = & $FfprobePath `
-        -v error `
-        -print_format json `
-        -show_format `
-        -show_streams `
-        -show_chapters `
-        --% "$InputPath"
+    # Pass arguments as an explicit array so PowerShell handles quoting
+    # for the path correctly. The --% stop-parsing token only works inline
+    # on the same logical line as the command; it does not survive backtick
+    # line continuations and would be passed to ffprobe as a literal string
+    # argument, causing an 'Invalid argument' error on the path.
+    $ffprobeArgs = @(
+        '-v',            'error',
+        '-print_format', 'json',
+        '-show_format',
+        '-show_streams',
+        '-show_chapters',
+        $InputPath
+    )
+
+    $json = & $FfprobePath @ffprobeArgs
 
     if (-not $json) {
         throw "ffprobe returned no output for: $InputPath"
@@ -319,16 +331,48 @@ function Invoke-FfprobeJson {
 # =============================================================================
 function Get-StreamLanguage {
     param($Stream)
-    $lang = $Stream.tags.language
+    # Guard against streams with no tags object, or a tags object with no
+    # language key. Set-StrictMode -Version Latest throws on missing properties
+    # rather than returning $null, so we must check for the tags object first.
+    if ($null -eq $Stream.tags) { return "" }
+    $lang = $Stream.tags.PSObject.Properties['language']?.Value
     if ([string]::IsNullOrWhiteSpace($lang)) { return "" }
     return $lang.ToLowerInvariant()
 }
 
 function Get-StreamTitle {
     param($Stream)
-    $title = $Stream.tags.title
+    # Same guard as Get-StreamLanguage -- tags may be absent entirely, or present
+    # but without a title key. Both cases must return an empty string silently.
+    if ($null -eq $Stream.tags) { return "" }
+    $title = $Stream.tags.PSObject.Properties['title']?.Value
     if ([string]::IsNullOrWhiteSpace($title)) { return "" }
     return $title
+}
+
+# =============================================================================
+# FUNCTION: Get-StreamProp
+#
+# Safely reads an optional top-level property from an ffprobe stream object.
+#
+# Set-StrictMode -Version Latest throws a terminating error when code accesses
+# a property that does not exist on a PSCustomObject, which is what
+# ConvertFrom-Json produces. Many ffprobe stream fields (bit_rate, channels,
+# codec_name, codec_tag_string, etc.) are simply absent from the JSON when
+# ffprobe has no value to report -- they are not present as null, they are
+# missing entirely. The null-coalescing operator (??) cannot help here because
+# the throw happens before ?? can evaluate.
+#
+# This helper uses PSObject.Properties to look up the key without triggering
+# strict mode, then returns $Default if the property is absent or null.
+# =============================================================================
+function Get-StreamProp {
+    param($Stream, [string]$Name, $Default = $null)
+    $prop = $Stream.PSObject.Properties[$Name]
+    if ($null -eq $prop) { return $Default }
+    $val = $prop.Value
+    if ($null -eq $val)  { return $Default }
+    return $val
 }
 
 function Test-IsEnglish {
@@ -356,9 +400,14 @@ function Test-IsForced {
     param($Stream)
     $title = (Get-StreamTitle -Stream $Stream).ToLowerInvariant()
     if ($title -match '\bforced\b') { return $true }
-    try {
-        if ($Stream.disposition.forced -eq 1) { return $true }
-    } catch {}
+    # disposition and its sub-keys may be absent on some stream types.
+    # Use Get-StreamProp to retrieve the disposition object safely, then
+    # access .forced via PSObject.Properties to avoid a second strict-mode throw.
+    $disp = Get-StreamProp $Stream 'disposition' $null
+    if ($null -ne $disp) {
+        $forced = $disp.PSObject.Properties['forced']?.Value
+        if ($forced -eq 1) { return $true }
+    }
     return $false
 }
 
@@ -381,9 +430,9 @@ function Test-IsForced {
 function Get-AudioRank {
     param($Stream)
 
-    $codec    = ($Stream.codec_name ?? "").ToLowerInvariant()
+    $codec    = (Get-StreamProp $Stream 'codec_name' '').ToLowerInvariant()
     $title    = (Get-StreamTitle -Stream $Stream).ToLowerInvariant()
-    $channels = [int]($Stream.channels ?? 0)
+    $channels = [int](Get-StreamProp $Stream 'channels' 0)
 
     if ($codec -eq 'truehd' -or $title -match 'atmos')                   { return 1000 + $channels }
     if ($codec -eq 'dts'    -and $title -match 'dts-hd ma|master audio') { return  900 + $channels }
@@ -407,7 +456,7 @@ function Get-AudioRank {
 # =============================================================================
 function Test-IsLossyAudio {
     param($Stream)
-    $codec = ($Stream.codec_name ?? "").ToLowerInvariant()
+    $codec = (Get-StreamProp $Stream 'codec_name' '').ToLowerInvariant()
     return $codec -in @('eac3', 'ac3', 'aac', 'dts', 'mp3', 'opus', 'vorbis')
 }
 
@@ -438,8 +487,12 @@ function Select-Streams {
     $streams = @($Probe.streams)
 
     $videoStreams = $streams | Where-Object {
-        $_.codec_type -eq 'video' -and
-        -not ($_.disposition.attached_pic -eq 1)
+        if ((Get-StreamProp $_ 'codec_type' '') -ne 'video') { return $false }
+        # Exclude cover-art streams. disposition may be absent; attached_pic
+        # defaults to 0 (not a cover) when the key is missing entirely.
+        $disp = Get-StreamProp $_ 'disposition' $null
+        $attachedPic = if ($null -ne $disp) { $disp.PSObject.Properties['attached_pic']?.Value } else { 0 }
+        -not ($attachedPic -eq 1)
     }
 
     if (-not $videoStreams) {
@@ -447,8 +500,8 @@ function Select-Streams {
     }
 
     $video          = $videoStreams | Select-Object -First 1
-    $audioStreams    = $streams | Where-Object { $_.codec_type -eq 'audio' }
-    $subtitleStreams = $streams | Where-Object { $_.codec_type -eq 'subtitle' }
+    $audioStreams    = $streams | Where-Object { (Get-StreamProp $_ 'codec_type' '') -eq 'audio' }
+    $subtitleStreams = $streams | Where-Object { (Get-StreamProp $_ 'codec_type' '') -eq 'subtitle' }
 
     $englishAudio = $audioStreams | Where-Object {
         (Test-IsEnglish $_) -and -not (Test-IsCommentary $_)
@@ -464,29 +517,29 @@ function Select-Streams {
 
     $mainAudio = $englishAudio |
         Sort-Object `
-            @{ Expression = { Get-AudioRank $_ };            Descending = $true },
-            @{ Expression = { [int]($_.channels  ?? 0) };   Descending = $true },
-            @{ Expression = { [int64]($_.bit_rate ?? 0) };  Descending = $true } |
+            @{ Expression = { Get-AudioRank $_ };                                    Descending = $true },
+            @{ Expression = { [int](Get-StreamProp $_ 'channels' 0) };              Descending = $true },
+            @{ Expression = { [int64](Get-StreamProp $_ 'bit_rate' 0) };            Descending = $true } |
         Select-Object -First 1
 
     $fallbackAudio = $null
     if ($KeepEnglishFallbackAudio) {
         # Only consider tracks with a different codec to main, so we don't end up
         # with two EAC3 tracks at different bitrates serving no practical purpose.
-        $mainCodec = ($mainAudio.codec_name ?? "").ToLowerInvariant()
+        $mainCodec = (Get-StreamProp $mainAudio 'codec_name' '').ToLowerInvariant()
 
         $fallbackCandidates = $englishAudio | Where-Object {
-            $_.index -ne $mainAudio.index -and
+            (Get-StreamProp $_ 'index' -1) -ne (Get-StreamProp $mainAudio 'index' -2) -and
             -not (Test-IsCommentary $_) -and
             (Test-IsLossyAudio $_) -and
-            ($_.codec_name ?? "").ToLowerInvariant() -ne $mainCodec
+            (Get-StreamProp $_ 'codec_name' '').ToLowerInvariant() -ne $mainCodec
         }
 
         if ($fallbackCandidates) {
             $fallbackAudio = $fallbackCandidates |
                 Sort-Object `
                     @{ Expression = {
-                        $codec = ($_.codec_name ?? "").ToLowerInvariant()
+                        $codec = (Get-StreamProp $_ 'codec_name' '').ToLowerInvariant()
                         switch ($codec) {
                             'eac3'  { 500 }
                             'ac3'   { 400 }
@@ -495,8 +548,8 @@ function Select-Streams {
                             default { 100 }
                         }
                     }; Descending = $true },
-                    @{ Expression = { [int]($_.channels  ?? 0) };  Descending = $true },
-                    @{ Expression = { [int64]($_.bit_rate ?? 0) }; Descending = $true } |
+                    @{ Expression = { [int](Get-StreamProp $_ 'channels' 0) };   Descending = $true },
+                    @{ Expression = { [int64](Get-StreamProp $_ 'bit_rate' 0) }; Descending = $true } |
                 Select-Object -First 1
         }
     }
@@ -513,8 +566,11 @@ function Select-Streams {
             Where-Object { -not (Test-IsSDH $_) } |
             Sort-Object `
                 @{ Expression = { if (Test-IsForced $_)              { 100 } else { 0 } }; Descending = $true },
-                @{ Expression = { if ($_.disposition.default -eq 1) {  50 } else { 0 } }; Descending = $true },
-                @{ Expression = { if ($_.codec_name -eq 'subrip')   {  20 } else { 10 } }; Descending = $true } |
+                @{ Expression = {
+                    $disp = Get-StreamProp $_ 'disposition' $null
+                    if ($null -ne $disp -and $disp.PSObject.Properties['default']?.Value -eq 1) { 50 } else { 0 }
+                }; Descending = $true },
+                @{ Expression = { if ((Get-StreamProp $_ 'codec_name' '') -eq 'subrip') { 20 } else { 10 } }; Descending = $true } |
             Select-Object -First 1
 
         if (-not $mainSub) {
@@ -523,7 +579,7 @@ function Select-Streams {
 
         if ($KeepEnglishSDH) {
             $sdhSub = $englishSubs |
-                Where-Object { $_.index -ne $mainSub.index -and (Test-IsSDH $_) } |
+                Where-Object { (Get-StreamProp $_ 'index' -1) -ne (Get-StreamProp $mainSub 'index' -2) -and (Test-IsSDH $_) } |
                 Select-Object -First 1
         }
     }
@@ -563,21 +619,35 @@ function Select-Streams {
 function Get-SourceProfile {
     param($Probe, $VideoStream)
 
-    $hasDV = [bool](
-        @($Probe.streams) | Where-Object {
-            ($_.codec_name       ?? "") -match 'dvhe|dvav' -or
-            ($_.codec_tag_string ?? "") -match 'dvhe|dvav' -or
-            (
-                $_.side_data_list -and
-                @($_.side_data_list) | Where-Object { ($_.side_data_type ?? "") -match 'DOVI|Dolby Vision' }
-            )
+    # Dolby Vision detection. Evaluated per-stream rather than as a single
+    # pipeline expression because the side_data_list check requires a variable
+    # assignment, which is a statement and cannot appear inside a parenthesised
+    # boolean expression in PowerShell.
+    $hasDV = $false
+    foreach ($dvStream in @($Probe.streams)) {
+        if ((Get-StreamProp $dvStream 'codec_name'       '') -match 'dvhe|dvav' -or
+            (Get-StreamProp $dvStream 'codec_tag_string' '') -match 'dvhe|dvav') {
+            $hasDV = $true
+            break
         }
-    )
+        # side_data_list is absent on streams with no side data; retrieve it
+        # safely and scan each entry's side_data_type for DOVI/Dolby Vision.
+        $sdList = Get-StreamProp $dvStream 'side_data_list' $null
+        if ($null -ne $sdList) {
+            foreach ($sd in @($sdList)) {
+                if ((Get-StreamProp $sd 'side_data_type' '') -match 'DOVI|Dolby Vision') {
+                    $hasDV = $true
+                    break
+                }
+            }
+        }
+        if ($hasDV) { break }
+    }
 
-    $hasHDR  = $false
-    $transfer = [string]($VideoStream.color_transfer  ?? "")
-    $primaries = [string]($VideoStream.color_primaries ?? "")
-    $matrix   = [string]($VideoStream.color_space     ?? "")
+    $hasHDR   = $false
+    $transfer  = [string](Get-StreamProp $VideoStream 'color_transfer'  '')
+    $primaries = [string](Get-StreamProp $VideoStream 'color_primaries' '')
+    $matrix    = [string](Get-StreamProp $VideoStream 'color_space'     '')
 
     if ($transfer  -match 'smpte2084|arib-std-b67|bt2020-10' -or
         $primaries -match 'bt2020' -or
@@ -610,14 +680,14 @@ function Get-SourceProfile {
 # =============================================================================
 function Get-TempOutputPath {
     param([string]$InputPath)
-    $dir  = Split-Path -LiteralPath $InputPath -Parent
+    $dir  = Split-Path -Path $InputPath -Parent
     $name = [System.IO.Path]::GetFileNameWithoutExtension($InputPath)
     return Join-Path $dir ($name + ".encoding.tmp.mkv")
 }
 
 function Get-FinalOutputPath {
     param([string]$InputPath)
-    $dir  = Split-Path -LiteralPath $InputPath -Parent
+    $dir  = Split-Path -Path $InputPath -Parent
     $name = [System.IO.Path]::GetFileNameWithoutExtension($InputPath)
     return Join-Path $dir ($name + ".mkv")
 }
@@ -641,9 +711,10 @@ function Format-StreamSummary {
     return ($Streams | ForEach-Object {
         $lang  = Get-StreamLanguage $_
         $title = Get-StreamTitle $_
-        $codec = ($_.codec_name ?? "")
-        $ch    = ($_.channels   ?? "")
-        "idx=$($_.index);lang=$lang;codec=$codec;ch=$ch;title=$title"
+        $codec = Get-StreamProp $_ 'codec_name' ''
+        $ch    = Get-StreamProp $_ 'channels'   ''
+        $idx   = Get-StreamProp $_ 'index'      ''
+        "idx=$idx;lang=$lang;codec=$codec;ch=$ch;title=$title"
     }) -join " | "
 }
 
@@ -980,7 +1051,7 @@ function Invoke-EncodeJob {
     $sourceItem    = Get-Item -LiteralPath $InputPath
     $sourceSizeGiB = [Math]::Round(($sourceItem.Length / 1GB), 3)
 
-    $outputDir = Split-Path -LiteralPath $InputPath -Parent
+    $outputDir = Split-Path -Path $InputPath -Parent
     $null = Test-SufficientDiskSpace -TargetDirectory $outputDir -SourceSizeBytes $sourceItem.Length
 
     $probe         = Invoke-FfprobeJson -InputPath $InputPath
@@ -999,7 +1070,7 @@ function Invoke-EncodeJob {
             SourceSizeGiB     = $sourceSizeGiB
             OutputSizeGiB     = ""
             ReductionPercent  = ""
-            SourceDurationSec = [double]($probe.format.duration ?? 0)
+            SourceDurationSec = [double](Get-StreamProp (Get-StreamProp probe 'format' ([PSCustomObject]@{})) 'duration' 0)
             OutputDurationSec = ""
             ElapsedSec        = [Math]::Round($stopwatch.Elapsed.TotalSeconds, 2)
             Profile           = $sourceProfile.Profile
@@ -1035,7 +1106,7 @@ function Invoke-EncodeJob {
 
     # ── Build ffmpeg argument list ────────────────────────────────────────────
     $ffArgs = New-Object System.Collections.Generic.List[string]
-    $ffArgs.AddRange(@(
+    $ffArgs.AddRange([string[]]@(
         "-hide_banner",
         "-y",
         "-i", $InputPath,
@@ -1043,11 +1114,11 @@ function Invoke-EncodeJob {
         "-map", "0:$($selected.MainAudio.index)"
     ))
 
-    if ($selected.FallbackAudio) { $ffArgs.AddRange(@("-map", "0:$($selected.FallbackAudio.index)")) }
-    if ($selected.MainSub)       { $ffArgs.AddRange(@("-map", "0:$($selected.MainSub.index)")) }
-    if ($selected.SdhSub)        { $ffArgs.AddRange(@("-map", "0:$($selected.SdhSub.index)")) }
+    if ($selected.FallbackAudio) { $ffArgs.AddRange([string[]]@("-map", "0:$($selected.FallbackAudio.index)")) }
+    if ($selected.MainSub)       { $ffArgs.AddRange([string[]]@("-map", "0:$($selected.MainSub.index)")) }
+    if ($selected.SdhSub)        { $ffArgs.AddRange([string[]]@("-map", "0:$($selected.SdhSub.index)")) }
 
-    $ffArgs.AddRange(@(
+    $ffArgs.AddRange([string[]]@(
         "-map_chapters",  "0",
         # -map_metadata -1 clears all global container metadata first. The explicit
         # -metadata flags below then re-add only what we want. Ordering matters --
@@ -1064,56 +1135,56 @@ function Invoke-EncodeJob {
         # smpte2084 (PQ) is the correct transfer function for both HDR10 and HDR10+.
         # HLG sources are also flagged HasHDR; tagging them smpte2084 is a known
         # trade-off when repackaging into AV1/MKV without tone-mapping.
-        $ffArgs.AddRange(@(
+        $ffArgs.AddRange([string[]]@(
             "-color_primaries", "bt2020",
             "-color_trc",       "smpte2084",
             "-colorspace",      "bt2020nc"
         ))
     }
 
-    $ffArgs.AddRange(@("-c:a", "copy"))
+    $ffArgs.AddRange([string[]]@("-c:a", "copy"))
 
-    if ($selected.MainSub -or $selected.SdhSub) { $ffArgs.AddRange(@("-c:s", "copy")) }
+    if ($selected.MainSub -or $selected.SdhSub) { $ffArgs.AddRange([string[]]@("-c:s", "copy")) }
 
-    $ffArgs.AddRange(@(
+    $ffArgs.AddRange([string[]]@(
         "-disposition:v:0", "default",
         "-disposition:a:0", "default"
     ))
 
-    if ($selected.FallbackAudio) { $ffArgs.AddRange(@("-disposition:a:1", "0")) }
+    if ($selected.FallbackAudio) { $ffArgs.AddRange([string[]]@("-disposition:a:1", "0")) }
 
-    if ($selected.MainSub) { $ffArgs.AddRange(@("-disposition:s:0", "default")) }
+    if ($selected.MainSub) { $ffArgs.AddRange([string[]]@("-disposition:s:0", "default")) }
 
     if ($selected.SdhSub) {
         $subIndex = if ($selected.MainSub) { 1 } else { 0 }
-        $ffArgs.AddRange(@("-disposition:s:$subIndex", "0"))
+        $ffArgs.AddRange([string[]]@("-disposition:s:$subIndex", "0"))
     }
 
     $baseTitle  = [System.IO.Path]::GetFileNameWithoutExtension($InputPath)
     $videoTitle = if ($sourceProfile.HasHDR) { "AV1 HDR10" } else { "AV1 SDR" }
 
-    $ffArgs.AddRange(@(
+    $ffArgs.AddRange([string[]]@(
         "-metadata",       "title=$baseTitle",
         "-metadata:s:v:0", "title=$videoTitle",
         "-metadata:s:a:0", "title=$(Get-StreamTitle $selected.MainAudio)"
     ))
 
     if ($selected.FallbackAudio) {
-        $ffArgs.AddRange(@("-metadata:s:a:1", "title=$(Get-StreamTitle $selected.FallbackAudio)"))
+        $ffArgs.AddRange([string[]]@("-metadata:s:a:1", "title=$(Get-StreamTitle $selected.FallbackAudio)"))
     }
 
     if ($selected.MainSub) {
-        $ffArgs.AddRange(@("-metadata:s:s:0", "title=$(Get-StreamTitle $selected.MainSub)"))
+        $ffArgs.AddRange([string[]]@("-metadata:s:s:0", "title=$(Get-StreamTitle $selected.MainSub)"))
     }
 
     if ($selected.SdhSub) {
         $subIndex = if ($selected.MainSub) { 1 } else { 0 }
-        $ffArgs.AddRange(@("-metadata:s:s:$subIndex", "title=$(Get-StreamTitle $selected.SdhSub)"))
+        $ffArgs.AddRange([string[]]@("-metadata:s:s:$subIndex", "title=$(Get-StreamTitle $selected.SdhSub)"))
     }
 
     # Direct ffmpeg to emit machine-readable key=value progress to stderr every
     # 2 seconds. Stderr is fully redirected; the async callback below parses it.
-    $ffArgs.AddRange(@("-progress", "pipe:2", "-stats_period", "2"))
+    $ffArgs.AddRange([string[]]@("-progress", "pipe:2", "-stats_period", "2"))
     $ffArgs.Add($tempOutput)
 
     # ── Write state file ──────────────────────────────────────────────────────
@@ -1169,13 +1240,21 @@ function Invoke-EncodeJob {
     # Async stderr reader: fires on a threadpool thread for each line received.
     # Lines matching the key=value pattern are progress data from -progress pipe:2.
     # Everything else is a normal ffmpeg log line, accumulated for display on failure.
-    $errAction = {
-        param($sender, $e)
+$errAction = {
+    param($sender, $e)
+
+    try {
         $line = $e.Data
         if ([string]::IsNullOrEmpty($line)) { return }
 
+        if ($null -eq $shared) {
+            throw "Async stderr callback lost access to `$shared."
+        }
+
         if ($line -match '^([a-z_]+)=(.+)$') {
-            $k = $Matches[1]; $v = $Matches[2]
+            $k = $Matches[1]
+            $v = $Matches[2]
+
             switch ($k) {
                 'out_time_us' {
                     $us = 0L
@@ -1191,17 +1270,29 @@ function Invoke-EncodeJob {
                 }
                 'speed' {
                     $sp = 0.0
-                    if ([double]::TryParse(($v -replace 'x', ''),
-                            [Globalization.NumberStyles]::Any,
-                            [Globalization.CultureInfo]::InvariantCulture, [ref]$sp)) {
+                    if ([double]::TryParse(
+                        ($v -replace 'x', ''),
+                        [Globalization.NumberStyles]::Any,
+                        [Globalization.CultureInfo]::InvariantCulture,
+                        [ref]$sp
+                    )) {
                         $shared.SpeedX = [Math]::Max(0.0, $sp)
                     }
                 }
             }
-        } else {
+        }
+        else {
             $shared.LogLines.Add($line)
         }
     }
+    catch {
+        [Console]::Error.WriteLine("ERRACTION FAIL: $($_.Exception.Message)")
+        [Console]::Error.WriteLine($_.ScriptStackTrace)
+        if ($_.InvocationInfo) {
+            [Console]::Error.WriteLine($_.InvocationInfo.PositionMessage)
+        }
+    }
+}.GetNewClosure()
 
     $proc.add_ErrorDataReceived($errAction)
     $null = $proc.Start()
@@ -1210,7 +1301,7 @@ function Invoke-EncodeJob {
     # ── Live UI loop ──────────────────────────────────────────────────────────
     $uiFileName     = [System.IO.Path]::GetFileName($InputPath)
     $uiLineCount    = -1   # -1 signals first paint; no cursor-up on first call
-    $sourceDuration = [double]($probe.format.duration ?? 0)
+    $sourceDuration = [double](Get-StreamProp (Get-StreamProp probe 'format' ([PSCustomObject]@{})) 'duration' 0)
 
     while (-not $proc.HasExited) {
         $uiLineCount = Write-ProgressUI `
@@ -1261,7 +1352,7 @@ function Invoke-EncodeJob {
     # A flat percentage alone would reject valid short clips where muxer rounding
     # differences are proportionally significant.
     $outProbe       = Invoke-FfprobeJson -InputPath $tempOutput
-    $outputDuration = [double]($outProbe.format.duration ?? 0)
+    $outputDuration = [double](Get-StreamProp (Get-StreamProp outProbe 'format' ([PSCustomObject]@{})) 'duration' 0)
 
     if ($sourceDuration -gt 0) {
         $allowedDelta = [Math]::Max(10.0, $sourceDuration * 0.02)
@@ -1416,33 +1507,47 @@ function Invoke-QueueProcessing {
             $job = Get-Content -LiteralPath $workingJobPath -Raw | ConvertFrom-Json
             Invoke-EncodeJob -InputPath $job.InputPath
         }
-        catch {
-            $message = $_.Exception.Message
-            Write-Host "FAILED: $message" -ForegroundColor Red
+			catch {
+				$message = $_.Exception.Message
+				$position = $_.InvocationInfo.PositionMessage
+				$stack = $_.ScriptStackTrace
 
-            Write-LogRow @{
-                Timestamp         = (Get-Date).ToString("s")
-                Status            = "FAILED"
-                InputPath         = $job.InputPath
-                OutputPath        = ""
-                SourceSizeGiB     = ""
-                OutputSizeGiB     = ""
-                ReductionPercent  = ""
-                SourceDurationSec = ""
-                OutputDurationSec = ""
-                ElapsedSec        = ""
-                Profile           = ""
-                HasHDR            = ""
-                HasDV             = ""
-                SelectedAudio     = ""
-                SelectedSubtitles = ""
-                CRF               = $CRF
-                Preset            = $Preset
-                FfmpegPath        = $FfmpegPath
-                FfprobePath       = $FfprobePath
-                Notes             = $message
-            }
-        }
+				Write-Host "FAILED: $message" -ForegroundColor Red
+
+				if ($position) {
+					Write-Host ""
+					Write-Host $position -ForegroundColor Yellow
+				}
+
+				if ($stack) {
+					Write-Host ""
+					Write-Host "Stack trace:" -ForegroundColor DarkYellow
+					Write-Host $stack -ForegroundColor DarkYellow
+				}
+
+				Write-LogRow @{
+					Timestamp         = (Get-Date).ToString("s")
+					Status            = "FAILED"
+					InputPath         = $job.InputPath
+					OutputPath        = ""
+					SourceSizeGiB     = ""
+					OutputSizeGiB     = ""
+					ReductionPercent  = ""
+					SourceDurationSec = ""
+					OutputDurationSec = ""
+					ElapsedSec        = ""
+					Profile           = ""
+					HasHDR            = ""
+					HasDV             = ""
+					SelectedAudio     = ""
+					SelectedSubtitles = ""
+					CRF               = $CRF
+					Preset            = $Preset
+					FfmpegPath        = $FfmpegPath
+					FfprobePath       = $FfprobePath
+					Notes             = ($message + " | " + $position)
+				}
+			}
         finally {
             if (Test-Path -LiteralPath $workingJobPath) {
                 Remove-Item -LiteralPath $workingJobPath -Force -ErrorAction SilentlyContinue
