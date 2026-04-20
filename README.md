@@ -172,6 +172,24 @@ $KeepBackupOriginal = $false
 
 ---
 
+⚠️ Grain-heavy films
+
+Some films contain heavy film grain and complex motion.
+
+These will:
+
+* encode to much larger sizes
+* especially at low CRF values (10–12)
+* Recommendation:
+* CRF 14–16
+
+or use grain synthesis:
+
+--film-grain 8–12
+
+AV1 preserves grain extremely well — sometimes too well.
+
+---
 ## 🎛️ Recommended Encoding Profiles / Scenarios
 
 🔥 Archival Quality (Slow)
