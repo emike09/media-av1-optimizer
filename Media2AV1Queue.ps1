@@ -907,7 +907,7 @@ function Write-ProgressUI {
     $pctLabel = ("{0,5:F1}%" -f $pct)
 
     # ── Queue snapshot ────────────────────────────────────────────────────────
-    $queueNames = Get-PendingQueueNames
+    $queueNames = @(Get-PendingQueueNames)   # @() ensures array even when 0 or 1 results
 
     # ── ANSI colour codes ─────────────────────────────────────────────────────
     $ESC      = [char]27
@@ -1237,71 +1237,69 @@ function Invoke-EncodeJob {
         LogLines     = [System.Collections.Generic.List[string]]::new()
     })
 
-    # Async stderr reader: fires on a threadpool thread for each line received.
-    # Lines matching the key=value pattern are progress data from -progress pipe:2.
-    # Everything else is a normal ffmpeg log line, accumulated for display on failure.
-$errAction = {
-    param($sender, $e)
+    # ── Background runspace: reads stderr from ffmpeg synchronously ───────────
+    # PS scriptblocks cannot run on arbitrary .NET threadpool threads because
+    # those threads have no PowerShell runspace attached. Using add_ErrorDataReceived
+    # with a scriptblock therefore crashes the process with a PSInvalidOperationException.
+    #
+    # The correct pattern is a dedicated PowerShell instance running in its own
+    # Runspace on a background thread. It reads stderr line by line in a blocking
+    # loop, parses the -progress pipe:2 key=value output, and writes results into
+    # the synchronized hashtable. The main thread reads from that hashtable to
+    # drive the progress UI without any thread-safety issues.
+    $stderrRunspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $stderrRunspace.Open()
+    $stderrRunspace.SessionStateProxy.SetVariable('shared', $shared)
+    $stderrRunspace.SessionStateProxy.SetVariable('proc',   $proc)
 
-    try {
-        $line = $e.Data
-        if ([string]::IsNullOrEmpty($line)) { return }
+    $stderrPs = [System.Management.Automation.PowerShell]::Create()
+    $stderrPs.Runspace = $stderrRunspace
+    $null = $stderrPs.AddScript({
+        try {
+            while ($true) {
+                $line = $proc.StandardError.ReadLine()
+                if ($null -eq $line) { break }
+                if ([string]::IsNullOrEmpty($line)) { continue }
 
-        if ($null -eq $shared) {
-            throw "Async stderr callback lost access to `$shared."
-        }
-
-        if ($line -match '^([a-z_]+)=(.+)$') {
-            $k = $Matches[1]
-            $v = $Matches[2]
-
-            switch ($k) {
-                'out_time_us' {
-                    $us = 0L
-                    if ([long]::TryParse($v, [ref]$us)) {
-                        $shared.OutTimeSec = [Math]::Max(0.0, $us / 1000000.0)
+                if ($line -match '^([a-z_]+)=(.+)$') {
+                    $k = $Matches[1]; $v = $Matches[2]
+                    switch ($k) {
+                        'out_time_us' {
+                            $us = 0L
+                            if ([long]::TryParse($v, [ref]$us)) {
+                                $shared.OutTimeSec = [Math]::Max(0.0, $us / 1000000.0)
+                            }
+                        }
+                        'total_size' {
+                            $sz = 0L
+                            if ([long]::TryParse($v, [ref]$sz)) {
+                                $shared.OutSizeBytes = [Math]::Max(0.0, [double]$sz)
+                            }
+                        }
+                        'speed' {
+                            $sp = 0.0
+                            if ([double]::TryParse(($v -replace 'x',''),
+                                    [Globalization.NumberStyles]::Any,
+                                    [Globalization.CultureInfo]::InvariantCulture,
+                                    [ref]$sp)) {
+                                $shared.SpeedX = [Math]::Max(0.0, $sp)
+                            }
+                        }
                     }
-                }
-                'total_size' {
-                    $sz = 0L
-                    if ([long]::TryParse($v, [ref]$sz)) {
-                        $shared.OutSizeBytes = [Math]::Max(0.0, [double]$sz)
-                    }
-                }
-                'speed' {
-                    $sp = 0.0
-                    if ([double]::TryParse(
-                        ($v -replace 'x', ''),
-                        [Globalization.NumberStyles]::Any,
-                        [Globalization.CultureInfo]::InvariantCulture,
-                        [ref]$sp
-                    )) {
-                        $shared.SpeedX = [Math]::Max(0.0, $sp)
-                    }
+                } else {
+                    $shared.LogLines.Add($line)
                 }
             }
-        }
-        else {
-            $shared.LogLines.Add($line)
-        }
-    }
-    catch {
-        [Console]::Error.WriteLine("ERRACTION FAIL: $($_.Exception.Message)")
-        [Console]::Error.WriteLine($_.ScriptStackTrace)
-        if ($_.InvocationInfo) {
-            [Console]::Error.WriteLine($_.InvocationInfo.PositionMessage)
-        }
-    }
-}.GetNewClosure()
+        } catch {}
+    })
 
-    $proc.add_ErrorDataReceived($errAction)
     $null = $proc.Start()
-    $proc.BeginErrorReadLine()
+    $stderrAsync = $stderrPs.BeginInvoke()
 
     # ── Live UI loop ──────────────────────────────────────────────────────────
     $uiFileName     = [System.IO.Path]::GetFileName($InputPath)
     $uiLineCount    = -1   # -1 signals first paint; no cursor-up on first call
-    $sourceDuration = [double](Get-StreamProp (Get-StreamProp probe 'format' ([PSCustomObject]@{})) 'duration' 0)
+    $sourceDuration = [double](Get-StreamProp (Get-StreamProp $probe 'format' ([PSCustomObject]@{})) 'duration' 0)
 
     while (-not $proc.HasExited) {
         $uiLineCount = Write-ProgressUI `
@@ -1320,6 +1318,12 @@ $errAction = {
     $proc.WaitForExit()
     $ffExit = $proc.ExitCode
     $proc.Dispose()
+
+    # Wait for the stderr reader to finish draining, then tear down its runspace.
+    $null = $stderrPs.EndInvoke($stderrAsync)
+    $stderrPs.Dispose()
+    $stderrRunspace.Close()
+    $stderrRunspace.Dispose()
 
     # Final paint: snap to 100% on success, leave at actual position on failure.
     $null = Write-ProgressUI `
