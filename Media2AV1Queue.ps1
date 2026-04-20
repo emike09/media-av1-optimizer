@@ -1070,7 +1070,7 @@ function Invoke-EncodeJob {
             SourceSizeGiB     = $sourceSizeGiB
             OutputSizeGiB     = ""
             ReductionPercent  = ""
-            SourceDurationSec = [double](Get-StreamProp (Get-StreamProp probe 'format' ([PSCustomObject]@{})) 'duration' 0)
+            SourceDurationSec = [double](Get-StreamProp (Get-StreamProp $probe 'format' ([PSCustomObject]@{})) 'duration' 0)
             OutputDurationSec = ""
             ElapsedSec        = [Math]::Round($stopwatch.Elapsed.TotalSeconds, 2)
             Profile           = $sourceProfile.Profile
@@ -1356,7 +1356,7 @@ function Invoke-EncodeJob {
     # A flat percentage alone would reject valid short clips where muxer rounding
     # differences are proportionally significant.
     $outProbe       = Invoke-FfprobeJson -InputPath $tempOutput
-    $outputDuration = [double](Get-StreamProp (Get-StreamProp outProbe 'format' ([PSCustomObject]@{})) 'duration' 0)
+    $outputDuration = [double](Get-StreamProp (Get-StreamProp $outProbe 'format' ([PSCustomObject]@{})) 'duration' 0)
 
     if ($sourceDuration -gt 0) {
         $allowedDelta = [Math]::Max(10.0, $sourceDuration * 0.02)
