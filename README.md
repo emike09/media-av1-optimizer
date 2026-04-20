@@ -10,6 +10,8 @@ Speed on an RX 9950x3D w/PBO: 1.4x
 
 Highly recommend a 16+ core CPU
 
+Average filesize: 10.5GB/hr
+
 ---
 
 ## 🚀 Features
