@@ -1180,7 +1180,7 @@ function Invoke-EncodeJob {
                 'out_time_us' {
                     $us = 0L
                     if ([long]::TryParse($v, [ref]$us)) {
-                        $shared.OutTimeSec = [Math]::Max(0.0, $us / 1_000_000.0)
+                        $shared.OutTimeSec = [Math]::Max(0.0, $us / 1000000.0)
                     }
                 }
                 'total_size' {
