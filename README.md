@@ -181,6 +181,7 @@ $KeepBackupOriginal = $false
   * CRF: 10
   * Preset: 3
 
+
 * ⚖️ High Quality / High Compression (Slow)
  *  Re-encoding existing x264/x265 files
  *  Large libraries
@@ -188,21 +189,26 @@ $KeepBackupOriginal = $false
   * CRF: 14–15
   * Preset: 3
 
+
 * High Quality / Balanced Compression / (Balanced Speed)
  * CRF 10-12
  * Preset 4
+
 
 * Normal Quality / Balanced Compression / (Balanced Speed)
  * CRF 14-15
  * Preset 4
 
+
 * 🚀 Faster Encoding, Larger Filesize (Fast, Efficient)
  * CRF: 10–12
  * Preset: 5
 
+
 * 🚀 Faster Encoding, Smaller Filesize (Fast, Efficient)
  * CRF: 14
  * Preset: 5
+
 
 ## 🧠 Philosophy
 
