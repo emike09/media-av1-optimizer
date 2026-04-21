@@ -162,8 +162,8 @@ $FilmGrain = 0  # 0 = disabled
 > A 70GB encode at `FilmGrain=0` may drop to ~20–25GB at `FilmGrain=12` with similar perceived quality.
 
 ### Film Grain Encoding Speed
-- Without film grain synthesis (FilmGrain=0), the encoder #tries to preserve every grain pixel.
-- With film grain synthesis (FilmGrain > 0), #the encoder removes grain during encoding and stores a compact grain model.
+- Without film grain synthesis (FilmGrain=0), the encoder tries to preserve every grain pixel.
+- With film grain synthesis (FilmGrain > 0), the encoder removes grain during encoding and stores a compact grain model.
 - The decoder later reconstructs this grain.
 - Gains on encoding speed can be up to 30%. 
 
