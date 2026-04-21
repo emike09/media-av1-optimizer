@@ -64,8 +64,7 @@ If you have large Blu-ray libraries or high-bitrate video files and want to comp
 
 - Windows
 - PowerShell 7.0+ (tested on 7.6)
-- `ffmpeg` and `ffprobe` version 8+
-
+- `ffmpeg` and `ffprobe` version 8+ https://www.ffmpeg.org/download.html
 ---
 
 ## 📦 Installation
@@ -124,7 +123,7 @@ pwsh Media2AV1Queue.ps1 "D:\Movies\SomeMovie.mkv"
 
 ## ⚠️ Dolby Vision
 
-Dolby Vision is **not preserved** during AV1 re-encoding.
+Dolby Vision is **not preserved** during AV1 re-encoding. I have not yet found a reliable, scriptable way to preserve this data for an AV1 re-encode and recommend manually re-encoding these one at a time. Please let me know if you have found a valid workflow to preserve DV with AV1. Dolby Vision can be re-encoded to HDR10 with the `$SkipDolbyVisionSources = $false` flag. 
 
 By default:
 - DV sources are **skipped**
