@@ -43,8 +43,32 @@ $ErrorView = 'NormalView'
 # =============================================================================
 
 # Encoding quality / speed
-$CRF    = 10    # SVT-AV1 CRF. Lower = better quality, larger file. Range 0-63.
-$Preset = 4     # SVT-AV1 preset. Lower = slower encode, higher efficiency. Range 0-13.
+$CRF       = 16   # SVT-AV1 CRF. Lower = better quality, larger file. Range 0-63.
+$Preset    = 3    # SVT-AV1 preset. Lower = slower encode, higher efficiency. Range 0-13.
+
+# Film grain synthesis
+# AV1 supports storing a compact grain model in the bitstream instead of encoding
+# the actual grain pixel-by-pixel. The decoder regenerates perceptually identical
+# grain at playback, which can dramatically reduce file size for noisy or grainy
+# sources (film grain, heavy ISO noise) with no visible quality loss.
+#
+# $FilmGrain sets the SVT-AV1 film-grain parameter (0-50):
+#   0       Disabled. Grain is encoded literally. Best for clean CGI/animation.
+#   4-8     Light grain. Good starting point for modern digital cinema releases.
+#   8-15    Moderate grain. Typical for Blu-ray film transfers.
+#   15-25   Heavy grain. Use for visibly grainy film sources (e.g. 70s/80s film,
+#           high-ISO documentary footage, or notoriously grainy titles like
+#           Saving Private Ryan, The Revenant, or Hereditary).
+#   25-50   Extreme grain. Rarely needed; use only for severely degraded sources.
+#
+# When in doubt, start at 8 and adjust based on the source. Setting this too high
+# on a clean source introduces artificial noise; too low on a grainy source just
+# means the encoder wastes bits trying to reproduce random noise pixel-by-pixel.
+#
+# This is the single highest-impact setting for oversized encodes of grain-heavy
+# content. A title that produces 70 GiB at FilmGrain=0 may produce 20-25 GiB at
+# FilmGrain=12 with identical perceptual quality on a calibrated display.
+$FilmGrain = 0    # 0 = disabled. See notes above for guidance.
 
 # Source handling
 $SkipDolbyVisionSources = $true    # Skip DV sources rather than silently destroying DV metadata.
@@ -56,6 +80,9 @@ $ReplaceOriginal        = $true    # Rename the finished .mkv to the original fi
 $KeepEnglishSDH           = $true  # Retain an SDH subtitle track alongside the main subtitle.
 $KeepEnglishFallbackAudio = $true  # Retain a secondary lossy English audio track (e.g. stereo AAC)
                                    # when the main track is lossless. Excluded if same codec as main.
+# =============================================================================
+# End of User-configurable settings
+# =============================================================================
 
 # Queue / log paths  (all relative to the script's own directory)
 $QueueRoot       = Join-Path $PSScriptRoot ".queue"
@@ -100,7 +127,7 @@ if (-not (Test-Path -LiteralPath $FfprobePath)) {
 $null = New-Item -ItemType Directory -Force -Path $QueueRoot, $QueuePendingDir, $QueueWorkingDir, $BackupDir
 
 if (-not (Test-Path -LiteralPath $LogPath)) {
-    "Timestamp,Status,InputPath,OutputPath,SourceSizeGiB,OutputSizeGiB,ReductionPercent,SourceDurationSec,OutputDurationSec,ElapsedSec,Profile,HasHDR,HasDV,SelectedAudio,SelectedSubtitles,CRF,Preset,FfmpegPath,FfprobePath,Notes" |
+    "Timestamp,Status,InputPath,OutputPath,SourceSizeGiB,OutputSizeGiB,ReductionPercent,SourceDurationSec,OutputDurationSec,ElapsedSec,Profile,HasHDR,HasDV,SelectedAudio,SelectedSubtitles,CRF,Preset,FilmGrain,FfmpegPath,FfprobePath,Notes" |
         Set-Content -LiteralPath $LogPath -Encoding UTF8
 }
 
@@ -137,6 +164,7 @@ function Write-LogRow {
         SelectedSubtitles = $Row.SelectedSubtitles
         CRF               = $Row.CRF
         Preset            = $Row.Preset
+        FilmGrain         = $Row.FilmGrain
         FfmpegPath        = $Row.FfmpegPath
         FfprobePath       = $Row.FfprobePath
         Notes             = $Row.Notes
@@ -1080,6 +1108,7 @@ function Invoke-EncodeJob {
             SelectedSubtitles = Format-StreamSummary -Streams @($selected.MainSub, $selected.SdhSub)
             CRF               = $CRF
             Preset            = $Preset
+            FilmGrain         = $FilmGrain
             FfmpegPath        = $FfmpegPath
             FfprobePath       = $FfprobePath
             Notes             = "Dolby Vision source skipped by policy."
@@ -1130,6 +1159,17 @@ function Invoke-EncodeJob {
         "-crf",     "$CRF",
         "-pix_fmt", "yuv420p10le"
     ))
+
+    # Film grain synthesis: pass the parameter to SVT-AV1 only when enabled.
+    # -svtav1-params is a catch-all for encoder-specific options not exposed as
+    # top-level ffmpeg flags. Multiple params can be chained with colons, e.g.
+    # "film-grain=10:film-grain-denoise=0". film-grain-denoise=0 tells the
+    # encoder to synthesise grain at decode time WITHOUT pre-denoising the source
+    # first -- generally preferred when the source grain is already well-behaved
+    # and you do not want to alter the underlying image texture.
+    if ($FilmGrain -gt 0) {
+        $ffArgs.AddRange([string[]]@("-svtav1-params", "film-grain=$FilmGrain`:film-grain-denoise=0"))
+    }
 
     if ($sourceProfile.HasHDR) {
         # smpte2084 (PQ) is the correct transfer function for both HDR10 and HDR10+.
@@ -1200,6 +1240,7 @@ function Invoke-EncodeJob {
         HasDV        = $sourceProfile.HasDV
         CRF          = $CRF
         Preset       = $Preset
+        FilmGrain    = $FilmGrain
     } | ConvertTo-Json -Depth 8
 
     Set-Content -LiteralPath $StatePath -Value $currentState -Encoding UTF8
@@ -1209,6 +1250,9 @@ function Invoke-EncodeJob {
     Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "Encoding: $InputPath"                                          -ForegroundColor Green
     Write-Host "Profile : $($sourceProfile.Profile)"                           -ForegroundColor Green
+    if ($FilmGrain -gt 0) {
+        Write-Host "Grain   : film-grain=$FilmGrain (synthesis enabled)"       -ForegroundColor Green
+    }
     Write-Host "Audio   : $(Format-StreamSummary @($selected.MainAudio, $selected.FallbackAudio))" -ForegroundColor Green
     Write-Host "Subs    : $(Format-StreamSummary @($selected.MainSub, $selected.SdhSub))"          -ForegroundColor Green
     Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
@@ -1418,6 +1462,7 @@ function Invoke-EncodeJob {
         SelectedSubtitles = Format-StreamSummary -Streams @($selected.MainSub, $selected.SdhSub)
         CRF               = $CRF
         Preset            = $Preset
+        FilmGrain         = $FilmGrain
         FfmpegPath        = $FfmpegPath
         FfprobePath       = $FfprobePath
         Notes             = ""
@@ -1486,6 +1531,7 @@ function Invoke-QueueProcessing {
                 SelectedSubtitles = ""
                 CRF               = $interrupted.CRF
                 Preset            = $interrupted.Preset
+                FilmGrain         = $interrupted.FilmGrain
                 FfmpegPath        = $FfmpegPath
                 FfprobePath       = $FfprobePath
                 Notes             = "Process was interrupted. Temp output may exist at: $tempPath"
@@ -1547,6 +1593,7 @@ function Invoke-QueueProcessing {
 					SelectedSubtitles = ""
 					CRF               = $CRF
 					Preset            = $Preset
+					FilmGrain         = $FilmGrain
 					FfmpegPath        = $FfmpegPath
 					FfprobePath       = $FfprobePath
 					Notes             = ($message + " | " + $position)
