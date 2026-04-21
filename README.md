@@ -71,7 +71,7 @@ If you have large Blu-ray libraries or high-bitrate video files and want to comp
 ## 📦 Installation
 
 ```bash
-git clone https://github.com/yourusername/media-av1-optimizer.git
+git clone https://github.com/emike09/media-av1-optimizer.git
 ```
 
 Place `ffmpeg.exe` and `ffprobe.exe` in the same directory (recommended).
