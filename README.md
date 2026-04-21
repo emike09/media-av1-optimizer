@@ -1,75 +1,80 @@
-# media-av1-optimizer
-Automated AV1 encoding pipeline for video libraries with intelligent stream selection, HDR handling, and queue-based processing.
-# Media AV1 Optimizer
+# 🎬 Media AV1 Optimizer
 
 A queue-based, drag-and-drop AV1 encoding pipeline for video libraries.
 
-Built for high-quality archival compression using **SVT-AV1**, with intelligent stream selection, HDR handling, and safe batch processing. If you have large blu-ray libraries or big video files and want to compress them using the powerful AV1 codec, this script is for you. This script is optimized for the English language.
+Built for high-quality archival compression using **SVT-AV1**, with intelligent stream selection, HDR handling, and safe batch processing.
 
-Speed on an RX 9950x3D w/PBO: 1.4x
+If you have large Blu-ray libraries or high-bitrate video files and want to compress them using AV1, this script is for you.
 
-Highly recommend a 16+ core CPU
+> Optimized for English-language media libraries.
 
-Average filesize: ~11GB/hr
+---
+
+## ⚡ Performance
+
+- CPU: Ryzen 9 9950X3D (PBO)
+- Speed: ~1.4× realtime
+- Recommended: **16+ core CPU**
+- Average output size: **~11 GB/hour**
 
 ---
 
 ## 🚀 Features
 
-* 🎬 **AV1 (SVT-AV1) encoding**
-* ⚡ High-quality profile (**CRF 10**, preset 4)
-* 📦 **Massive space savings** (5–10x typical reduction) compared to H.265
-* 🧠 Intelligent stream selection:
+- 🎬 **AV1 (SVT-AV1) encoding**
+- ⚡ High-quality defaults (**CRF 10 / Preset 4**)
+- 📦 **Massive space savings** (5–10× vs H.265 typical)
 
-  * Best English audio (TrueHD / DTS-HD / E-AC3 Atmos prioritized)
-  * Optional fallback audio track
-  * English subtitles + optional SDH
-* 🧹 Automatic cleanup:
+### 🧠 Intelligent Stream Selection
 
-  * Removes commentary tracks
-  * Removes foreign audio/subtitles
-  * Removes junk metadata streams
-* 🌈 HDR-aware:
+- Best English audio (TrueHD / DTS-HD / E-AC3 Atmos prioritized)
+- Optional fallback audio track
+- English subtitles + optional SDH
 
-  * Preserves HDR10 signaling
-  * Detects Dolby Vision and safely skips (configurable)
-* 📋 Queue system:
+### 🧹 Automatic Cleanup
 
-  * Drag-and-drop files anytime
-  * Processes sequentially
-  * No limit on queue size
-* 🔁 Safe processing:
+- Removes commentary tracks
+- Removes foreign audio/subtitles
+- Removes junk metadata streams
 
-  * Temp file encoding
-  * Validation before replacement
-* 📝 Logging:
+### 🌈 HDR Awareness
 
-  * CSV log of all encodes
-  * Size reduction, duration, profile, etc.
+- Preserves HDR10 signaling
+- Detects Dolby Vision and skips (configurable)
+
+### 📋 Queue System
+
+- Drag-and-drop anytime
+- Sequential processing
+- Unlimited queue size
+
+### 🔁 Safe Processing
+
+- Temp file encoding
+- Validation before replacement
+
+### 📝 Logging
+
+- CSV log of all encodes
+- Size reduction, duration, profile, etc.
 
 ---
 
 ## 🧰 Requirements
 
-* Windows
-* PowerShell 7.0+ (tested on 7.6)
-* `ffmpeg` and `ffprobe` version 8+
-
-  * Either in PATH or placed next to the script
+- Windows
+- PowerShell 7.0+ (tested on 7.6)
+- `ffmpeg` and `ffprobe` version 8+
 
 ---
 
 ## 📦 Installation
 
-1. Clone the repo:
-
 ```bash
-git clone https://github.com/yourusername/plex-av1-optimizer.git
+git clone https://github.com/yourusername/media-av1-optimizer.git
 ```
 
-2. Place `ffmpeg.exe` and `ffprobe.exe` in the same folder (optional but recommended)
-
-3. Done.
+Place `ffmpeg.exe` and `ffprobe.exe` in the same directory (recommended).
 
 ---
 
@@ -77,20 +82,16 @@ git clone https://github.com/yourusername/plex-av1-optimizer.git
 
 ### Drag & Drop
 
-Drag video files onto:
+Drop files onto:
 
-```
+```text
 Drop_Encode_AV1.bat
 ```
-
-That’s it. Files can be dropped into the queue at any time.
-
----
 
 ### CLI
 
 ```powershell
-pwsh PlexAV1Queue.ps1 "D:\Movies\SomeMovie.mkv"
+pwsh Media2AV1Queue.ps1 "D:\Movies\SomeMovie.mkv"
 ```
 
 ---
@@ -99,25 +100,25 @@ pwsh PlexAV1Queue.ps1 "D:\Movies\SomeMovie.mkv"
 
 ### Encoding
 
-* Codec: AV1 (SVT-AV1)
-* CRF: 10
-* Preset: 4
-* Output: MKV
+- Codec: AV1 (SVT-AV1)
+- CRF: 10
+- Preset: 4
+- Container: MKV
 
 ### Audio
 
-* Keeps best English track
-* Keeps optional fallback (AC3/E-AC3/etc.)
+- Keeps best English track
+- Keeps optional fallback track
 
 ### Subtitles
 
-* Keeps English default
-* Optionally keeps SDH
+- Keeps English default
+- Optionally keeps SDH
 
 ### Video
 
-* Preserves HDR10 metadata
-* Skips Dolby Vision sources (by default)
+- Preserves HDR10 metadata
+- Skips Dolby Vision sources by default
 
 ---
 
@@ -125,46 +126,171 @@ pwsh PlexAV1Queue.ps1 "D:\Movies\SomeMovie.mkv"
 
 Dolby Vision is **not preserved** during AV1 re-encoding.
 
-By default, DV sources are skipped to prevent accidental quality loss.
+By default:
+- DV sources are **skipped**
 
-You can override this behavior in the script if you prefer HDR10 fallback.
+Optional:
+- Allow fallback to HDR10
+
+---
+
+## 🎞️ Film Grain
+
+AV1 supports **film grain synthesis**, allowing grain to be stored efficiently and reconstructed during playback instead of encoded pixel-by-pixel.
+
+### Configuration
+
+```powershell
+$FilmGrain = 0  # 0 = disabled
+```
+
+### Recommended Values
+
+| Value | Use Case |
+|------:|----------|
+| 0 | Clean CGI / animation |
+| 4–8 | Light grain (modern films) |
+| 8–15 | Typical Blu-ray grain |
+| 15–25 | Heavy grain (e.g. *Saving Private Ryan*) |
+| 25+ | Extreme / degraded sources |
+
+### Notes
+
+- Too low = wasted bitrate
+- Too high = artificial noise
+
+> A 70GB encode at `FilmGrain=0` may drop to ~20–25GB at `FilmGrain=12` with similar perceived quality.
+
+---
+
+## ⚠️ Grain-Heavy Films
+
+Some films contain heavy grain and complex motion.
+
+These will:
+- produce very large encodes
+- especially at CRF 10–12
+
+### Recommendation
+
+```text
+CRF: 14–16
+```
+
+or:
+
+```text
+FilmGrain: 8–12
+```
+
+> AV1 preserves grain extremely well — sometimes *too well*.
+
+---
+
+## 🎛️ Recommended Encoding Profiles
+
+### 🔥 Archival Quality
+
+```text
+CRF: 10
+Preset: 3
+```
+
+- Near-transparent quality
+- 4–7× reduction from remux
+- Slow but optimal
+
+### ⚖️ High Quality / Compression Balance
+
+```text
+CRF: 14–15
+Preset: 3
+```
+
+- ~30–50% smaller than x265
+- Minimal visible loss
+
+### ⚡ Balanced (Default Recommendation)
+
+```text
+CRF: 10–12
+Preset: 4
+```
+
+- Excellent quality
+- Good performance
+
+### 🚀 Faster Encoding
+
+```text
+CRF: 10–12
+Preset: 5
+```
+
+- Faster encoding
+- Slightly larger files
+
+### 📦 Aggressive Compression
+
+```text
+CRF: 16–18
+Preset: 4–5
+```
+
+- Maximum savings
+- Visible artifacts possible
+
+### 🧊 Skip Re-encoding
+
+```text
+< ~8 GB/hour → Skip
+```
+
+- Minimal gains
+- Guaranteed quality loss
+
+---
+
+## 🧠 Preset vs CRF
+
+| Setting | Result |
+|--------|--------|
+| CRF 10 / Preset 5 | Higher quality, larger file |
+| CRF 14 / Preset 3 | Smaller file, more loss |
+
+> Rule: Lower CRF first, then lower preset.
 
 ---
 
 ## 📊 Logging
 
-All encodes are logged to:
-
-```
+```text
 .queue/encode_log.csv
 ```
 
-Includes:
-
-* Input/output size
-* Reduction %
-* Duration
-* HDR/DV detection
-* Selected streams
+Tracks:
+- size reduction
+- duration
+- HDR/DV detection
+- selected streams
 
 ---
 
 ## 🧪 Tested Scenarios
 
-* 4K HDR remux (HEVC → AV1)
-* Dolby Vision (skipped)
-* AI-upscaled content (Topaz)
-* Multi-audio / multi-subtitle cluttered files
+- 4K HDR remux → AV1
+- Dolby Vision (skip logic)
+- AI-upscaled content (Topaz)
+- Multi-audio / multi-subtitle cluttered files
 
 ---
 
 ## 🛠️ Configuration
 
-Edit the script:
-
 ```powershell
 $CRF = 10
 $Preset = 4
+$FilmGrain = 0
 $SkipDolbyVisionSources = $true
 $KeepEnglishSDH = $true
 $KeepBackupOriginal = $false
@@ -172,75 +298,17 @@ $KeepBackupOriginal = $false
 
 ---
 
-⚠️ Grain-heavy films
-
-Some films contain heavy film grain and complex motion.
-
-These will:
-
-* encode to much larger sizes
-* especially at low CRF values (10–12)
-* Recommendation:
-* CRF 14–16
-
-or use grain synthesis:
-
---film-grain 8–12
-
-AV1 preserves grain extremely well — sometimes too well.
-
----
-## 🎛️ Recommended Encoding Profiles / Scenarios
-
-🔥 Archival Quality (Slow)
-Encoding remuxes / high bitrate sources
-Long-term storage
-You want near-transparent quality
-CRF: 10
-Preset: 3
-
-
-⚖️ High Quality / High Compression (Slow)
-Re-encoding existing x264/x265 files
-Large libraries
-You want strong savings without noticeable loss
-CRF: 14–15
-Preset: 3
-
-
-High Quality / Balanced Compression / (Balanced Speed)
-CRF 10-12
-Preset 4
-
-
-Normal Quality / Balanced Compression / (Balanced Speed)
-CRF 14-15
-Preset 4
-
-
-🚀 Faster Encoding, Larger Filesize (Fast, Efficient)
-CRF: 10–12
-Preset: 5
-
-
-🚀 Faster Encoding, Smaller Filesize (Fast, Efficient)
-CRF: 14
-Preset: 5
-
-
 ## 🧠 Philosophy
 
-This project prioritizes:
-
-* Visual quality over maximum compression
-* Consistency over edge-case perfection
-* Automation over manual micromanagement
+- Visual quality over maximum compression
+- Consistency over edge-case perfection
+- Automation over manual tuning
 
 ---
 
 ## 📜 License
 
-MIT License (see LICENSE file)
+MIT License
 
 ---
 
@@ -249,20 +317,19 @@ MIT License (see LICENSE file)
 Pull requests welcome.
 
 Ideas:
-
-* DV-safe workflows
-* SDR/HDR auto-detection improvements
-* GPU encoding modes (at this time, software encoding provides the best results)
-* Linux support
+- DV-safe workflows
+- HDR/SDR detection improvements
+- GPU encoding modes (experimental)
+- Linux support
 
 ---
 
-## ⚡ Final Notes
+## ⚡ Final Note
 
 If it looks good on *Prometheus*, it’ll survive anything.
 
 ---
 
-## ⭐ If this helped you
+## ⭐ Support
 
-Give it a star — it helps others find it.
+If this helped you, give it a star.
