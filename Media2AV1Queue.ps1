@@ -6,9 +6,9 @@
 #
 # Drop one or more video files onto PlexAV1Queue.bat. Each file is added to a
 # filesystem queue under .queue\pending\. A machine-global named mutex ensures
-# only one worker runs at a time — if an encoder session is already active,
-# newly dropped files are silently appended to the queue and will be picked up
-# when the current job finishes.
+# only one queue manager process runs at a time — if an encoder session is
+# already active, newly dropped files are silently appended to the queue and
+# will be picked up by the active lane scheduler.
 #
 # Per-file workflow:
 #   1. ffprobe inspects the source and returns full stream/format metadata.
@@ -25,9 +25,12 @@
 #
 # Requirements:
 #   - PowerShell 7.0+  (pwsh.exe)  — ships with .NET 5+
-#   - ffmpeg / ffprobe 8.x+        — placed next to the script or on PATH
+#   - ffmpeg / ffprobe 8.1 full build (or newer full build) — placed next to
+#     the script or on PATH. FFmpeg 6.x / 7.x and stripped/basic builds are
+#     unsupported.
 #
 # =============================================================================
+#Do not change the following lines:
 [CmdletBinding()]
 param(
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -37,6 +40,21 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ErrorView = 'NormalView'
+$script:ResolvedScriptProcessPriority = 'Normal'
+$script:QueueShutdownRequested = $false
+$script:QueueShutdownMessageShown = $false
+$script:QueueShutdownSentinel = '__QUEUE_SHUTDOWN__'
+$script:OriginalTreatControlCAsInput = $null
+$script:HeldForCpuAnnouncements = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$script:SessionLogPath = $null
+$script:QueuePaused = $false
+$script:SoftExitRequested = $false
+$script:ShowHelpOverlay = $false
+$script:ConsoleCommandContext = [pscustomobject]@{ Kind = ''; Target = ''; ExpiresAt = $null }
+$script:ConsoleStatus = [pscustomobject]@{ Message = ''; Level = 'Info'; ExpiresAt = $null }
+$script:ThreadControlInteropLoaded = $false
+$script:TestAutoShutdownAt = $null
+$script:TestAutoShutdownSeconds = 0
 
 # Supports bare `Auto` in the config block so users can write either:
 #   $CRF = Auto
@@ -44,6 +62,7 @@ $ErrorView = 'NormalView'
 #   $CRF = 'Auto'
 # In expression context PowerShell otherwise tries to invoke `Auto` as a
 # command before our later config validation can normalize it.
+# Do not changes the following lines:
 function Auto {
     return 'Auto'
 }
@@ -57,6 +76,67 @@ function Auto {
 $CRF       = Auto   # SVT-AV1 CRF. Lower = better quality, larger file. Range 0-63, or 'Auto'.
 $Preset    = Auto    # SVT-AV1 preset. Lower = slower encode, higher efficiency. Range 0-13, or 'Auto'.
 $AutoCRFOffset = Auto  # Applies only when CRF='Auto'. Integer offset added to the resolved auto CRF, or 'Auto' for 0.
+
+# Encoder preference / lane selection
+# Auto   = choose CPU or NVIDIA per file based on source analysis, preflight,
+#          and current lane availability.
+# CPU    = software AV1 only (libsvtav1).
+# Nvidia = NVIDIA AV1 only (av1_nvenc). Fails early if NVIDIA AV1 is unavailable.
+$EncoderPreference = 'Auto' # Auto | CPU | Nvidia
+
+# Process priority
+$SoftwareEncodePriority = 'BelowNormal' # Idle | BelowNormal | Normal | AboveNormal
+$HardwareEncodePriority = 'Normal'      # Idle | BelowNormal | Normal | AboveNormal
+$ScriptProcessPriority  = 'Normal'      # Priority for the controlling PowerShell process
+$ApplyProcessPriority   = $true         # Master toggle for process priority handling
+
+# NVENC mode settings
+# NVENC is much faster than software SVT-AV1, but compression efficiency and
+# grain retention behavior are generally worse at similar perceptual quality.
+# Film grain synthesis is typically not available in FFmpeg's av1_nvenc path,
+# so Auto mode may force FilmGrain=0 and log the reason when NVENC is enabled.
+$NvencMaxParallel     = Auto    # Integer or 'Auto'. Auto uses GPU model lookup / capability table.
+$NvencCQ              = Auto    # Integer or 'Auto'. CQ target for av1_nvenc; separate from software CRF.
+$NvencPreset          = Auto    # 'p1'..'p7' or 'Auto'. Auto chooses a quality-biased preset.
+$NvencDecode          = Auto    # 'Auto', 'cpu', or 'cuda'. Auto prefers the most reliable path.
+
+# NVENC tuning mode for av1_nvenc (FFmpeg 8.1 full build required)
+# Options:
+#   'auto' = use 'hq' if supported, otherwise disable tune
+#   'hq'   = High quality (recommended)
+#   'll'   = Low latency
+#   'ull'  = Ultra low latency
+#   $null  = disabled
+#
+# Notes:
+# - This script requires a full FFmpeg 8.1 build.
+# - Older FFmpeg versions and stripped/basic builds are not supported.
+# - Some FFmpeg builds may not expose -tune for av1_nvenc.
+# - The script only passes -tune when the local FFmpeg build supports it.
+$NvencTune            = 'auto'
+$NvencAllowSplitFrame = $false  # Leave split-frame encoding disabled by default.
+#Split-frame may be useful for single-file encoding, but comes with risks and 
+#reduced quality / compression. 
+
+# Size estimation / preflight
+$EnablePreflightEstimate = $true
+$PreflightSampleCount = 4
+$PreflightSampleDurationSec = 30
+$PreflightWarnIfEstimatedPctOfSource = 95
+$PreflightAbortIfEstimatedPctOfSource = 100
+$EnablePreflightAutoTune = $true
+$EnableSecondPreflightPass = $true
+$PreflightAutoTuneQuality = 'High' # Low = smaller files | Medium = balanced | High = more quality-preserving
+$PreflightTinyOutputPctThreshold = 35
+$PreflightTinyOutputAbsoluteGiBThreshold = 1.0
+$EnableLiveSizeEstimate = $true
+$LiveEstimateStartPercent = 3
+$LiveEstimateSmoothingFactor = 0.30
+
+# Advanced preflight overrides
+$PreflightAutoTuneCustomTargetGiBPerHour = $null
+$PreflightAutoTuneCustomUpperGiBPerHour = $null
+$PreflightAutoTuneCustomLowerGiBPerHour = $null
 
 # Film grain synthesis
 # AV1 supports storing a compact grain model in the bitstream instead of encoding
@@ -105,6 +185,7 @@ $QueueRoot       = Join-Path $PSScriptRoot ".queue"
 $QueuePendingDir = Join-Path $QueueRoot "pending"
 $QueueWorkingDir = Join-Path $QueueRoot "working"
 $BackupDir       = Join-Path $QueueRoot "backup_originals"
+$PreflightDir    = Join-Path $QueueRoot "preflight"
 $LogPath         = Join-Path $QueueRoot "encode_log.csv"
 $StatePath       = Join-Path $QueueRoot "current_job.json"
 
@@ -124,13 +205,46 @@ $LogColumns = @(
     'HasDV',
     'SelectedAudio',
     'SelectedSubtitles',
+    'EstimatedFinalSizeGiB',
+    'EstimatedSavingsPercent',
+    'EstimatedOutputGiBPerHour',
+    'InitialResolvedCRF',
+    'InitialResolvedPreset',
+    'InitialResolvedFilmGrain',
+    'PreflightPassCount',
+    'Preflight1EstimatedFinalGiB',
+    'Preflight1EstimatedSavingsPercent',
+    'Preflight1EstimatedGiBPerHour',
+    'Preflight2EstimatedFinalGiB',
+    'Preflight2EstimatedSavingsPercent',
+    'Preflight2EstimatedGiBPerHour',
+    'FinalResolvedCRF',
+    'FinalResolvedPreset',
+    'FinalResolvedFilmGrain',
+    'PreflightAutoTuneReason',
+    'WasPreflightRetuned',
+    'WasSkippedByPreflight',
     'CRF',
     'Preset',
     'FilmGrain',
     'AutoCRFOffset',
+    'EncoderPreference',
+    'ResolvedEncodeLane',
+    'LaneSelectionReason',
+    'LaneSuitability',
+    'CpuOnlyReason',
+    'NvidiaFallbackAllowed',
+    'HeldForCpuLane',
+    'WorkerProcessPriority',
+    'ScriptProcessPriority',
+    'EncodeMode',
     'ResolvedCRF',
     'ResolvedPreset',
     'ResolvedFilmGrain',
+    'ResolvedCQ',
+    'ResolvedNvencPreset',
+    'ResolvedNvencTune',
+    'ResolvedDecodePath',
     'AutoReason',
     'BPP',
     'EffectiveVideoBitrate',
@@ -140,16 +254,21 @@ $LogColumns = @(
     'GrainClass',
     'GrainScore',
     'WasAutoSkipped',
+    'NvencWorkerCountAtStart',
+    'NvencEngineCountDetected',
+    'NvencCapacitySource',
+    'DetectedGpuName',
+    'FilmGrainDisabledReason',
     'FfmpegPath',
     'FfprobePath',
     'Notes'
 )
 
-# Named mutex used to enforce single-worker execution.
+# Named mutex used to enforce a single queue-manager instance.
 # The "Global\" prefix makes it machine-wide so it works across all console
 # sessions and UAC boundaries. Each script directory keeps its own .queue
 # folder, so two separate copies of this script queue independently but will
-# never encode simultaneously.
+# never drive the same queue at the same time.
 $MutexName = "Global\PlexAV1QueueMutex"
 
 # =============================================================================
@@ -177,7 +296,7 @@ if (-not (Test-Path -LiteralPath $FfprobePath)) {
 # Creates the directory tree on first run, and writes the CSV header row if
 # the log file does not yet exist.
 # =============================================================================
-$null = New-Item -ItemType Directory -Force -Path $QueueRoot, $QueuePendingDir, $QueueWorkingDir, $BackupDir
+$null = New-Item -ItemType Directory -Force -Path $QueueRoot, $QueuePendingDir, $QueueWorkingDir, $BackupDir, $PreflightDir
 
 if (-not (Test-Path -LiteralPath $LogPath)) {
     ($LogColumns -join ",") |
@@ -210,6 +329,146 @@ function Write-LogRow {
     }) -join ","
 
     Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+
+    if ($script:SessionLogPath) {
+        Write-SessionTextLogEntry -Row $ordered
+    }
+}
+
+function Resolve-SessionTextLogPath {
+    if (-not [string]::IsNullOrWhiteSpace($script:SessionLogPath) -and (Test-Path -LiteralPath $script:SessionLogPath)) {
+        return $script:SessionLogPath
+    }
+
+    $hasActiveQueueSession = $false
+    try {
+        $hasActiveQueueSession = (@(Get-ChildItem -LiteralPath $QueueWorkingDir -Filter *.json -File -ErrorAction SilentlyContinue).Count -gt 0) -or
+            (Test-Path -LiteralPath $StatePath)
+    } catch {}
+    if (-not $hasActiveQueueSession) { return $null }
+
+    try {
+        $latest = @(Get-ChildItem -LiteralPath $QueueRoot -Filter *.log -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1)
+        if ($latest.Count -gt 0) {
+            return $latest[0].FullName
+        }
+    } catch {}
+
+    return $null
+}
+
+function Write-SessionTextLogMessage {
+    param(
+        [string]$Message,
+        [ValidateSet('Info', 'Warn', 'Err')]
+        [string]$Level = 'Info'
+    )
+
+    $logPath = Resolve-SessionTextLogPath
+    if ([string]::IsNullOrWhiteSpace($logPath)) { return }
+    $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Add-Content -LiteralPath $logPath -Value ("[{0}] [{1}] {2}" -f $stamp, $Level, $Message) -Encoding UTF8
+}
+
+function Write-SessionTextLogEntry {
+    param($Row)
+
+    if ([string]::IsNullOrWhiteSpace($script:SessionLogPath) -or $null -eq $Row) { return }
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $level = switch -Regex ([string]$Row.Status) {
+        '^FAILED' { 'Err'; break }
+        '^SUCCESS' { 'Info'; break }
+        '^SKIPPED|^AUTO_SKIPPED|^PRECHECK_SKIPPED' { 'Warn'; break }
+        default { 'Info' }
+    }
+    $parts.Add("Status $($Row.Status)")
+
+    $inputName = if (-not [string]::IsNullOrWhiteSpace([string]$Row.InputPath)) {
+        [System.IO.Path]::GetFileName([string]$Row.InputPath)
+    } else {
+        ''
+    }
+    if ($inputName) { $parts.Add($inputName) }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Row.ResolvedEncodeLane)) { $parts.Add("Lane $($Row.ResolvedEncodeLane)") }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Row.EncodeMode))         { $parts.Add("Mode $($Row.EncodeMode)") }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Row.Profile))            { $parts.Add("Profile $($Row.Profile)") }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Row.OutputSizeGiB))      { $parts.Add("Output $($Row.OutputSizeGiB) GiB") }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Row.ReductionPercent))   { $parts.Add("Savings $($Row.ReductionPercent)%") }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Row.ResolvedCRF))        { $parts.Add("CRF $($Row.ResolvedCRF)") }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Row.ResolvedCQ))         { $parts.Add("CQ $($Row.ResolvedCQ)") }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Row.ResolvedPreset))     { $parts.Add("Preset $($Row.ResolvedPreset)") }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Row.ResolvedNvencPreset)){ $parts.Add("NVENC $($Row.ResolvedNvencPreset)") }
+
+    $reason = if (-not [string]::IsNullOrWhiteSpace([string]$Row.LaneSelectionReason)) {
+        [string]$Row.LaneSelectionReason
+    } elseif (-not [string]::IsNullOrWhiteSpace([string]$Row.AutoReason)) {
+        [string]$Row.AutoReason
+    } else {
+        [string]$Row.Notes
+    }
+    if (-not [string]::IsNullOrWhiteSpace($reason)) { $parts.Add("Reason $reason") }
+
+    Write-SessionTextLogMessage -Level $level -Message ($parts -join ' | ')
+}
+
+function Write-SessionEncodeStart {
+    param($Init)
+
+    if ($null -eq $Init) { return }
+
+    $modeLabel = if ($Init.ResolvedEncodeLane -eq 'Nvidia') { 'NVENC' } else { 'SVT-AV1' }
+    Write-SessionTextLogMessage -Level Info -Message ("Starting | {0} -> {1} | Lane {2} | Mode {3}" -f $Init.DisplayInputName, $Init.DisplayOutputName, $Init.ResolvedEncodeLane, $modeLabel)
+    Write-SessionTextLogMessage -Level Info -Message ("Lane decision | {0}" -f $Init.LaneSelectionReason)
+
+    $sourceColor = Get-OptionalProperty -InputObject $Init.SourceProfile -PropertyName 'SourceColorSummary' -Default ''
+    $encodeColor = Get-OptionalProperty -InputObject $Init.EncodeColorProfile -PropertyName 'Summary' -Default ''
+    if (-not [string]::IsNullOrWhiteSpace($sourceColor) -or -not [string]::IsNullOrWhiteSpace($encodeColor)) {
+        Write-SessionTextLogMessage -Level Info -Message ("Color | Source {0} -> Output {1}" -f $sourceColor, $encodeColor)
+    }
+
+    if ($Init.ResolvedEncodeLane -eq 'Nvidia' -and $Init.NvencSettings) {
+        Write-SessionTextLogMessage -Level Info -Message ("Output settings | CQ {0} | NVENC {1} | Tune {2} | Decode {3} | Priority {4}" -f $Init.NvencSettings.CQ, $Init.NvencSettings.Preset, $Init.NvencSettings.TuneDisplay, $Init.NvencSettings.DecodePath, $Init.WorkerProcessPriority)
+    } else {
+        Write-SessionTextLogMessage -Level Info -Message ("Output settings | CRF {0} | Preset {1} | FilmGrain {2} | Priority {3}" -f $Init.PreflightWorkflow.FinalResolvedCRF, $Init.PreflightWorkflow.FinalResolvedPreset, $Init.EffectiveFilmGrain, $Init.WorkerProcessPriority)
+    }
+
+    $autoReason = if ($Init.PreflightWorkflow -and -not [string]::IsNullOrWhiteSpace($Init.PreflightWorkflow.PreflightAutoTuneReason)) {
+        $Init.PreflightWorkflow.PreflightAutoTuneReason
+    } else {
+        Get-OptionalProperty -InputObject $Init.AutoSettings -PropertyName 'Reason' -Default ''
+    }
+    if (-not [string]::IsNullOrWhiteSpace($autoReason)) {
+        Write-SessionTextLogMessage -Level Info -Message ("Auto reason | {0}" -f $autoReason)
+    }
+
+    $signalLine = "Signals | {0} | {1} | {2} | BPP {3}" -f `
+        (Get-OptionalProperty -InputObject $Init.AutoSettings -PropertyName 'ResolutionTier' -Default ''), `
+        (Get-OptionalProperty -InputObject $Init.SourceProfile -PropertyName 'Profile' -Default ''), `
+        (Get-OptionalProperty -InputObject $Init.AutoSettings -PropertyName 'CodecLabel' -Default ''), `
+        ([Math]::Round((Convert-ToInvariantDouble (Get-OptionalProperty -InputObject $Init.AutoSettings -PropertyName 'BPP' -Default 0.0) 0.0), 4))
+    Write-SessionTextLogMessage -Level Info -Message $signalLine
+}
+
+function Start-SessionTextLog {
+    $stamp = Get-Date -Format 'HH-mm-yyyy-MM-dd'
+    $candidatePath = Join-Path $QueueRoot ("{0}.log" -f $stamp)
+    $suffix = 1
+    while (Test-Path -LiteralPath $candidatePath) {
+        $suffix++
+        $candidatePath = Join-Path $QueueRoot ("{0}_{1}.log" -f $stamp, $suffix)
+    }
+
+    $script:SessionLogPath = $candidatePath
+    Set-Content -LiteralPath $script:SessionLogPath -Value ("Media2AV1Queue session log`r`nStarted: {0}`r`n" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) -Encoding UTF8
+
+    Write-SessionTextLogMessage -Level Info -Message ("EncoderPreference={0}" -f $EncoderPreference)
+    if ($script:NvencEnvironment) {
+        Write-SessionTextLogMessage -Level Info -Message ("GPU={0} | NVENC engines={1} | Capacity={2} ({3})" -f $script:NvencEnvironment.GpuName, $script:NvencEnvironment.NvencEngineCount, $script:NvencEnvironment.MaxParallel, $script:NvencEnvironment.CapacitySource)
+    }
 }
 
 function Convert-ToInvariantDouble {
@@ -269,6 +528,96 @@ function Resolve-ConfigValue {
     return $parsed
 }
 
+function Resolve-BooleanConfigValue {
+    param(
+        [string]$Name,
+        $Value
+    )
+
+    if ($Value -is [bool]) { return $Value }
+
+    $text = ([string]$Value).Trim().ToLowerInvariant()
+    if ($text -in @('true', '$true', '1', 'yes', 'on')) { return $true }
+    if ($text -in @('false', '$false', '0', 'no', 'off')) { return $false }
+
+    throw "$Name must be `$true or `$false. Current value: $Value"
+}
+
+function Resolve-EncoderPreferenceConfigValue {
+    param(
+        [string]$Name,
+        $Value
+    )
+
+    if ($null -eq $Value) {
+        throw "$Name must be one of: Auto, CPU, Nvidia."
+    }
+
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        throw "$Name must be one of: Auto, CPU, Nvidia."
+    }
+
+    switch ($text.ToLowerInvariant()) {
+        'auto'   { return 'Auto' }
+        'cpu'    { return 'CPU' }
+        'nvidia' { return 'Nvidia' }
+        default  { throw "$Name must be one of: Auto, CPU, Nvidia. Current value: $Value" }
+    }
+}
+
+function Resolve-ProcessPriorityConfigValue {
+    param(
+        [string]$Name,
+        $Value
+    )
+
+    if ($null -eq $Value) {
+        throw "$Name must be one of: Idle, BelowNormal, Normal, AboveNormal."
+    }
+
+    $text = ([string]$Value).Trim()
+    switch ($text.ToLowerInvariant()) {
+        'idle'        { return 'Idle' }
+        'belownormal' { return 'BelowNormal' }
+        'normal'      { return 'Normal' }
+        'abovenormal' { return 'AboveNormal' }
+        default       { throw "$Name must be one of: Idle, BelowNormal, Normal, AboveNormal. Current value: $Value" }
+    }
+}
+
+function Resolve-DoubleRangeConfigValue {
+    param(
+        [string]$Name,
+        $Value,
+        [double]$Minimum,
+        [double]$Maximum
+    )
+
+    $parsed = Convert-ToInvariantDouble $Value ([double]::NaN)
+    if ([double]::IsNaN($parsed) -or $parsed -lt $Minimum -or $parsed -gt $Maximum) {
+        throw "$Name must be a number from $Minimum to $Maximum. Current value: $Value"
+    }
+
+    return $parsed
+}
+
+function Resolve-NullableDoubleRangeConfigValue {
+    param(
+        [string]$Name,
+        $Value,
+        [double]$Minimum,
+        [double]$Maximum
+    )
+
+    if ($null -eq $Value) { return $null }
+
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+
+    return Resolve-DoubleRangeConfigValue -Name $Name -Value $Value -Minimum $Minimum -Maximum $Maximum
+}
+
 function Resolve-OffsetConfigValue {
     param(
         [string]$Name,
@@ -286,6 +635,104 @@ function Resolve-OffsetConfigValue {
     }
 
     return $parsed
+}
+
+function Resolve-NvencPresetConfigValue {
+    param(
+        [string]$Name,
+        $Value
+    )
+
+    if ($Value -is [string] -and $Value.Trim().ToLowerInvariant() -eq 'auto') {
+        return 'Auto'
+    }
+
+    $text = ([string]$Value).Trim().ToLowerInvariant()
+    if ($text -match '^p[1-7]$') {
+        return $text
+    }
+
+    throw "$Name must be one of p1-p7 or 'Auto'. Current value: $Value"
+}
+
+function Resolve-NvencDecodeConfigValue {
+    param(
+        [string]$Name,
+        $Value
+    )
+
+    $text = ([string]$Value).Trim().ToLowerInvariant()
+    if ($text -in @('auto', 'cpu', 'cuda')) {
+        if ($text -eq 'auto') { return 'Auto' }
+        return $text
+    }
+
+    throw "$Name must be 'Auto', 'cpu', or 'cuda'. Current value: $Value"
+}
+
+function Resolve-NvencTuneConfigValue {
+    param(
+        [string]$Name,
+        $Value
+    )
+
+    if ($null -eq $Value) { return $null }
+
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+
+    $normalized = $text.ToLowerInvariant()
+    if ($normalized -eq 'auto') { return 'Auto' }
+    if ($normalized -in @('hq', 'll', 'ull')) { return $normalized }
+
+    throw "$Name must be one of 'Auto', 'hq', 'll', 'ull', or `$null. Current value: $Value"
+}
+
+function Resolve-PreflightAutoTuneQualityConfigValue {
+    param(
+        [string]$Name,
+        $Value
+    )
+
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        throw "$Name must be 'Low', 'Medium', or 'High'. Current value: $Value"
+    }
+
+    switch ($text.ToLowerInvariant()) {
+        'low' { return 'Low' }
+        'medium' { return 'Medium' }
+        'high' { return 'High' }
+        default { throw "$Name must be 'Low', 'Medium', or 'High'. Current value: $Value" }
+    }
+}
+
+function Test-RequiredFfmpegBuild {
+    param([string]$ExecutablePath)
+
+    $versionText = (& $ExecutablePath -hide_banner -version | Out-String)
+    if ([string]::IsNullOrWhiteSpace($versionText)) {
+        throw "Unable to inspect FFmpeg version information. This script requires a full FFmpeg 8.1 build."
+    }
+
+    $versionLine = (($versionText -split "\r?\n")[0]).Trim()
+
+    if ($versionText -match '(?im)^ffmpeg version [^\r\n]*\b(?:n?6(?:\.\d+)?|n?7(?:\.\d+)?)\b') {
+        throw "This script requires a full FFmpeg 8.1 build. FFmpeg 6.x / 7.x builds are unsupported. Detected: $versionLine"
+    }
+
+    if ($versionText -match '(?i)\b(?:essentials|basic|minimal|lite)(?:[_ -]?build)?\b') {
+        throw "This script requires a full FFmpeg 8.1 build. Stripped/basic FFmpeg builds are unsupported. Detected: $versionLine"
+    }
+
+    if ($versionText -notmatch '(?i)\b(?:n?8\.1|8\.1)\b' -and $versionText -notmatch '(?i)full_build') {
+        Write-Warning "This script is designed for a full FFmpeg 8.1 build. Older FFmpeg 6.x / 7.x and stripped/basic builds are unsupported. Detected: $versionLine. NVENC tune support will still be checked against the local build."
+    }
+
+    return [ordered]@{
+        VersionLine = $versionLine
+        VersionText = $versionText
+    }
 }
 
 function Update-LogSchemaIfNeeded {
@@ -316,6 +763,1279 @@ function Update-LogSchemaIfNeeded {
     }
 
     Set-Content -LiteralPath $LogPath -Value $rewritten -Encoding UTF8
+}
+
+function Test-TextContainsOption {
+    param(
+        [string]$Text,
+        [string]$OptionName
+    )
+
+    return ($Text -match "(?m)^\s+-$([Regex]::Escape($OptionName))\b")
+}
+
+function Test-TextContainsValue {
+    param(
+        [string]$Text,
+        [string]$Value
+    )
+
+    return ($Text -match "(?m)^\s+$([Regex]::Escape($Value))\b")
+}
+
+function Test-NvencTuneSupported {
+    param([string]$EncoderHelpText)
+
+    return Test-TextContainsOption -Text $EncoderHelpText -OptionName 'tune'
+}
+
+function Get-NvidiaSmiPath {
+    $cmd = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    $defaultPath = Join-Path ${env:ProgramFiles} 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'
+    if (Test-Path -LiteralPath $defaultPath) { return $defaultPath }
+
+    return $null
+}
+
+function Get-NvencEngineCountFromGpuName {
+    param([string]$GpuName)
+
+    $normalized = ([string]$GpuName).ToUpperInvariant().Trim()
+    $lookup = [ordered]@{
+        'RTX 5090 LAPTOP GPU'                 = 1
+        'RTX 5080 LAPTOP GPU'                 = 1
+        'RTX 5070 TI LAPTOP GPU'              = 1
+        'RTX 5070 LAPTOP GPU'                 = 1
+        'RTX 5060 LAPTOP GPU'                 = 1
+        'RTX 4090 LAPTOP GPU'                 = 1
+        'RTX 4080 LAPTOP GPU'                 = 1
+        'RTX 4070 LAPTOP GPU'                 = 1
+        'RTX 4060 LAPTOP GPU'                 = 1
+        'RTX 4050 LAPTOP GPU'                 = 1
+        'RTX 5090'                            = 3
+        'RTX 5080'                            = 2
+        'RTX 5070 TI'                         = 1
+        'RTX 5070'                            = 1
+        'RTX 5060 TI'                         = 1
+        'RTX 5060'                            = 1
+        'RTX 4090'                            = 2
+        'RTX 4080 SUPER'                      = 1
+        'RTX 4080'                            = 1
+        'RTX 4070 TI SUPER'                   = 1
+        'RTX 4070 TI'                         = 1
+        'RTX 4070 SUPER'                      = 1
+        'RTX 4070'                            = 1
+        'RTX 4060 TI'                         = 1
+        'RTX 4060'                            = 1
+        'RTX 6000 ADA GENERATION'             = 3
+        'RTX 5000 ADA GENERATION'             = 2
+        'RTX 4500 ADA GENERATION'             = 1
+        'RTX 4000 ADA GENERATION'             = 1
+        'RTX 4000 SFF ADA GENERATION'         = 1
+        'RTX 3500 ADA GENERATION LAPTOP GPU'  = 1
+        'RTX 3000 ADA GENERATION LAPTOP GPU'  = 1
+        'RTX 2000 ADA GENERATION LAPTOP GPU'  = 1
+    }
+
+    foreach ($key in $lookup.Keys) {
+        if ($normalized -like "*$key*") {
+            return [ordered]@{
+                EngineCount = [int]$lookup[$key]
+                Source      = 'matrix'
+                Warning     = ''
+            }
+        }
+    }
+
+    $genericAdaOrBlackwell = $normalized -match 'RTX 4\d{3}|RTX 5\d{3}|ADA'
+    $warning = if ($genericAdaOrBlackwell) {
+        "GPU model '$GpuName' was not found in the curated NVENC lookup table. Defaulting to 1 NVENC engine conservatively."
+    } else {
+        "GPU model '$GpuName' is not recognized as an AV1-capable NVIDIA model. Defaulting to 1 NVENC engine."
+    }
+
+    return [ordered]@{
+        EngineCount = 1
+        Source      = 'fallback'
+        Warning     = $warning
+    }
+}
+
+function Get-NvencEnvironment {
+    $encodersText = (& $FfmpegPath -hide_banner -encoders | Out-String)
+    if ($encodersText -notmatch '(?m)\bav1_nvenc\b') {
+        throw "NVENC mode requested, but this FFmpeg build does not expose av1_nvenc."
+    }
+
+    $encoderHelpText = (& $FfmpegPath -hide_banner -h encoder=av1_nvenc | Out-String)
+    if (-not $encoderHelpText) {
+        throw "NVENC mode requested, but FFmpeg could not describe encoder=av1_nvenc."
+    }
+
+    $nvidiaSmiPath = Get-NvidiaSmiPath
+    if (-not $nvidiaSmiPath) {
+        throw "NVENC mode requested, but nvidia-smi was not found."
+    }
+
+    $gpuNames = @(& $nvidiaSmiPath --query-gpu=name --format=csv,noheader 2>$null | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if (-not $gpuNames -or $gpuNames.Count -eq 0) {
+        throw "NVENC mode requested, but no usable NVIDIA GPU was reported by nvidia-smi."
+    }
+
+    $primaryGpuName = [string]$gpuNames[0]
+    $engineInfo = Get-NvencEngineCountFromGpuName -GpuName $primaryGpuName
+    if ($engineInfo.Warning) {
+        Write-Warning $engineInfo.Warning
+    }
+
+    $hwaccelsText = (& $FfmpegPath -hide_banner -hwaccels | Out-String)
+    $supportsCudaHwaccel = ($hwaccelsText -match '(?m)^\s*cuda\s*$')
+
+    $maxParallel = if ($NvencMaxParallel -eq 'Auto') { [int]$engineInfo.EngineCount } else { [int]$NvencMaxParallel }
+    $capacitySource = if ($NvencMaxParallel -eq 'Auto') { $engineInfo.Source } else { 'overridden' }
+
+    return [ordered]@{
+        Available             = $true
+        EncoderHelpText       = $encoderHelpText
+        SupportsPreset        = Test-TextContainsOption -Text $encoderHelpText -OptionName 'preset'
+        SupportsTune          = Test-NvencTuneSupported -EncoderHelpText $encoderHelpText
+        SupportsRc            = Test-TextContainsOption -Text $encoderHelpText -OptionName 'rc'
+        SupportsCQ            = Test-TextContainsOption -Text $encoderHelpText -OptionName 'cq'
+        SupportsLookahead     = Test-TextContainsOption -Text $encoderHelpText -OptionName 'rc-lookahead'
+        SupportsSpatialAQ     = Test-TextContainsOption -Text $encoderHelpText -OptionName 'spatial-aq'
+        SupportsTemporalAQ    = Test-TextContainsOption -Text $encoderHelpText -OptionName 'temporal-aq'
+        SupportsAQStrength    = Test-TextContainsOption -Text $encoderHelpText -OptionName 'aq-strength'
+        SupportsBRefMode      = Test-TextContainsOption -Text $encoderHelpText -OptionName 'b_ref_mode'
+        SupportsMultipass     = Test-TextContainsOption -Text $encoderHelpText -OptionName 'multipass'
+        SupportsHighBitDepth  = Test-TextContainsOption -Text $encoderHelpText -OptionName 'highbitdepth'
+        SupportsSplitEncode   = Test-TextContainsOption -Text $encoderHelpText -OptionName 'split_encode_mode'
+        SupportsP4            = Test-TextContainsValue -Text $encoderHelpText -Value 'p4'
+        SupportsP5            = Test-TextContainsValue -Text $encoderHelpText -Value 'p5'
+        SupportsP6            = Test-TextContainsValue -Text $encoderHelpText -Value 'p6'
+        SupportsP7            = Test-TextContainsValue -Text $encoderHelpText -Value 'p7'
+        SupportsTuneHQ        = Test-TextContainsValue -Text $encoderHelpText -Value 'hq'
+        SupportsTuneLL        = Test-TextContainsValue -Text $encoderHelpText -Value 'll'
+        SupportsTuneULL       = Test-TextContainsValue -Text $encoderHelpText -Value 'ull'
+        SupportsCudaHwaccel   = $supportsCudaHwaccel
+        GpuName               = $primaryGpuName
+        AllGpuNames           = $gpuNames
+        NvencEngineCount      = [int]$engineInfo.EngineCount
+        MaxParallel           = [Math]::Max(1, $maxParallel)
+        CapacitySource        = $capacitySource
+        NvidaSmiPath          = $nvidiaSmiPath
+    }
+}
+
+function Resolve-NvencTune {
+    param(
+        [AllowNull()][string]$ConfiguredNvencTune,
+        $NvencEnvironment
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$ConfiguredNvencTune)) {
+        return [ordered]@{
+            Tune    = $null
+            Reason  = 'NVENC Tune: disabled (user setting empty/null)'
+            Warning = ''
+        }
+    }
+
+    if ($ConfiguredNvencTune -eq 'Auto') {
+        if ($NvencEnvironment.SupportsTune -and $NvencEnvironment.SupportsTuneHQ) {
+            return [ordered]@{
+                Tune    = 'hq'
+                Reason  = 'NVENC Tune: hq (supported by local FFmpeg build)'
+                Warning = ''
+            }
+        }
+
+        return [ordered]@{
+            Tune    = $null
+            Reason  = 'NVENC Tune: disabled (not supported by local FFmpeg build)'
+            Warning = ''
+        }
+    }
+
+    if (-not $NvencEnvironment.SupportsTune) {
+        return [ordered]@{
+            Tune    = $null
+            Reason  = 'NVENC Tune: disabled (not supported by local FFmpeg build)'
+            Warning = "NVENC tune '$ConfiguredNvencTune' was requested, but this FFmpeg build does not expose -tune for av1_nvenc. Tune has been disabled."
+        }
+    }
+
+    $supportKey = switch ($ConfiguredNvencTune) {
+        'hq'  { 'SupportsTuneHQ' }
+        'll'  { 'SupportsTuneLL' }
+        'ull' { 'SupportsTuneULL' }
+        default { '' }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($supportKey) -or -not $NvencEnvironment[$supportKey]) {
+        return [ordered]@{
+            Tune    = $null
+            Reason  = "NVENC Tune: disabled (local FFmpeg build does not expose tune '$ConfiguredNvencTune')"
+            Warning = "NVENC tune '$ConfiguredNvencTune' was requested, but this FFmpeg build does not list it for av1_nvenc. Tune has been disabled."
+        }
+    }
+
+    return [ordered]@{
+        Tune    = $ConfiguredNvencTune
+        Reason  = "NVENC Tune: $ConfiguredNvencTune (supported by local FFmpeg build)"
+        Warning = ''
+    }
+}
+
+function Convert-SoftwareQualityToNvencSettings {
+    param(
+        $AutoSettings,
+        $SourceProfile,
+        [string]$ConfiguredNvencPreset,
+        $ConfiguredNvencCQ,
+        [string]$ConfiguredNvencTune,
+        [string]$ConfiguredNvencDecode,
+        $NvencEnvironment
+    )
+
+    $softwareCrf = [int]$AutoSettings.CRF
+    $cq = if ($ConfiguredNvencCQ -eq 'Auto') {
+        [Math]::Max(0, [Math]::Min(63, ($softwareCrf + 8)))
+    } else {
+        [int]$ConfiguredNvencCQ
+    }
+
+    $preset = $ConfiguredNvencPreset
+    $presetReason = "Manual: using configured NVENC preset $ConfiguredNvencPreset."
+    if ($ConfiguredNvencPreset -eq 'Auto') {
+        if (($AutoSettings.ResolutionTier -eq 'UHD' -and $SourceProfile.HasHDR) -or
+            ($AutoSettings.GrainClass -in @('heavy', 'extreme')) -or
+            ($AutoSettings.BPPTier -eq 'high')) {
+            $preset = if ($NvencEnvironment.SupportsP6) { 'p6' } elseif ($NvencEnvironment.SupportsP5) { 'p5' } else { 'p4' }
+            $presetReason = 'Auto: higher-quality NVENC preset for difficult HDR/UHD or heavy-grain content.'
+        } elseif (($AutoSettings.ResolutionTier -in @('SD', 'HD')) -and
+                  ($SourceProfile.Profile -eq 'SDR') -and
+                  ($AutoSettings.BPPTier -in @('low', 'medium')) -and
+                  ($AutoSettings.GrainClass -in @('none', 'light', 'unknown'))) {
+            $preset = if ($NvencEnvironment.SupportsP4) { 'p4' } else { 'p5' }
+            $presetReason = 'Auto: speed-favored NVENC preset for easier SDR content.'
+        } else {
+            $preset = if ($NvencEnvironment.SupportsP5) { 'p5' } else { 'p4' }
+            $presetReason = 'Auto: balanced NVENC preset.'
+        }
+    }
+
+    $tuneResolution = Resolve-NvencTune -ConfiguredNvencTune $ConfiguredNvencTune -NvencEnvironment $NvencEnvironment
+    $tune = $tuneResolution.Tune
+    $tuneReason = $tuneResolution.Reason
+
+    $decodePath = $ConfiguredNvencDecode
+    $decodeReason = "Manual: using configured decode path $ConfiguredNvencDecode."
+    if ($ConfiguredNvencDecode -eq 'Auto') {
+        $decodePath = 'cpu'
+        $decodeReason = 'Auto: CPU decode selected for maximum compatibility and filter-path reliability.'
+    } elseif ($ConfiguredNvencDecode -eq 'cuda' -and -not $NvencEnvironment.SupportsCudaHwaccel) {
+        $decodePath = 'cpu'
+        $decodeReason = 'Requested CUDA decode is not supported by this FFmpeg build; falling back to CPU decode.'
+    }
+
+    $pixFmt = if ($SourceProfile.HasHDR -or $AutoSettings.BitDepth -ge 10) { 'p010le' } else { 'yuv420p' }
+    $bitDepth = if ($pixFmt -eq 'p010le') { 10 } else { 8 }
+
+    return [ordered]@{
+        CQ             = $cq
+        Preset         = $preset
+        PresetReason   = $presetReason
+        Tune           = $tune
+        TuneReason     = $tuneReason
+        TuneWarning    = $tuneResolution.Warning
+        TuneDisplay    = if ([string]::IsNullOrWhiteSpace([string]$tune)) { 'disabled' } else { $tune }
+        DecodePath     = $decodePath
+        DecodeReason   = $decodeReason
+        PixFmt         = $pixFmt
+        BitDepth       = $bitDepth
+        Reason         = "Mapped software-style Auto CRF $softwareCrf to NVENC CQ $cq."
+    }
+}
+
+function Get-ResolvedEncodeLaneName {
+    param([string]$EncodeMode)
+
+    if ($EncodeMode -eq 'nvenc') { return 'Nvidia' }
+    return 'CPU'
+}
+
+function Get-AutoLaneHint {
+    param(
+        $SourceProfile,
+        $AutoSettings
+    )
+
+    $preflightTargets = Resolve-PreflightAutoTuneTargets -QualityProfile $PreflightAutoTuneQuality -ResolutionTier $AutoSettings.ResolutionTier -SourceProfile $SourceProfile
+
+    if ($SourceProfile.HasHDR -and $AutoSettings.ResolutionTier -eq 'UHD') {
+        return [pscustomobject][ordered]@{
+            Lane   = 'CPU'
+            Reason = 'modern UHD HDR source; software lane favored for compression efficiency'
+        }
+    }
+
+    if (($AutoSettings.CodecClass -eq 'modern' -and $AutoSettings.BPPTier -in @('medium', 'high')) -or
+        ($AutoSettings.VideoBitratePerHourGiB -ge $preflightTargets.UpperGiBPerHour)) {
+        return [pscustomobject][ordered]@{
+            Lane   = 'CPU'
+            Reason = 'modern or high-density source; software lane favored'
+        }
+    }
+
+    if (($SourceProfile.Profile -eq 'SDR') -and
+        ($AutoSettings.ResolutionTier -in @('SD', 'HD')) -and
+        ($AutoSettings.CodecClass -in @('legacy', 'standard')) -and
+        ($AutoSettings.BPPTier -in @('low', 'medium'))) {
+        return [pscustomobject][ordered]@{
+            Lane   = 'Nvidia'
+            Reason = 'SDR HD/SD source with lower-risk compression profile; Nvidia lane favored for throughput'
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Lane   = 'CPU'
+        Reason = 'quality-first default; software lane favored when source complexity is uncertain'
+    }
+}
+
+function Get-EncoderLaneSuitability {
+    param(
+        $SourceProfile,
+        $AutoSettings
+    )
+
+    $cpuOnlyScore = 0
+    $cpuReasons = [System.Collections.Generic.List[string]]::new()
+    $nvidiaPreferredScore = 0
+    $nvidiaReasons = [System.Collections.Generic.List[string]]::new()
+    $preflightTargets = Resolve-PreflightAutoTuneTargets -QualityProfile $PreflightAutoTuneQuality -ResolutionTier $AutoSettings.ResolutionTier -SourceProfile $SourceProfile
+
+    if ($AutoSettings.ResolutionTier -eq 'UHD' -and $SourceProfile.HasHDR) {
+        $cpuOnlyScore += 1
+        $cpuReasons.Add('UHD HDR source')
+    } elseif ($SourceProfile.HasHDR) {
+        $cpuOnlyScore += 1
+        $cpuReasons.Add('HDR source')
+    }
+
+    switch ($AutoSettings.GrainClass) {
+        'extreme' {
+            $cpuOnlyScore += 3
+            $cpuReasons.Add('extreme grain')
+        }
+        'heavy' {
+            $cpuOnlyScore += 3
+            $cpuReasons.Add('heavy grain')
+        }
+        'moderate' {
+            $cpuOnlyScore += 0
+            $cpuReasons.Add('moderate grain')
+        }
+    }
+
+    if ($AutoSettings.CodecClass -eq 'modern') {
+        $cpuOnlyScore += 1
+        $cpuReasons.Add('modern source codec')
+    } elseif ($AutoSettings.CodecClass -eq 'standard' -and $AutoSettings.BPPTier -eq 'high') {
+        $cpuOnlyScore += 1
+        $cpuReasons.Add('high-density AVC source')
+    }
+
+    if ($AutoSettings.BPPTier -eq 'high') {
+        $cpuOnlyScore += 1
+        $cpuReasons.Add('high BPP content')
+    }
+
+    if ($AutoSettings.VideoBitratePerHourGiB -ge $preflightTargets.UpperGiBPerHour) {
+        $cpuOnlyScore += 1
+        $cpuReasons.Add('high projected density')
+    }
+
+    if ([int]$AutoSettings.FilmGrain -ge 12 -or $AutoSettings.GrainClass -in @('heavy', 'extreme')) {
+        $cpuOnlyScore += 1
+        $cpuReasons.Add('software film-grain tools matter')
+    }
+
+    if (($AutoSettings.ResolutionTier -eq 'UHD') -and
+        $SourceProfile.HasHDR -and
+        ($AutoSettings.GrainClass -in @('heavy', 'extreme')) -and
+        ($AutoSettings.CodecClass -eq 'modern')) {
+        $cpuOnlyScore += 2
+        $cpuReasons.Add('quality-first worst-case NVENC candidate')
+    }
+
+    if (($SourceProfile.Profile -eq 'SDR') -and
+        ($AutoSettings.ResolutionTier -in @('SD', 'HD')) -and
+        ($AutoSettings.CodecClass -in @('legacy', 'standard')) -and
+        ($AutoSettings.BPPTier -in @('low', 'medium')) -and
+        ($AutoSettings.GrainClass -in @('none', 'light', 'unknown'))) {
+        $nvidiaPreferredScore += 4
+        $nvidiaReasons.Add('SDR HD/SD source with lower-risk compression profile')
+    }
+
+    if (($SourceProfile.Profile -eq 'SDR') -and ($AutoSettings.BPPTier -eq 'low')) {
+        $nvidiaPreferredScore += 1
+        $nvidiaReasons.Add('low-density SDR content')
+    }
+
+    if ($AutoSettings.CodecClass -eq 'legacy') {
+        $nvidiaPreferredScore += 1
+        $nvidiaReasons.Add('legacy source codec')
+    }
+
+    if ($cpuOnlyScore -ge 7) {
+        $reason = '{0}; software encoding strongly preferred' -f (($cpuReasons | Select-Object -Unique) -join ', ')
+        return [pscustomobject][ordered]@{
+            Suitability           = 'CpuOnly'
+            PreferredLane         = 'CPU'
+            Reason                = $reason
+            CpuOnlyReason         = $reason
+            NvidiaFallbackAllowed = $false
+        }
+    }
+
+    if ($nvidiaPreferredScore -ge 4 -and $cpuOnlyScore -le 1) {
+        $reason = if ($nvidiaReasons.Count -gt 0) {
+            '{0}; Nvidia lane favored for throughput' -f (($nvidiaReasons | Select-Object -Unique) -join ', ')
+        } else {
+            'Nvidia lane favored for throughput'
+        }
+
+        return [pscustomobject][ordered]@{
+            Suitability           = 'NvidiaPreferred'
+            PreferredLane         = 'Nvidia'
+            Reason                = $reason
+            CpuOnlyReason         = ''
+            NvidiaFallbackAllowed = $true
+        }
+    }
+
+    $fallbackReason = if ($cpuReasons.Count -gt 0) {
+        '{0}; software lane preferred but Nvidia fallback allowed' -f (($cpuReasons | Select-Object -Unique) -join ', ')
+    } else {
+        'quality-first default; software lane preferred but Nvidia fallback allowed'
+    }
+
+    return [pscustomobject][ordered]@{
+        Suitability           = 'NvidiaAllowedFallback'
+        PreferredLane         = 'CPU'
+        Reason                = $fallbackReason
+        CpuOnlyReason         = ''
+        NvidiaFallbackAllowed = $true
+    }
+}
+
+function Test-NvencFallbackSuitable {
+    param(
+        $LaneSuitability,
+        $Init
+    )
+
+    if ($null -eq $Init) {
+        return [pscustomobject][ordered]@{
+            Allowed = $true
+            Reason  = ''
+        }
+    }
+
+    if ($LaneSuitability -and $LaneSuitability.Suitability -eq 'CpuOnly') {
+        return [pscustomobject][ordered]@{
+            Allowed = $false
+            Reason  = if ($LaneSuitability.CpuOnlyReason) { $LaneSuitability.CpuOnlyReason } else { 'NVENC not recommended for this source.' }
+        }
+    }
+
+    if ($Init.ResolvedEncodeLane -ne 'Nvidia') {
+        return [pscustomobject][ordered]@{
+            Allowed = $true
+            Reason  = ''
+        }
+    }
+
+    $preflight = Get-OptionalProperty -InputObject $Init -PropertyName 'PreflightEstimate' -Default $null
+    $isHdr = [bool](Get-OptionalProperty -InputObject $Init.SourceProfile -PropertyName 'HasHDR' -Default $false)
+    $resolutionTier = [string](Get-OptionalProperty -InputObject $Init.AutoSettings -PropertyName 'ResolutionTier' -Default '')
+    $codecClass = [string](Get-OptionalProperty -InputObject $Init.AutoSettings -PropertyName 'CodecClass' -Default '')
+    $grainClass = [string](Get-OptionalProperty -InputObject $Init.AutoSettings -PropertyName 'GrainClass' -Default '')
+    $preflightTargets = Resolve-PreflightAutoTuneTargets -QualityProfile $PreflightAutoTuneQuality -ResolutionTier $resolutionTier -SourceProfile $Init.SourceProfile
+
+    if ($preflight -and $preflight.Ran) {
+        $pctOfSource = Convert-ToInvariantDouble (Get-OptionalProperty -InputObject $preflight -PropertyName 'EstimatedPctOfSource' -Default 0.0) 0.0
+        $gibPerHour = Convert-ToInvariantDouble (Get-OptionalProperty -InputObject $preflight -PropertyName 'EstimatedOutputGiBPerHour' -Default 0.0) 0.0
+        $savingsPct = Convert-ToInvariantDouble (Get-OptionalProperty -InputObject $preflight -PropertyName 'EstimatedSavingsPercent' -Default 0.0) 0.0
+
+        if ($pctOfSource -ge 90.0) {
+            return [pscustomobject][ordered]@{
+                Allowed = $false
+                Reason  = 'NVENC fallback held for CPU because preflight projects near-source-size output.'
+            }
+        }
+
+        if ($gibPerHour -gt $preflightTargets.UpperGiBPerHour -and $savingsPct -lt 25.0) {
+            return [pscustomobject][ordered]@{
+                Allowed = $false
+                Reason  = 'NVENC fallback held for CPU because preflight projects weak compression efficiency.'
+            }
+        }
+
+        if ($isHdr -and $resolutionTier -eq 'UHD' -and $codecClass -eq 'modern' -and $savingsPct -lt 20.0) {
+            return [pscustomobject][ordered]@{
+                Allowed = $false
+                Reason  = 'NVENC fallback held for CPU because modern UHD HDR content projected weak savings.'
+            }
+        }
+    }
+
+    if ($isHdr -and $resolutionTier -eq 'UHD' -and $codecClass -eq 'modern' -and $grainClass -in @('heavy', 'extreme')) {
+        return [pscustomobject][ordered]@{
+            Allowed = $false
+            Reason  = 'NVENC fallback held for CPU because heavy grain on modern UHD HDR content favors software encoding.'
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Allowed = $true
+        Reason  = ''
+    }
+}
+
+function Try-Get-NvencEnvironment {
+    try {
+        return Get-NvencEnvironment
+    } catch {
+        Write-Warning $_.Exception.Message
+        return $null
+    }
+}
+
+function Get-WorkerProcessPriorityName {
+    param([string]$EncodeMode)
+
+    if ($EncodeMode -eq 'nvenc') { return $HardwareEncodePriority }
+    return $SoftwareEncodePriority
+}
+
+function Set-TrackedProcessPriority {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$PriorityName
+    )
+
+    $currentName = try { $Process.PriorityClass.ToString() } catch { 'Normal' }
+
+    if (-not $ApplyProcessPriority) {
+        return [pscustomobject][ordered]@{
+            AppliedPriority = $currentName
+            Warning         = ''
+            Reason          = 'Process priority handling disabled; leaving worker at OS default priority.'
+        }
+    }
+
+    try {
+        $desiredPriority = [System.Diagnostics.ProcessPriorityClass]::$PriorityName
+        $Process.PriorityClass = $desiredPriority
+        return [pscustomobject][ordered]@{
+            AppliedPriority = $Process.PriorityClass.ToString()
+            Warning         = ''
+            Reason          = "Process priority: $($Process.PriorityClass)"
+        }
+    } catch {
+        return [pscustomobject][ordered]@{
+            AppliedPriority = $currentName
+            Warning         = "Could not set process priority to ${PriorityName}: $($_.Exception.Message)"
+            Reason          = "Process priority: $currentName (priority change failed)"
+        }
+    }
+}
+
+function Initialize-ConsoleShutdownHandling {
+    try {
+        $script:OriginalTreatControlCAsInput = [Console]::TreatControlCAsInput
+        [Console]::TreatControlCAsInput = $true
+    } catch {
+        $script:OriginalTreatControlCAsInput = $null
+    }
+}
+
+function Restore-ConsoleShutdownHandling {
+    try {
+        if ($null -ne $script:OriginalTreatControlCAsInput) {
+            [Console]::TreatControlCAsInput = [bool]$script:OriginalTreatControlCAsInput
+        }
+    } catch {}
+}
+
+function Initialize-TestHooks {
+    $envValue = [Environment]::GetEnvironmentVariable('MEDIA2AV1QUEUE_TEST_AUTO_SHUTDOWN_SEC')
+    if ([string]::IsNullOrWhiteSpace($envValue)) { return }
+
+    $seconds = 0
+    if (-not [int]::TryParse($envValue, [ref]$seconds)) { return }
+    if ($seconds -le 0) { return }
+
+    $script:TestAutoShutdownSeconds = $seconds
+    $script:TestAutoShutdownAt = (Get-Date).AddSeconds($seconds)
+}
+
+function Invoke-TestAutoShutdownIfDue {
+    if ($script:QueueShutdownRequested) { return $true }
+    if ($null -eq $script:TestAutoShutdownAt) { return $false }
+    if ((Get-Date) -lt $script:TestAutoShutdownAt) { return $false }
+
+    $script:QueueShutdownRequested = $true
+    $script:TestAutoShutdownAt = $null
+    if (-not $script:QueueShutdownMessageShown) {
+        Write-Host "Shutting down (test hook). Restart by running Media2AV1Queue.bat." -ForegroundColor Yellow
+        Write-SessionTextLogMessage -Level Warn -Message ("Shutdown requested by test hook after {0}s." -f $script:TestAutoShutdownSeconds)
+        $script:QueueShutdownMessageShown = $true
+    }
+    Clear-ConsoleCommandContext
+    return $true
+}
+
+function Set-ConsoleStatusMessage {
+    param(
+        [string]$Message,
+        [ValidateSet('Info', 'Warn', 'Err')]
+        [string]$Level = 'Info',
+        [int]$DurationSec = 5,
+        [bool]$Log = $false
+    )
+
+    $script:ConsoleStatus = [pscustomobject]@{
+        Message = $Message
+        Level = $Level
+        ExpiresAt = (Get-Date).AddSeconds([Math]::Max(1, $DurationSec))
+    }
+
+    if ($Log -and -not [string]::IsNullOrWhiteSpace($Message)) {
+        Write-SessionTextLogMessage -Level $Level -Message $Message
+    }
+}
+
+function Get-ConsoleStatusMessage {
+    if ($null -eq $script:ConsoleStatus) { return '' }
+    if ([string]::IsNullOrWhiteSpace($script:ConsoleStatus.Message)) { return '' }
+    if ($script:ConsoleStatus.ExpiresAt -and (Get-Date) -gt $script:ConsoleStatus.ExpiresAt) {
+        $script:ConsoleStatus = [pscustomobject]@{ Message = ''; Level = 'Info'; ExpiresAt = $null }
+        return ''
+    }
+    return [string]$script:ConsoleStatus.Message
+}
+
+function Clear-ConsoleCommandContext {
+    $script:ConsoleCommandContext = [pscustomobject]@{
+        Kind = ''
+        Target = ''
+        ExpiresAt = $null
+    }
+}
+
+function Set-ConsoleCommandContext {
+    param(
+        [string]$Kind,
+        [string]$Target = '',
+        [int]$TimeoutSec = 10
+    )
+
+    $script:ConsoleCommandContext = [pscustomobject]@{
+        Kind = $Kind
+        Target = $Target
+        ExpiresAt = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSec))
+    }
+}
+
+function Get-ConsoleCommandPrompt {
+    $ctx = $script:ConsoleCommandContext
+    if ($null -eq $ctx -or [string]::IsNullOrWhiteSpace($ctx.Kind)) { return '' }
+
+    if ($ctx.ExpiresAt -and (Get-Date) -gt $ctx.ExpiresAt) {
+        Clear-ConsoleCommandContext
+        Set-ConsoleStatusMessage -Message 'Command timed out.' -Level Warn
+        return ''
+    }
+
+    switch ($ctx.Kind) {
+        'Worker' { return "Command: worker $($ctx.Target) selected (waiting for p/r/s, 10s timeout)" }
+        'Queue'  { return 'Command: queue selected (waiting for p/r/c, 10s timeout)' }
+        default  { return '' }
+    }
+}
+
+function Get-QueueControlStateText {
+    $queueState = if ($script:QueuePaused) { 'Paused' } else { 'Running' }
+    $softExitState = if ($script:SoftExitRequested) { 'Armed' } else { 'Off' }
+    return "Queue: $queueState  |  Soft exit: $softExitState"
+}
+
+function Get-ConsoleHelpLines {
+    return @(
+        'Controls:',
+        '[1-9] Select worker  |  [q] Queue controls  |  [x] Finish active jobs, then exit  |  [h] Toggle help',
+        'Worker:',
+        '[p] Pause selected worker  |  [r] Resume selected worker  |  [s] Stop selected worker',
+        'Queue:',
+        '[q] then [p] Pause queue  |  [q] then [r] Resume queue  |  [q] then [c] Clear pending queue',
+        'Notes:',
+        'Pause suspends the current ffmpeg process. Stop cancels the job and holds the worker.'
+    )
+}
+
+function Confirm-ConsoleAction {
+    param([string]$Prompt)
+
+    Write-Host ""
+    Write-Host "$Prompt Y/N" -ForegroundColor Yellow
+    while ($true) {
+        try {
+            $answer = [Console]::ReadKey($true)
+        } catch {
+            return $false
+        }
+
+        switch ($answer.Key) {
+            ([ConsoleKey]::Y) { return $true }
+            ([ConsoleKey]::N) { return $false }
+        }
+    }
+}
+
+function Ensure-ProcessThreadControlInterop {
+    if ($script:ThreadControlInteropLoaded) { return }
+
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class Media2Av1ThreadControl {
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern IntPtr OpenThread(uint dwDesiredAccess, bool bInheritHandle, uint dwThreadId);
+
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern uint SuspendThread(IntPtr hThread);
+
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern uint ResumeThread(IntPtr hThread);
+
+    [DllImport("kernel32.dll", SetLastError=true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool CloseHandle(IntPtr hObject);
+}
+"@ -ErrorAction SilentlyContinue
+
+    $script:ThreadControlInteropLoaded = $true
+}
+
+function Suspend-ProcessThreads {
+    param([System.Diagnostics.Process]$Process)
+
+    if ($null -eq $Process) { return }
+    Ensure-ProcessThreadControlInterop
+
+    $threadAccess = 0x0002
+    foreach ($thread in @($Process.Threads)) {
+        $handle = [Media2Av1ThreadControl]::OpenThread($threadAccess, $false, [uint32]$thread.Id)
+        if ($handle -eq [IntPtr]::Zero) { continue }
+        try {
+            [void][Media2Av1ThreadControl]::SuspendThread($handle)
+        } finally {
+            [void][Media2Av1ThreadControl]::CloseHandle($handle)
+        }
+    }
+}
+
+function Resume-ProcessThreads {
+    param([System.Diagnostics.Process]$Process)
+
+    if ($null -eq $Process) { return }
+    Ensure-ProcessThreadControlInterop
+
+    $threadAccess = 0x0002
+    foreach ($thread in @($Process.Threads)) {
+        $handle = [Media2Av1ThreadControl]::OpenThread($threadAccess, $false, [uint32]$thread.Id)
+        if ($handle -eq [IntPtr]::Zero) { continue }
+        try {
+            while ($true) {
+                $resumeResult = [Media2Av1ThreadControl]::ResumeThread($handle)
+                if ($resumeResult -eq 0 -or $resumeResult -eq 0xFFFFFFFF) { break }
+            }
+        } finally {
+            [void][Media2Av1ThreadControl]::CloseHandle($handle)
+        }
+    }
+}
+
+function Get-WorkerStateLabel {
+    param($Worker)
+
+    $state = [string](Get-OptionalProperty -InputObject $Worker -PropertyName 'WorkerState' -Default '')
+    if (-not [string]::IsNullOrWhiteSpace($state)) { return $state }
+    return 'Running'
+}
+
+function Set-WorkerState {
+    param(
+        $Worker,
+        [string]$State
+    )
+
+    if ($null -eq $Worker) { return }
+    if ($Worker.PSObject.Properties['WorkerState']) {
+        $Worker.WorkerState = $State
+    } else {
+        $Worker | Add-Member -NotePropertyName WorkerState -NotePropertyValue $State
+    }
+}
+
+function Get-WorkerBySlot {
+    param(
+        [object[]]$Workers,
+        [string]$Slot
+    )
+
+    return @($Workers | Where-Object { "$($_.SlotNumber)" -eq "$Slot" } | Select-Object -First 1)[0]
+}
+
+function Pause-WorkerByUser {
+    param($Worker)
+
+    if ($null -eq $Worker) { return }
+    $state = Get-WorkerStateLabel -Worker $Worker
+    if ($state -ne 'Running') {
+        Set-ConsoleStatusMessage -Message ("Worker {0} is not running." -f $Worker.SlotNumber) -Level Warn
+        return
+    }
+
+    try {
+        Suspend-ProcessThreads -Process $Worker.TrackedProcess.Process
+        try { $Worker.Stopwatch.Stop() } catch {}
+        Set-WorkerState -Worker $Worker -State 'Paused'
+        Set-ConsoleStatusMessage -Message ("Worker {0} paused." -f $Worker.SlotNumber) -Level Info -Log $true
+    } catch {
+        Set-ConsoleStatusMessage -Message ("Could not pause worker {0}: {1}" -f $Worker.SlotNumber, $_.Exception.Message) -Level Err -Log $true
+    }
+}
+
+function Resume-WorkerByUser {
+    param($Worker)
+
+    if ($null -eq $Worker) { return }
+    $state = Get-WorkerStateLabel -Worker $Worker
+
+    if ($state -eq 'Paused') {
+        try {
+            Resume-ProcessThreads -Process $Worker.TrackedProcess.Process
+            try { $Worker.Stopwatch.Start() } catch {}
+            Set-WorkerState -Worker $Worker -State 'Running'
+            Set-ConsoleStatusMessage -Message ("Worker {0} resumed." -f $Worker.SlotNumber) -Level Info -Log $true
+        } catch {
+            Set-ConsoleStatusMessage -Message ("Could not resume worker {0}: {1}" -f $Worker.SlotNumber, $_.Exception.Message) -Level Err -Log $true
+        }
+        return
+    }
+
+    if ($state -eq 'Held') {
+        if ($Worker.PSObject.Properties['PendingResumeRequested']) {
+            $Worker.PendingResumeRequested = $true
+        } else {
+            $Worker | Add-Member -NotePropertyName PendingResumeRequested -NotePropertyValue $true
+        }
+        Set-ConsoleStatusMessage -Message ("Worker {0} restart requested." -f $Worker.SlotNumber) -Level Info -Log $true
+        return
+    }
+
+    Set-ConsoleStatusMessage -Message ("Worker {0} is not paused or held." -f $Worker.SlotNumber) -Level Warn
+}
+
+function Stop-WorkerByUser {
+    param($Worker)
+
+    if ($null -eq $Worker) { return }
+
+    $state = Get-WorkerStateLabel -Worker $Worker
+    if ($state -notin @('Running', 'Paused')) {
+        Set-ConsoleStatusMessage -Message ("Worker {0} is not running." -f $Worker.SlotNumber) -Level Warn
+        return
+    }
+
+    if (-not (Confirm-ConsoleAction -Prompt ("Stop worker {0} and hold it?" -f $Worker.SlotNumber))) {
+        Set-ConsoleStatusMessage -Message ("Worker {0} stop cancelled." -f $Worker.SlotNumber) -Level Info -Log $true
+        return
+    }
+
+    if ($state -eq 'Paused') {
+        try { Resume-ProcessThreads -Process $Worker.TrackedProcess.Process } catch {}
+    }
+
+    if ($Worker.PSObject.Properties['ManualStopRequested']) {
+        $Worker.ManualStopRequested = $true
+    } else {
+        $Worker | Add-Member -NotePropertyName ManualStopRequested -NotePropertyValue $true
+    }
+
+    Set-WorkerState -Worker $Worker -State 'Stopping'
+    Set-ConsoleStatusMessage -Message ("Worker {0} stop requested." -f $Worker.SlotNumber) -Level Warn -Log $true
+    try {
+        $Worker.TrackedProcess.Process.Kill()
+    } catch {
+        Set-ConsoleStatusMessage -Message ("Could not stop worker {0}: {1}" -f $Worker.SlotNumber, $_.Exception.Message) -Level Err -Log $true
+    }
+}
+
+function Clear-PendingQueueByUser {
+    if (-not (Confirm-ConsoleAction -Prompt 'Clear pending queue?')) {
+        Set-ConsoleStatusMessage -Message 'Pending queue clear cancelled.' -Level Info -Log $true
+        return
+    }
+
+    $removed = 0
+    foreach ($job in @(Get-ChildItem -LiteralPath $QueuePendingDir -Filter *.json -File -ErrorAction SilentlyContinue)) {
+        try {
+            Remove-Item -LiteralPath $job.FullName -Force -ErrorAction SilentlyContinue
+            $removed++
+        } catch {}
+    }
+
+    Set-ConsoleStatusMessage -Message ("Pending queue cleared: {0} item(s) removed." -f $removed) -Level Warn -Log $true
+}
+
+function Handle-QueueCommand {
+    param([ConsoleKeyInfo]$KeyInfo)
+
+    switch ($KeyInfo.Key) {
+        ([ConsoleKey]::P) {
+            if ($script:QueuePaused) {
+                Set-ConsoleStatusMessage -Message 'Queue is already paused.' -Level Warn
+            } else {
+                $script:QueuePaused = $true
+                Set-ConsoleStatusMessage -Message 'Queue paused by user.' -Level Info -Log $true
+            }
+        }
+        ([ConsoleKey]::R) {
+            if (-not $script:QueuePaused) {
+                Set-ConsoleStatusMessage -Message 'Queue is already running.' -Level Warn
+            } else {
+                $script:QueuePaused = $false
+                Set-ConsoleStatusMessage -Message 'Queue resumed by user.' -Level Info -Log $true
+            }
+        }
+        ([ConsoleKey]::C) {
+            Clear-PendingQueueByUser
+        }
+        default {
+            Set-ConsoleStatusMessage -Message 'Queue command cancelled.' -Level Warn
+        }
+    }
+}
+
+function Try-RestartHeldWorker {
+    param(
+        $Worker,
+        $NvencEnvironment = $null
+    )
+
+    if ($null -eq $Worker) { return $false }
+    if (-not (Get-OptionalProperty -InputObject $Worker -PropertyName 'PendingResumeRequested' -Default $false)) { return $false }
+
+    $Worker.PendingResumeRequested = $false
+    $heldInputPath = Get-OptionalProperty -InputObject $Worker -PropertyName 'HeldInputPath' -Default ''
+    $heldEncodeMode = Get-OptionalProperty -InputObject $Worker -PropertyName 'HeldEncodeMode' -Default ''
+    if ([string]::IsNullOrWhiteSpace($heldInputPath) -or [string]::IsNullOrWhiteSpace($heldEncodeMode)) {
+        Set-ConsoleStatusMessage -Message ("Worker {0} has no held job to restart." -f $Worker.SlotNumber) -Level Warn -Log $true
+        return $false
+    }
+
+    if (-not (Test-Path -LiteralPath $heldInputPath)) {
+        Write-SessionTextLogMessage -Level Err -Message ("Held worker restart failed | worker {0} | source missing | {1}" -f $Worker.SlotNumber, $heldInputPath)
+        Set-ConsoleStatusMessage -Message ("Worker {0} restart failed: source missing." -f $Worker.SlotNumber) -Level Err -Log $true
+        return $false
+    }
+
+    Write-SessionTextLogMessage -Level Info -Message ("Held worker restart requested | worker {0} | {1}" -f $Worker.SlotNumber, $heldInputPath)
+
+    try {
+        $newInit = Get-EncodeInitialization -InputPath $heldInputPath -EncodeMode $heldEncodeMode -NvencEnvironment $NvencEnvironment -EncoderPreferenceValue $Worker.Init.EncoderPreference -LaneSelectionReason ((Get-OptionalProperty -InputObject $Worker -PropertyName 'HeldRestartReason' -Default '') ?? $Worker.Init.LaneSelectionReason) -LaneSuitability $Worker.Init.LaneSuitability -CpuOnlyReason $Worker.Init.CpuOnlyReason -NvidiaFallbackAllowed $Worker.Init.NvidiaFallbackAllowed
+        if ($newInit.EarlyExit) {
+            $row = $newInit.Row
+            if ($heldEncodeMode -eq 'nvenc' -and $NvencEnvironment) {
+                $row.NvencWorkerCountAtStart = $NvencEnvironment.MaxParallel
+            }
+            Write-LogRow $row
+            Set-ConsoleStatusMessage -Message ("Worker {0} restart could not continue." -f $Worker.SlotNumber) -Level Warn -Log $true
+            return $false
+        }
+
+        if (Test-Path -LiteralPath $newInit.TempOutput) {
+            Remove-Item -LiteralPath $newInit.TempOutput -Force -ErrorAction SilentlyContinue
+        }
+
+        $ffArgs = if ($newInit.ResolvedEncodeLane -eq 'Nvidia') {
+            Build-NvencFfmpegArgs -Init $newInit -NvencEnvironment $NvencEnvironment
+        } else {
+            Build-SoftwareFfmpegArgs -Init $newInit
+        }
+        $tracked = Start-TrackedFfmpegProcess -Arguments $ffArgs -PriorityName $newInit.WorkerProcessPriority
+        $newInit.WorkerProcessPriority = $tracked.WorkerProcessPriority
+        Write-SessionEncodeStart -Init $newInit
+
+        $Worker.Init = $newInit
+        $Worker.TrackedProcess = $tracked
+        $Worker.Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $Worker.WorkerProcessPriority = $tracked.WorkerProcessPriority
+        $Worker.ShutdownRequestedAt = $null
+        $Worker.ManualStopRequested = $false
+        $Worker.HeldInputPath = ''
+        $Worker.HeldEncodeMode = ''
+        $Worker.HeldRestartReason = ''
+        Set-WorkerState -Worker $Worker -State 'Running'
+        Set-ConsoleStatusMessage -Message ("Worker {0} restarted from scratch." -f $Worker.SlotNumber) -Level Info -Log $true
+        return $true
+    } catch {
+        Write-SessionTextLogMessage -Level Err -Message ("Held worker restart failed | worker {0} | {1}" -f $Worker.SlotNumber, $_.Exception.Message)
+        Set-ConsoleStatusMessage -Message ("Worker {0} restart failed: {1}" -f $Worker.SlotNumber, $_.Exception.Message) -Level Err -Log $true
+        return $false
+    }
+}
+
+function Get-BlockingWorkerCount {
+    param([object[]]$Workers)
+
+    return @($Workers | Where-Object { (Get-WorkerStateLabel -Worker $_) -in @('Running', 'Paused', 'Starting', 'Stopping') }).Count
+}
+
+function Handle-LiveConsoleInput {
+    param(
+        [object[]]$Workers = @(),
+        $NvencEnvironment = $null
+    )
+
+    if ($script:QueueShutdownRequested) { return $true }
+    $null = Get-ConsoleCommandPrompt
+    $ctx = $script:ConsoleCommandContext
+
+    try {
+        while ([Console]::KeyAvailable) {
+            $key = [Console]::ReadKey($true)
+            $isCtrlC = (($key.Modifiers -band [ConsoleModifiers]::Control) -and $key.Key -eq [ConsoleKey]::C) -or ([int][char]$key.KeyChar -eq 3)
+            if ($isCtrlC) {
+                Write-Host ""
+                if (Confirm-ConsoleAction -Prompt 'Cancel current queue?') {
+                    $script:QueueShutdownRequested = $true
+                    if (-not $script:QueueShutdownMessageShown) {
+                        Write-Host "Shutting down. Restart by running Media2AV1Queue.bat." -ForegroundColor Yellow
+                        Write-SessionTextLogMessage -Level Warn -Message 'Shutdown requested by user. Restart by running Media2AV1Queue.bat.'
+                        $script:QueueShutdownMessageShown = $true
+                    }
+                    Clear-ConsoleCommandContext
+                    return $true
+                }
+
+                Set-ConsoleStatusMessage -Message 'Continuing queue.' -Level Info
+                Clear-ConsoleCommandContext
+                continue
+            }
+
+            $ctx = $script:ConsoleCommandContext
+            if ($ctx -and -not [string]::IsNullOrWhiteSpace($ctx.Kind)) {
+                switch ($ctx.Kind) {
+                    'Worker' {
+                        $worker = Get-WorkerBySlot -Workers $Workers -Slot $ctx.Target
+                        if ($null -eq $worker) {
+                            Set-ConsoleStatusMessage -Message ("Worker {0} is no longer available." -f $ctx.Target) -Level Warn
+                            Clear-ConsoleCommandContext
+                            continue
+                        }
+
+                        switch ($key.Key) {
+                            ([ConsoleKey]::P) { Pause-WorkerByUser -Worker $worker }
+                            ([ConsoleKey]::R) { Resume-WorkerByUser -Worker $worker }
+                            ([ConsoleKey]::S) { Stop-WorkerByUser -Worker $worker }
+                            default { Set-ConsoleStatusMessage -Message 'Worker command cancelled.' -Level Warn }
+                        }
+                        Clear-ConsoleCommandContext
+                        continue
+                    }
+                    'Queue' {
+                        Handle-QueueCommand -KeyInfo $key
+                        Clear-ConsoleCommandContext
+                        continue
+                    }
+                }
+            }
+
+            if ($key.KeyChar -match '^[1-9]$') {
+                $slot = [string]$key.KeyChar
+                $worker = Get-WorkerBySlot -Workers $Workers -Slot $slot
+                if ($null -eq $worker) {
+                    Set-ConsoleStatusMessage -Message ("Worker {0} is not active in this session." -f $slot) -Level Warn
+                } else {
+                    Set-ConsoleCommandContext -Kind 'Worker' -Target $slot
+                }
+                continue
+            }
+
+            switch ($key.Key) {
+                ([ConsoleKey]::Q) {
+                    Set-ConsoleCommandContext -Kind 'Queue'
+                }
+                ([ConsoleKey]::H) {
+                    $script:ShowHelpOverlay = -not $script:ShowHelpOverlay
+                    Set-ConsoleStatusMessage -Message ("Help overlay {0}." -f $(if ($script:ShowHelpOverlay) { 'shown' } else { 'hidden' })) -Level Info
+                }
+                ([ConsoleKey]::X) {
+                    if (Confirm-ConsoleAction -Prompt 'Finish active jobs, then exit?') {
+                        $script:SoftExitRequested = $true
+                        $script:QueuePaused = $true
+                        Set-ConsoleStatusMessage -Message 'Soft exit armed. No new jobs will start.' -Level Warn -Log $true
+                    } else {
+                        Set-ConsoleStatusMessage -Message 'Soft exit cancelled.' -Level Info -Log $true
+                    }
+                }
+            }
+        }
+    } catch {}
+
+    return $script:QueueShutdownRequested
+}
+
+function Test-QueueShutdownRequested {
+    param(
+        [object[]]$Workers = @(),
+        $NvencEnvironment = $null
+    )
+
+    if (Invoke-TestAutoShutdownIfDue) { return $true }
+    return (Handle-LiveConsoleInput -Workers $Workers -NvencEnvironment $NvencEnvironment)
+}
+
+
+function Request-FfmpegProcessQuit {
+    param([System.Diagnostics.Process]$Process)
+
+    if ($null -eq $Process) { return }
+    try {
+        if ($Process.HasExited) { return }
+    } catch {
+        return
+    }
+
+    try {
+        $Process.StandardInput.WriteLine('q')
+        $Process.StandardInput.Flush()
+    } catch {}
+}
+
+function Get-TrackedWorkerProcess {
+    param($Worker)
+
+    $trackedProcess = Get-OptionalProperty -InputObject $Worker -PropertyName 'TrackedProcess' -Default $null
+    $process = Get-OptionalProperty -InputObject $trackedProcess -PropertyName 'Process' -Default $null
+    if ($process -is [System.Diagnostics.Process]) { return $process }
+    return $null
+}
+
+function Test-TrackedWorkerProcessExited {
+    param($Worker)
+
+    $process = Get-TrackedWorkerProcess -Worker $Worker
+    if ($null -eq $process) { return $true }
+    try {
+        return $process.HasExited
+    } catch {
+        return $true
+    }
+}
+
+function Request-WorkerShutdown {
+    param($Worker)
+
+    if ($null -eq $Worker) { return }
+
+    $process = Get-TrackedWorkerProcess -Worker $Worker
+
+    $shutdownRequestedAt = Get-OptionalProperty -InputObject $Worker -PropertyName 'ShutdownRequestedAt' -Default $null
+    if ($null -ne $shutdownRequestedAt -and $shutdownRequestedAt -isnot [datetime]) {
+        $shutdownRequestedAt = $null
+        try {
+            if ($Worker.PSObject.Properties['ShutdownRequestedAt']) {
+                $Worker.ShutdownRequestedAt = $null
+            }
+        } catch {}
+    }
+
+    if ($null -eq $shutdownRequestedAt) {
+        $slot = Get-OptionalProperty -InputObject $Worker -PropertyName 'SlotNumber' -Default '?'
+        $lane = Get-OptionalProperty -InputObject $Worker.Init -PropertyName 'ResolvedEncodeLane' -Default 'Unknown'
+        $name = Get-OptionalProperty -InputObject $Worker.Init -PropertyName 'DisplayInputName' -Default ''
+        Write-Host ("Shutdown: requesting worker {0} ({1}) to stop gracefully{2}" -f $slot, $lane, $(if ($name) { " - $name" } else { '' })) -ForegroundColor DarkYellow
+        Write-SessionTextLogMessage -Level Warn -Message ("Shutdown | requesting worker {0} ({1}) to stop gracefully{2}" -f $slot, $lane, $(if ($name) { " - $name" } else { '' }))
+        if ($null -ne $process) {
+            Request-FfmpegProcessQuit -Process $process
+        }
+        try {
+            if ($Worker.PSObject.Properties['ShutdownRequestedAt']) {
+                $Worker.ShutdownRequestedAt = Get-Date
+            } else {
+                $Worker | Add-Member -NotePropertyName ShutdownRequestedAt -NotePropertyValue (Get-Date)
+            }
+        } catch {}
+        return
+    }
+
+    try {
+        if ($null -ne $process -and -not $process.HasExited -and ((Get-Date) - $shutdownRequestedAt).TotalSeconds -ge 20) {
+            $slot = Get-OptionalProperty -InputObject $Worker -PropertyName 'SlotNumber' -Default '?'
+            Write-Host ("Shutdown: worker {0} did not exit in time; terminating ffmpeg." -f $slot) -ForegroundColor Yellow
+            Write-SessionTextLogMessage -Level Warn -Message ("Shutdown | worker {0} did not exit in time; terminating ffmpeg." -f $slot)
+            $process.Kill()
+            if ($Worker.PSObject.Properties['ShutdownRequestedAt']) {
+                $Worker.ShutdownRequestedAt = (Get-Date).AddYears(50)
+            } else {
+                $Worker | Add-Member -NotePropertyName ShutdownRequestedAt -NotePropertyValue ((Get-Date).AddYears(50))
+            }
+        }
+    } catch {}
+}
+
+function Requeue-WorkingJob {
+    param([string]$WorkingJobPath)
+
+    if ([string]::IsNullOrWhiteSpace($WorkingJobPath) -or -not (Test-Path -LiteralPath $WorkingJobPath)) {
+        return
+    }
+
+    $pendingPath = Join-Path $QueuePendingDir ([System.IO.Path]::GetFileName($WorkingJobPath))
+    if (Test-Path -LiteralPath $pendingPath) {
+        Remove-Item -LiteralPath $WorkingJobPath -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    Move-Item -LiteralPath $WorkingJobPath -Destination $pendingPath -Force
+}
+
+function Show-NoWorkToResumeMessage {
+    Write-Host "No queued or interrupted jobs were found." -ForegroundColor Yellow
+    Write-Host "Press any key to continue..." -ForegroundColor DarkGray
+    try { $null = [Console]::ReadKey($true) } catch {}
+}
+
+function Recover-StaleQueueArtifactsForEnqueue {
+    if (Test-Path -LiteralPath $StatePath) {
+        Remove-Item -LiteralPath $StatePath -Force -ErrorAction SilentlyContinue
+    }
+
+    foreach ($staleJob in @(Get-ChildItem -LiteralPath $QueueWorkingDir -Filter *.json -File -ErrorAction SilentlyContinue)) {
+        try {
+            Requeue-WorkingJob -WorkingJobPath $staleJob.FullName
+        } catch {}
+    }
 }
 
 # =============================================================================
@@ -412,12 +2132,14 @@ function Add-QueueInputs {
         if ([string]::IsNullOrWhiteSpace($p)) { continue }
         if (-not (Test-Path -LiteralPath $p)) {
             Write-Warning "Path not found, skipping: $p"
+            Write-SessionTextLogMessage -Level Warn -Message ("Queue add skipped | path not found | {0}" -f $p)
             continue
         }
 
         $item = Get-Item -LiteralPath $p
         if ($item.PSIsContainer) {
             Write-Warning "Folders are not supported for drag-drop queueing, skipping: $($item.FullName)"
+            Write-SessionTextLogMessage -Level Warn -Message ("Queue add skipped | folders are not supported | {0}" -f $item.FullName)
             continue
         }
 
@@ -425,6 +2147,7 @@ function Add-QueueInputs {
 
         if ($existing.Contains($full)) {
             Write-Host "Already queued or currently processing: $full" -ForegroundColor Yellow
+            Write-SessionTextLogMessage -Level Warn -Message ("Queue add skipped | already queued or processing | {0}" -f $full)
             continue
         }
 
@@ -441,6 +2164,7 @@ function Add-QueueInputs {
         $null = $existing.Add($full)
 
         Write-Host "Queued: $full" -ForegroundColor Cyan
+        Write-SessionTextLogMessage -Level Info -Message ("Queued | {0}" -f $full)
     }
 }
 
@@ -505,6 +2229,13 @@ function Get-OptionalProperty {
     )
 
     if ($null -eq $InputObject) { return $Default }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        if (-not $InputObject.Contains($PropertyName)) { return $Default }
+        $value = $InputObject[$PropertyName]
+        if ($null -eq $value) { return $Default }
+        return $value
+    }
 
     $prop = $InputObject.PSObject.Properties[$PropertyName]
     if ($null -eq $prop) { return $Default }
@@ -772,6 +2503,761 @@ function Get-VideoBitDepth {
     if ($pixFmt)             { return 8 }
 
     return 0
+}
+
+function Get-StreamEstimatedSizeBytes {
+    param(
+        $Stream,
+        [double]$DurationSec = 0.0
+    )
+
+    foreach ($tagName in @('NUMBER_OF_BYTES', 'NUMBER_OF_BYTES-eng')) {
+        $numBytes = Convert-ToInvariantInt64 (Get-StreamTagValue $Stream $tagName '') 0
+        if ($numBytes -gt 0) { return $numBytes }
+    }
+
+    $bitrateEstimate = Get-StreamBitrateEstimate -Stream $Stream -DurationSec $DurationSec
+    if ($bitrateEstimate.Bitrate -gt 0 -and $DurationSec -gt 0) {
+        return [int64][Math]::Round(($bitrateEstimate.Bitrate * $DurationSec) / 8.0)
+    }
+
+    return 0L
+}
+
+function Get-CopiedStreamsSizeEstimate {
+    param(
+        [object[]]$Streams = @(),
+        [double]$DurationSec = 0.0
+    )
+
+    $totalBytes = 0L
+    $usedCount = 0
+
+    foreach ($stream in @($Streams | Where-Object { $_ })) {
+        $streamBytes = Get-StreamEstimatedSizeBytes -Stream $stream -DurationSec $DurationSec
+        if ($streamBytes -gt 0) {
+            $totalBytes += [int64]$streamBytes
+            $usedCount++
+        }
+    }
+
+    return [ordered]@{
+        Bytes      = $totalBytes
+        StreamCount = $usedCount
+        Reason     = if ($usedCount -gt 0) {
+            "Estimated $usedCount copied stream size(s) from ffprobe metadata."
+        } else {
+            'No reliable copied-stream size estimate was available.'
+        }
+    }
+}
+
+function Update-LiveEstimateState {
+    param(
+        $State,
+        [double]$SourceDurationSec,
+        [int64]$SourceSizeBytes
+    )
+
+    $result = [pscustomobject][ordered]@{
+        Enabled             = $EnableLiveSizeEstimate
+        Ready               = $false
+        Status              = 'starting'
+        ProgressPercent     = 0.0
+        EstimatedFinalBytes = 0.0
+        EstimatedFinalSizeGiB = 0.0
+        EstimatedSavingsPercent = 0.0
+        EstimatedOutputGiBPerHour = 0.0
+    }
+
+    if (-not $EnableLiveSizeEstimate) {
+        $result.Status = 'disabled'
+        return $result
+    }
+
+    if ($SourceDurationSec -le 0 -or $SourceSizeBytes -le 0) {
+        return $result
+    }
+
+    $encodedSec = Convert-ToInvariantDouble (Get-OptionalProperty $State 'OutTimeSec' 0.0) 0.0
+    $outputBytes = Convert-ToInvariantDouble (Get-OptionalProperty $State 'OutSizeBytes' 0.0) 0.0
+    $progressPercent = if ($SourceDurationSec -gt 0) { ($encodedSec / $SourceDurationSec) * 100.0 } else { 0.0 }
+    $result.ProgressPercent = $progressPercent
+
+    if ($encodedSec -le 0.0 -or $outputBytes -le 0.0) {
+        $result.Status = 'starting'
+        $State.EstimateReady = $false
+        return $result
+    }
+
+    if ($progressPercent -lt $LiveEstimateStartPercent) {
+        $result.Status = 'warming up'
+        $State.EstimateReady = $false
+        return $result
+    }
+
+    $rawEstimatedFinalBytes = ($outputBytes / $encodedSec) * $SourceDurationSec
+    if ($rawEstimatedFinalBytes -le 0.0) {
+        $State.EstimateReady = $false
+        return $result
+    }
+
+    $previousSmoothed = Convert-ToInvariantDouble (Get-OptionalProperty $State 'SmoothedEstimatedFinalBytes' 0.0) 0.0
+    $smoothed = if ($previousSmoothed -gt 0.0) {
+        ($previousSmoothed * (1.0 - $LiveEstimateSmoothingFactor)) + ($rawEstimatedFinalBytes * $LiveEstimateSmoothingFactor)
+    } else {
+        $rawEstimatedFinalBytes
+    }
+
+    $savingsPercent = 100.0 * (1.0 - ($smoothed / $SourceSizeBytes))
+    $outputGiBPerHour = if ($SourceDurationSec -gt 0) { ($smoothed / 1GB) / ($SourceDurationSec / 3600.0) } else { 0.0 }
+
+    $State.SmoothedEstimatedFinalBytes = $smoothed
+    $State.LastRawEstimatedFinalBytes = $rawEstimatedFinalBytes
+    $State.EstimateReady = $true
+    $State.EstimatedSavingsPercent = $savingsPercent
+    $State.EstimatedOutputGiBPerHour = $outputGiBPerHour
+
+    $result.Ready = $true
+    $result.Status = 'ready'
+    $result.EstimatedFinalBytes = $smoothed
+    $result.EstimatedFinalSizeGiB = ($smoothed / 1GB)
+    $result.EstimatedSavingsPercent = $savingsPercent
+    $result.EstimatedOutputGiBPerHour = $outputGiBPerHour
+    return $result
+}
+
+function Get-AnimatedDotsText {
+    param([int]$MaximumDots = 10)
+
+    $secondsTick = [int64][Math]::Floor([DateTime]::UtcNow.Ticks / 10000000.0)
+    $dotCount = [Math]::Max(1, [Math]::Min($MaximumDots, [int](($secondsTick % $MaximumDots) + 1)))
+    return ('.' * $dotCount)
+}
+
+function Get-LiveEstimateSummaryText {
+    param($Estimate)
+
+    if (-not $EnableLiveSizeEstimate) { return '' }
+    if ($null -eq $Estimate -or -not $Estimate.Ready) {
+        if ($Estimate -and $Estimate.Status -eq 'starting') {
+            return ("Starting up{0}" -f (Get-AnimatedDotsText))
+        }
+
+        if ($Estimate -and $Estimate.Status -eq 'warming up') {
+            return ("Est. final size: warming up ({0:F1}% complete)" -f $Estimate.ProgressPercent)
+        }
+
+        return 'Est. final size: warming up'
+    }
+
+    return ("Est. final: {0:F2} GiB  |  Est. savings: {1:F1}%  |  Est. rate: {2:F2} GiB/hr" -f
+        $Estimate.EstimatedFinalSizeGiB,
+        $Estimate.EstimatedSavingsPercent,
+        $Estimate.EstimatedOutputGiBPerHour)
+}
+
+function Remove-AnsiDisplayFormatting {
+    param([string]$Value)
+
+    if ([string]::IsNullOrEmpty($Value)) { return '' }
+
+    $escape = [regex]::Escape([string][char]27)
+    return [regex]::Replace($Value, "${escape}\[[0-9;?]*[ -/]*[@-~]", '')
+}
+
+function Add-RainbowHdrHighlights {
+    param(
+        [string]$Text,
+        [string]$BaseColor = ''
+    )
+
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+
+    $ESC = [char]27
+    $reset = "${ESC}[0m"
+    $rainbowCodes = @('196', '208', '226', '82', '45', '93')
+
+    function Convert-HdrTokenToRainbow {
+        param([string]$Token)
+
+        $builder = [System.Text.StringBuilder]::new()
+        for ($i = 0; $i -lt $Token.Length; $i++) {
+            $code = $rainbowCodes[$i % $rainbowCodes.Count]
+            $null = $builder.Append("${ESC}[1;38;5;${code}m")
+            $null = $builder.Append($Token[$i])
+        }
+
+        $null = $builder.Append($reset)
+        if (-not [string]::IsNullOrEmpty($BaseColor)) {
+            $null = $builder.Append($BaseColor)
+        }
+
+        return $builder.ToString()
+    }
+
+    $highlighted = [regex]::Replace($Text, 'HDR10\+', { param($m) Convert-HdrTokenToRainbow -Token $m.Value })
+    $highlighted = [regex]::Replace($highlighted, 'HDR10', { param($m) Convert-HdrTokenToRainbow -Token $m.Value })
+    $highlighted = [regex]::Replace($highlighted, '(?<![A-Za-z0-9])HDR(?![A-Za-z0-9+])', { param($m) Convert-HdrTokenToRainbow -Token $m.Value })
+
+    return $highlighted
+}
+
+function Invoke-FfmpegSync {
+    param([string[]]$Arguments)
+
+    $tracked = Start-TrackedFfmpegProcess -Arguments $Arguments -PriorityName 'Normal'
+    try {
+        while (-not $tracked.Process.HasExited) {
+            if (Test-QueueShutdownRequested) {
+                Request-FfmpegProcessQuit -Process $tracked.Process
+                $deadline = (Get-Date).AddSeconds(20)
+                while (-not $tracked.Process.HasExited -and (Get-Date) -lt $deadline) {
+                    Start-Sleep -Milliseconds 200
+                }
+                if (-not $tracked.Process.HasExited) {
+                    try { $tracked.Process.Kill() } catch {}
+                }
+                throw $script:QueueShutdownSentinel
+            }
+
+            Start-Sleep -Milliseconds 200
+        }
+
+        $stderr = ($tracked.Shared.LogLines -join "`n")
+        return [pscustomobject][ordered]@{
+            ExitCode = $tracked.Process.ExitCode
+            Stderr   = $stderr
+            LogLines = @(($stderr -split "\r?\n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        }
+    } finally {
+        Stop-TrackedFfmpegProcess -TrackedProcess $tracked
+    }
+}
+
+function Invoke-PreflightEstimate {
+    param(
+        [string]$InputPath,
+        $Selected,
+        $SourceProfile,
+        [string]$EncodeMode,
+        [double]$SourceDurationSec,
+        [int64]$SourceSizeBytes,
+        [int]$ResolvedCRF,
+        [int]$ResolvedPreset,
+        [int]$ResolvedFilmGrain,
+        [int]$PassNumber = 1,
+        [string]$SettingsLabel = '',
+        $NvencSettings = $null,
+        $NvencEnvironment = $null
+    )
+
+    if (-not $EnablePreflightEstimate) {
+        return [pscustomobject][ordered]@{
+            Ran = $false
+            ShouldSkip = $false
+            Reason = 'Preflight estimate disabled by configuration.'
+        }
+    }
+
+    if ($SourceDurationSec -le 0) {
+        return [pscustomobject][ordered]@{
+            Ran = $false
+            ShouldSkip = $false
+            Reason = 'Preflight estimate skipped because the source duration is unavailable.'
+        }
+    }
+
+    $maxSamplesBySpan = [int][Math]::Floor(($SourceDurationSec * 0.80) / [Math]::Max(1, $PreflightSampleDurationSec))
+    $sampleCount = [Math]::Min([int]$PreflightSampleCount, [Math]::Max(0, $maxSamplesBySpan))
+    if ($sampleCount -lt 1) {
+        return [pscustomobject][ordered]@{
+            Ran = $false
+            ShouldSkip = $false
+            Reason = 'Preflight estimate skipped because the source is too short for the configured sample spacing.'
+        }
+    }
+
+    $copiedEstimate = Get-CopiedStreamsSizeEstimate -Streams @($Selected.MainAudio, $Selected.FallbackAudio, $Selected.MainSub, $Selected.SdhSub) -DurationSec $SourceDurationSec
+    $sampleBytesPerSec = [System.Collections.Generic.List[double]]::new()
+    $sampleFailures = [System.Collections.Generic.List[string]]::new()
+
+    Write-Host ("Preflight pass {0}" -f $PassNumber) -ForegroundColor DarkCyan
+    Write-SessionTextLogMessage -Level Info -Message ("Preflight pass {0} | {1}" -f $PassNumber, [System.IO.Path]::GetFileName($InputPath))
+    if (-not [string]::IsNullOrWhiteSpace($SettingsLabel)) {
+        Write-Host ("Settings: {0}" -f $SettingsLabel) -ForegroundColor DarkCyan
+        Write-SessionTextLogMessage -Level Info -Message ("Preflight settings | {0}" -f $SettingsLabel)
+    }
+    Write-Host ("Running {0} sample encodes of {1}s each..." -f $sampleCount, $PreflightSampleDurationSec) -ForegroundColor DarkCyan
+    Write-SessionTextLogMessage -Level Info -Message ("Preflight samples | count={0} | duration={1}s" -f $sampleCount, $PreflightSampleDurationSec)
+
+    for ($i = 0; $i -lt $sampleCount; $i++) {
+        $fraction = 0.10 + (0.80 * (($i + 0.5) / $sampleCount))
+        $centerSec = $SourceDurationSec * $fraction
+        $startSec = [Math]::Max(0.0, [Math]::Min($SourceDurationSec - $PreflightSampleDurationSec, $centerSec - ($PreflightSampleDurationSec / 2.0)))
+        $sampleOutput = Join-Path $PreflightDir ("{0}_{1}_{2}.mkv" -f ([System.IO.Path]::GetFileNameWithoutExtension($InputPath)), [Guid]::NewGuid().ToString('N'), $i)
+
+        try {
+            $ffArgs = New-Object System.Collections.Generic.List[string]
+            $ffArgs.AddRange([string[]]@('-hide_banner', '-y', '-ss', ("{0:0.###}" -f $startSec), '-t', "$PreflightSampleDurationSec"))
+
+            if ($EncodeMode -eq 'nvenc' -and $NvencSettings -and $NvencSettings.DecodePath -eq 'cuda') {
+                $ffArgs.AddRange([string[]]@('-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'))
+            }
+
+            $ffArgs.AddRange([string[]]@('-i', $InputPath, '-map', "0:$($Selected.Video.index)", '-an', '-sn', '-dn'))
+
+            if ($EncodeMode -eq 'nvenc') {
+                $ffArgs.AddRange([string[]]@('-c:v', 'av1_nvenc'))
+                if ($NvencEnvironment.SupportsPreset -and -not [string]::IsNullOrWhiteSpace($NvencSettings.Preset)) {
+                    $ffArgs.AddRange([string[]]@('-preset', $NvencSettings.Preset))
+                }
+                if ($NvencEnvironment.SupportsTune -and -not [string]::IsNullOrWhiteSpace($NvencSettings.Tune)) {
+                    $ffArgs.AddRange([string[]]@('-tune', $NvencSettings.Tune))
+                }
+                if ($NvencEnvironment.SupportsRc) { $ffArgs.AddRange([string[]]@('-rc', 'vbr')) }
+                if ($NvencEnvironment.SupportsCQ) { $ffArgs.AddRange([string[]]@('-cq', "$($NvencSettings.CQ)")) }
+                if ($NvencEnvironment.SupportsLookahead) { $ffArgs.AddRange([string[]]@('-rc-lookahead', '32')) }
+                if ($NvencEnvironment.SupportsSpatialAQ)  { $ffArgs.AddRange([string[]]@('-spatial-aq', '1')) }
+                if ($NvencEnvironment.SupportsTemporalAQ) { $ffArgs.AddRange([string[]]@('-temporal-aq', '1')) }
+                if ($NvencEnvironment.SupportsAQStrength) { $ffArgs.AddRange([string[]]@('-aq-strength', '8')) }
+                if ($NvencEnvironment.SupportsBRefMode)   { $ffArgs.AddRange([string[]]@('-b_ref_mode', 'middle')) }
+                if ($NvencEnvironment.SupportsMultipass)  { $ffArgs.AddRange([string[]]@('-multipass', 'fullres')) }
+                if ($NvencEnvironment.SupportsSplitEncode -and -not $NvencAllowSplitFrame) {
+                    $ffArgs.AddRange([string[]]@('-split_encode_mode', 'disabled'))
+                }
+                $ffArgs.AddRange([string[]]@('-pix_fmt', $NvencSettings.PixFmt))
+                if ($NvencEnvironment.SupportsHighBitDepth -and $NvencSettings.BitDepth -ge 10) {
+                    $ffArgs.AddRange([string[]]@('-highbitdepth', '1'))
+                }
+            } else {
+                $ffArgs.AddRange([string[]]@('-c:v', 'libsvtav1', '-preset', "$ResolvedPreset", '-crf', "$ResolvedCRF", '-pix_fmt', 'yuv420p10le'))
+                if ($ResolvedFilmGrain -gt 0) {
+                    $ffArgs.AddRange([string[]]@('-svtav1-params', "film-grain=$ResolvedFilmGrain`:film-grain-denoise=0"))
+                }
+            }
+
+            if ($SourceProfile.HasHDR) {
+                $ffArgs.AddRange([string[]]@('-color_primaries', 'bt2020', '-color_trc', 'smpte2084', '-colorspace', 'bt2020nc'))
+            }
+
+            $ffArgs.Add($sampleOutput)
+
+            $sampleResult = Invoke-FfmpegSync -Arguments $ffArgs.ToArray()
+            if ($sampleResult.ExitCode -ne 0) {
+                $sampleFailures.Add(("sample {0} failed: {1}" -f ($i + 1), (($sampleResult.LogLines | Select-Object -Last 3) -join ' || ')))
+                continue
+            }
+
+            if (-not (Test-Path -LiteralPath $sampleOutput)) {
+                $sampleFailures.Add(("sample {0} did not create an output file" -f ($i + 1)))
+                continue
+            }
+
+            $sampleItem = Get-Item -LiteralPath $sampleOutput
+            if ($sampleItem.Length -gt 0) {
+                $sampleBytesPerSec.Add(($sampleItem.Length / [double]$PreflightSampleDurationSec))
+            }
+        } finally {
+            if (Test-Path -LiteralPath $sampleOutput) {
+                Remove-Item -LiteralPath $sampleOutput -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    if ($sampleBytesPerSec.Count -eq 0) {
+        $failureReason = if ($sampleFailures.Count -gt 0) {
+            "Preflight estimate failed; continuing with full encode. " + (($sampleFailures | Select-Object -First 3) -join ' | ')
+        } else {
+            'Preflight estimate failed; continuing with full encode.'
+        }
+        Write-SessionTextLogMessage -Level Warn -Message $failureReason
+        return [pscustomobject][ordered]@{
+            Ran = $false
+            ShouldSkip = $false
+            Reason = $failureReason
+        }
+    }
+
+    $sortedRates = @($sampleBytesPerSec | Sort-Object)
+    $medianRate = if ($sortedRates.Count % 2 -eq 1) {
+        $sortedRates[[int][Math]::Floor($sortedRates.Count / 2)]
+    } else {
+        ($sortedRates[($sortedRates.Count / 2) - 1] + $sortedRates[$sortedRates.Count / 2]) / 2.0
+    }
+
+    $estimatedVideoBytes = $medianRate * $SourceDurationSec
+    $estimatedFinalBytes = $estimatedVideoBytes + $copiedEstimate.Bytes
+    $estimatedPctOfSource = if ($SourceSizeBytes -gt 0) { ($estimatedFinalBytes / $SourceSizeBytes) * 100.0 } else { 0.0 }
+    $estimatedSavingsPercent = if ($SourceSizeBytes -gt 0) { 100.0 * (1.0 - ($estimatedFinalBytes / $SourceSizeBytes)) } else { 0.0 }
+    $estimatedOutputGiBPerHour = if ($SourceDurationSec -gt 0) { ($estimatedFinalBytes / 1GB) / ($SourceDurationSec / 3600.0) } else { 0.0 }
+
+    $shouldSkip = $estimatedPctOfSource -ge $PreflightAbortIfEstimatedPctOfSource
+    $reason = "Used median bytes/sec from $($sampleBytesPerSec.Count) sample encode(s)."
+    if ($copiedEstimate.Bytes -gt 0) {
+        $reason += " Added copied stream estimate ($([Math]::Round($copiedEstimate.Bytes / 1MB, 2)) MiB)."
+    }
+    Write-SessionTextLogMessage -Level Info -Message ("Preflight estimate | {0:F2} GiB | savings {1:F1}% | rate {2:F2} GiB/hr" -f ($estimatedFinalBytes / 1GB), $estimatedSavingsPercent, $estimatedOutputGiBPerHour)
+
+    return [pscustomobject][ordered]@{
+        Ran = $true
+        ShouldSkip = $shouldSkip
+        EstimatedFinalBytes = $estimatedFinalBytes
+        EstimatedFinalSizeGiB = ($estimatedFinalBytes / 1GB)
+        EstimatedSavingsPercent = $estimatedSavingsPercent
+        EstimatedOutputGiBPerHour = $estimatedOutputGiBPerHour
+        EstimatedPctOfSource = $estimatedPctOfSource
+        SampleCountUsed = $sampleBytesPerSec.Count
+        WarningTriggered = ($estimatedPctOfSource -ge $PreflightWarnIfEstimatedPctOfSource)
+        Reason = $reason
+    }
+}
+
+function Format-PreflightSettingsLabel {
+    param(
+        [string]$EncodeMode,
+        [int]$CRF,
+        [int]$Preset,
+        [int]$FilmGrain,
+        $NvencSettings = $null
+    )
+
+    if ($EncodeMode -eq 'nvenc' -and $NvencSettings) {
+        return "CRF $CRF / Preset $Preset / FilmGrain $FilmGrain / CQ $($NvencSettings.CQ) / NVENC $($NvencSettings.Preset)"
+    }
+
+    return "CRF $CRF / Preset $Preset / FilmGrain $FilmGrain"
+}
+
+function Resolve-PreflightAutoTuneTargets {
+    param(
+        [string]$QualityProfile,
+        [string]$ResolutionTier,
+        $SourceProfile
+    )
+
+    $target = 4.0
+    $lower = 3.0
+    $upper = 5.0
+    $profileLabel = if ([string]::IsNullOrWhiteSpace($QualityProfile)) { 'High' } else { $QualityProfile }
+    $isHdr = [bool](Get-OptionalProperty -InputObject $SourceProfile -PropertyName 'HasHDR' -Default $false)
+    $tier = if ([string]::IsNullOrWhiteSpace($ResolutionTier)) { 'HD' } else { $ResolutionTier }
+
+    switch ("$tier|$($isHdr)") {
+        'UHD|True' {
+            switch ($profileLabel) {
+                'Low'    { $target = 6.0;  $lower = 4.0;  $upper = 8.0 }
+                'Medium' { $target = 9.0;  $lower = 7.0;  $upper = 11.0 }
+                default  { $target = 12.0; $lower = 10.0; $upper = 14.0 }
+            }
+        }
+        'UHD|False' {
+            switch ($profileLabel) {
+                'Low'    { $target = 5.0;  $lower = 3.0;  $upper = 7.0 }
+                'Medium' { $target = 8.0;  $lower = 6.0;  $upper = 10.0 }
+                default  { $target = 10.0; $lower = 8.0;  $upper = 12.0 }
+            }
+        }
+        'HD|True' {
+            switch ($profileLabel) {
+                'Low'    { $target = 3.0; $lower = 2.0; $upper = 4.0 }
+                'Medium' { $target = 4.0; $lower = 3.0; $upper = 5.0 }
+                default  { $target = 5.0; $lower = 4.0; $upper = 6.0 }
+            }
+        }
+        'HD|False' {
+            switch ($profileLabel) {
+                'Low'    { $target = 2.0; $lower = 1.0; $upper = 3.0 }
+                'Medium' { $target = 3.0; $lower = 2.0; $upper = 4.0 }
+                default  { $target = 4.0; $lower = 3.0; $upper = 5.0 }
+            }
+        }
+        default {
+            switch ($profileLabel) {
+                'Low'    { $target = 1.0; $lower = 0.0; $upper = 2.0 }
+                'Medium' { $target = 1.5; $lower = 0.5; $upper = 2.5 }
+                default  { $target = 2.0; $lower = 1.0; $upper = 3.0 }
+            }
+        }
+    }
+
+    if ($null -ne $PreflightAutoTuneCustomTargetGiBPerHour) { $target = [double]$PreflightAutoTuneCustomTargetGiBPerHour }
+    if ($null -ne $PreflightAutoTuneCustomUpperGiBPerHour)  { $upper  = [double]$PreflightAutoTuneCustomUpperGiBPerHour }
+    if ($null -ne $PreflightAutoTuneCustomLowerGiBPerHour)  { $lower  = [double]$PreflightAutoTuneCustomLowerGiBPerHour }
+
+    $sourceLabel = switch ($tier) {
+        'UHD' { if ($isHdr) { 'UHD HDR' } else { 'UHD SDR' } }
+        'HD'  { if ($isHdr) { 'HD HDR' } else { 'HD SDR' } }
+        default { 'SD / 720p SDR' }
+    }
+
+    return [pscustomobject][ordered]@{
+        QualityProfile = $profileLabel
+        TargetGiBPerHour = $target
+        LowerGiBPerHour = $lower
+        UpperGiBPerHour = $upper
+        TargetReason = "{0} {1}, range {2}-{3}" -f $sourceLabel, $profileLabel, $lower, $upper
+    }
+}
+
+function Test-PreflightOversized {
+    param(
+        $PreflightResult,
+        $Targets
+    )
+
+    if (-not $PreflightResult -or -not $PreflightResult.Ran) { return $false }
+    return ($PreflightResult.EstimatedOutputGiBPerHour -gt $Targets.UpperGiBPerHour -or
+            $PreflightResult.EstimatedPctOfSource -ge $PreflightWarnIfEstimatedPctOfSource)
+}
+
+function Test-PreflightSuspiciouslyTiny {
+    param(
+        $PreflightResult,
+        $Targets
+    )
+
+    if (-not $PreflightResult -or -not $PreflightResult.Ran) { return $false }
+    return ($PreflightResult.EstimatedPctOfSource -le $PreflightTinyOutputPctThreshold -and
+            ($PreflightResult.EstimatedFinalSizeGiB -lt $PreflightTinyOutputAbsoluteGiBThreshold -or
+             $PreflightResult.EstimatedOutputGiBPerHour -lt $Targets.LowerGiBPerHour))
+}
+
+function Get-PreflightAutoTuneAdjustment {
+    param(
+        $PreflightResult,
+        $PreflightTargets,
+        $AutoSettings,
+        [string]$EncodeMode,
+        [int]$CurrentCRF,
+        [int]$CurrentPreset,
+        [int]$CurrentFilmGrain,
+        [bool]$AllowCrfTune,
+        [bool]$AllowPresetTune,
+        [bool]$AllowFilmGrainTune
+    )
+
+    $newCrf = $CurrentCRF
+    $newPreset = $CurrentPreset
+    $newFilmGrain = $CurrentFilmGrain
+    $reasons = [System.Collections.Generic.List[string]]::new()
+
+    if (Test-PreflightOversized -PreflightResult $PreflightResult -Targets $PreflightTargets) {
+        if ($AllowCrfTune) {
+            $adjustedCrf = [Math]::Max(0, [Math]::Min(63, ($CurrentCRF + 2)))
+            if ($adjustedCrf -ne $newCrf) {
+                $reasons.Add("Auto-tune: CRF $CurrentCRF -> $adjustedCrf (oversized preflight)")
+                $newCrf = $adjustedCrf
+            }
+        }
+
+        if ($AllowFilmGrainTune -and $EncodeMode -eq 'software' -and ($AutoSettings.GrainClass -in @('moderate', 'heavy', 'extreme')) -and $newFilmGrain -lt 16) {
+            $adjustedFilmGrain = [Math]::Min(16, ($newFilmGrain + 4))
+            if ($adjustedFilmGrain -ne $newFilmGrain) {
+                $reasons.Add("Auto-tune: FilmGrain $newFilmGrain -> $adjustedFilmGrain (grain-aware oversized preflight)")
+                $newFilmGrain = $adjustedFilmGrain
+            }
+        }
+    } elseif (Test-PreflightSuspiciouslyTiny -PreflightResult $PreflightResult -Targets $PreflightTargets) {
+        if ($AllowCrfTune) {
+            $adjustedCrf = [Math]::Max(0, [Math]::Min(63, ($CurrentCRF - 1)))
+            if ($adjustedCrf -ne $newCrf) {
+                $reasons.Add("Auto-tune: CRF $CurrentCRF -> $adjustedCrf (suspiciously tiny preflight)")
+                $newCrf = $adjustedCrf
+            }
+        }
+
+        if ($AllowFilmGrainTune -and $EncodeMode -eq 'software' -and ($AutoSettings.GrainClass -in @('none', 'light', 'unknown')) -and $newFilmGrain -gt 0) {
+            $adjustedFilmGrain = [Math]::Max(0, ($newFilmGrain - 4))
+            if ($adjustedFilmGrain -ne $newFilmGrain) {
+                $reasons.Add("Auto-tune: FilmGrain $newFilmGrain -> $adjustedFilmGrain (suspiciously tiny clean-source preflight)")
+                $newFilmGrain = $adjustedFilmGrain
+            }
+        }
+    }
+
+    # Preset is intentionally left untouched here unless future evidence shows
+    # it helps more than it harms. In the current quality-first architecture,
+    # CRF and film grain are the clearer tuning levers.
+    return [pscustomobject][ordered]@{
+        CRF = $newCrf
+        Preset = $newPreset
+        FilmGrain = $newFilmGrain
+        MaterialChange = ($newCrf -ne $CurrentCRF -or $newPreset -ne $CurrentPreset -or $newFilmGrain -ne $CurrentFilmGrain)
+        Reasons = @($reasons)
+    }
+}
+
+function Invoke-PreflightAutoTuneWorkflow {
+    param(
+        [string]$InputPath,
+        $Selected,
+        $SourceProfile,
+        [string]$EncodeMode,
+        [double]$SourceDurationSec,
+        [int64]$SourceSizeBytes,
+        $AutoSettings,
+        [int]$InitialResolvedCRF,
+        [int]$InitialResolvedPreset,
+        [int]$InitialResolvedFilmGrain,
+        $NvencEnvironment = $null
+    )
+
+    $workflow = [pscustomobject][ordered]@{
+        InitialResolvedCRF = $InitialResolvedCRF
+        InitialResolvedPreset = $InitialResolvedPreset
+        InitialResolvedFilmGrain = $InitialResolvedFilmGrain
+        FinalResolvedCRF = $InitialResolvedCRF
+        FinalResolvedPreset = $InitialResolvedPreset
+        FinalResolvedFilmGrain = $InitialResolvedFilmGrain
+        FinalNvencSettings = $null
+        PreflightPassCount = 0
+        Preflight1 = $null
+        Preflight2 = $null
+        FinalPreflight = [pscustomobject][ordered]@{ Ran = $false; ShouldSkip = $false; Reason = 'Preflight estimate not run.' }
+        PreflightAutoTuneReason = ''
+        WasPreflightRetuned = $false
+        WasSkippedByPreflight = $false
+        SkipStatus = ''
+    }
+
+    if ($EncodeMode -eq 'nvenc') {
+        $baseNvencAuto = [ordered]@{}
+        foreach ($prop in $AutoSettings.Keys) { $baseNvencAuto[$prop] = $AutoSettings[$prop] }
+        $baseNvencAuto.CRF = $InitialResolvedCRF
+        $workflow.FinalNvencSettings = Convert-SoftwareQualityToNvencSettings `
+            -AutoSettings $baseNvencAuto `
+            -SourceProfile $SourceProfile `
+            -ConfiguredNvencPreset $NvencPreset `
+            -ConfiguredNvencCQ $NvencCQ `
+            -ConfiguredNvencTune $NvencTune `
+            -ConfiguredNvencDecode $NvencDecode `
+            -NvencEnvironment $NvencEnvironment
+    }
+
+    if (-not $EnablePreflightEstimate) {
+        $workflow.PreflightAutoTuneReason = 'Preflight estimate disabled by configuration.'
+        return $workflow
+    }
+
+    $allowCrfTune = ($CRF -eq 'Auto')
+    $allowPresetTune = ($Preset -eq 'Auto' -and $EncodeMode -eq 'software')
+    $allowFilmGrainTune = ($FilmGrain -eq 'Auto' -and $EncodeMode -eq 'software')
+    $preflightTargets = Resolve-PreflightAutoTuneTargets -QualityProfile $PreflightAutoTuneQuality -ResolutionTier $AutoSettings.ResolutionTier -SourceProfile $SourceProfile
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    $reasons.Add("Initial Auto: CRF $InitialResolvedCRF / Preset $InitialResolvedPreset / FilmGrain $InitialResolvedFilmGrain ($($AutoSettings.ResolutionTier) / $($SourceProfile.Profile) / $($AutoSettings.CodecLabel) / $($AutoSettings.BPPTier) BPP)")
+    $reasons.Add(("Preflight target: {0} GiB/hr ({1})" -f $preflightTargets.TargetGiBPerHour, $preflightTargets.TargetReason))
+
+    $currentCrf = $InitialResolvedCRF
+    $currentPreset = $InitialResolvedPreset
+    $currentFilmGrain = $InitialResolvedFilmGrain
+
+    $currentNvencSettings = $workflow.FinalNvencSettings
+    Write-Host ("Preflight target profile: {0}" -f $preflightTargets.QualityProfile) -ForegroundColor DarkCyan
+    Write-Host ("Resolved target: {0} GiB/hr ({1})" -f $preflightTargets.TargetGiBPerHour, $preflightTargets.TargetReason) -ForegroundColor DarkCyan
+    Write-SessionTextLogMessage -Level Info -Message ("Preflight target | profile {0} | {1} GiB/hr ({2})" -f $preflightTargets.QualityProfile, $preflightTargets.TargetGiBPerHour, $preflightTargets.TargetReason)
+    $workflow.Preflight1 = Invoke-PreflightEstimate `
+        -InputPath $InputPath `
+        -Selected $Selected `
+        -SourceProfile $SourceProfile `
+        -EncodeMode $EncodeMode `
+        -SourceDurationSec $SourceDurationSec `
+        -SourceSizeBytes $SourceSizeBytes `
+        -ResolvedCRF $currentCrf `
+        -ResolvedPreset $currentPreset `
+        -ResolvedFilmGrain $currentFilmGrain `
+        -PassNumber 1 `
+        -SettingsLabel (Format-PreflightSettingsLabel -EncodeMode $EncodeMode -CRF $currentCrf -Preset $currentPreset -FilmGrain $currentFilmGrain -NvencSettings $currentNvencSettings) `
+        -NvencSettings $currentNvencSettings `
+        -NvencEnvironment $NvencEnvironment
+
+    if ($workflow.Preflight1.Ran) {
+        $workflow.PreflightPassCount = 1
+        $reasons.Add(("Preflight 1: projected {0:F2} GiB/hr, {1:F1}% of source" -f $workflow.Preflight1.EstimatedOutputGiBPerHour, $workflow.Preflight1.EstimatedPctOfSource))
+    } else {
+        $workflow.PreflightAutoTuneReason = $workflow.Preflight1.Reason
+        $workflow.FinalPreflight = $workflow.Preflight1
+        return $workflow
+    }
+
+    if ($EnablePreflightAutoTune -and ($allowCrfTune -or $allowPresetTune -or $allowFilmGrainTune)) {
+        $adjustment = Get-PreflightAutoTuneAdjustment `
+            -PreflightResult $workflow.Preflight1 `
+            -PreflightTargets $preflightTargets `
+            -AutoSettings $AutoSettings `
+            -EncodeMode $EncodeMode `
+            -CurrentCRF $currentCrf `
+            -CurrentPreset $currentPreset `
+            -CurrentFilmGrain $currentFilmGrain `
+            -AllowCrfTune $allowCrfTune `
+            -AllowPresetTune $allowPresetTune `
+            -AllowFilmGrainTune $allowFilmGrainTune
+
+        if ($adjustment.MaterialChange) {
+            $workflow.WasPreflightRetuned = $true
+            foreach ($adjustmentReason in @($adjustment.Reasons)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$adjustmentReason)) {
+                    $reasons.Add([string]$adjustmentReason)
+                }
+            }
+            $currentCrf = $adjustment.CRF
+            $currentPreset = $adjustment.Preset
+            $currentFilmGrain = $adjustment.FilmGrain
+            $workflow.FinalResolvedCRF = $currentCrf
+            $workflow.FinalResolvedPreset = $currentPreset
+            $workflow.FinalResolvedFilmGrain = $currentFilmGrain
+
+            if ($EncodeMode -eq 'nvenc') {
+                $retunedNvencAuto = [ordered]@{}
+                foreach ($prop in $AutoSettings.Keys) { $retunedNvencAuto[$prop] = $AutoSettings[$prop] }
+                $retunedNvencAuto.CRF = $currentCrf
+                $workflow.FinalNvencSettings = Convert-SoftwareQualityToNvencSettings `
+                    -AutoSettings $retunedNvencAuto `
+                    -SourceProfile $SourceProfile `
+                    -ConfiguredNvencPreset $NvencPreset `
+                    -ConfiguredNvencCQ $NvencCQ `
+                    -ConfiguredNvencTune $NvencTune `
+                    -ConfiguredNvencDecode $NvencDecode `
+                    -NvencEnvironment $NvencEnvironment
+            }
+
+            if ($EnableSecondPreflightPass) {
+                $currentNvencSettings = if ($EncodeMode -eq 'nvenc') { $workflow.FinalNvencSettings } else { $null }
+                $workflow.Preflight2 = Invoke-PreflightEstimate `
+                    -InputPath $InputPath `
+                    -Selected $Selected `
+                    -SourceProfile $SourceProfile `
+                    -EncodeMode $EncodeMode `
+                    -SourceDurationSec $SourceDurationSec `
+                    -SourceSizeBytes $SourceSizeBytes `
+                    -ResolvedCRF $currentCrf `
+                    -ResolvedPreset $currentPreset `
+                    -ResolvedFilmGrain $currentFilmGrain `
+                    -PassNumber 2 `
+                    -SettingsLabel (Format-PreflightSettingsLabel -EncodeMode $EncodeMode -CRF $currentCrf -Preset $currentPreset -FilmGrain $currentFilmGrain -NvencSettings $currentNvencSettings) `
+                    -NvencSettings $currentNvencSettings `
+                    -NvencEnvironment $NvencEnvironment
+
+                if ($workflow.Preflight2.Ran) {
+                    $workflow.PreflightPassCount = 2
+                    $reasons.Add(("Preflight 2: projected {0:F2} GiB/hr, {1:F1}% of source" -f $workflow.Preflight2.EstimatedOutputGiBPerHour, $workflow.Preflight2.EstimatedPctOfSource))
+                }
+            }
+        }
+    }
+
+    $workflow.FinalPreflight = if ($workflow.Preflight2 -and $workflow.Preflight2.Ran) { $workflow.Preflight2 } else { $workflow.Preflight1 }
+    $workflow | Add-Member -NotePropertyName PreflightTargets -NotePropertyValue $preflightTargets -Force
+    if ($workflow.FinalPreflight -and $workflow.FinalPreflight.Ran -and $workflow.FinalPreflight.EstimatedPctOfSource -ge $PreflightAbortIfEstimatedPctOfSource) {
+        $workflow.WasSkippedByPreflight = $true
+        $workflow.SkipStatus = 'PRECHECK_SKIPPED_UNFAVORABLE'
+        $reasons.Add('Decision: skipped (estimated output exceeds threshold)')
+    } elseif ($workflow.FinalPreflight -and $workflow.FinalPreflight.Ran) {
+        $reasons.Add('Proceeding with tuned settings')
+    }
+
+    $workflow.PreflightAutoTuneReason = ($reasons -join ' | ')
+    return $workflow
 }
 
 function Get-ColorPrimariesLabel {
@@ -1678,6 +4164,659 @@ function Get-FinalOutputPath {
     return Join-Path $dir ($name + ".mkv")
 }
 
+function Get-EncodeInitialization {
+    param(
+        [string]$InputPath,
+        [string]$EncodeMode = 'software',
+        $NvencEnvironment = $null,
+        [string]$EncoderPreferenceValue = $EncoderPreference,
+        [string]$LaneSelectionReason = '',
+        [string]$LaneSuitability = '',
+        [string]$CpuOnlyReason = '',
+        [bool]$NvidiaFallbackAllowed = $true,
+        [bool]$HeldForCpuLane = $false
+    )
+
+    $sourceItem = Get-Item -LiteralPath $InputPath
+    $sourceSizeGiB = [Math]::Round(($sourceItem.Length / 1GB), 3)
+
+    $outputDir = Split-Path -Path $InputPath -Parent
+    $null = Test-SufficientDiskSpace -TargetDirectory $outputDir -SourceSizeBytes $sourceItem.Length
+
+    $probe         = Invoke-FfprobeJson -InputPath $InputPath
+    $selected      = Select-Streams     -Probe $probe
+    $sourceProfile = Get-SourceProfile  -Probe $probe -VideoStream $selected.Video
+    $encodeColorProfile = Get-EncodeColorProfile -SourceProfile $sourceProfile
+    $sourceFormat  = Get-OptionalProperty -InputObject $probe -PropertyName 'format' -Default ([PSCustomObject]@{})
+    $sourceDuration = Convert-ToInvariantDouble (Get-OptionalProperty $sourceFormat 'duration' 0) 0.0
+    $sourceResolutionTier = Get-ResolutionTier -Width ([int](Get-StreamProp $selected.Video 'width' 0))
+    $sourceCodecClass = Get-CodecClass -Stream $selected.Video
+    $selectedAudioSummary = Format-StreamSummary -Streams @($selected.MainAudio, $selected.FallbackAudio)
+    $selectedSubtitleSummary = Format-StreamSummary -Streams @($selected.MainSub, $selected.SdhSub)
+    $copiedStreamsEstimate = Get-CopiedStreamsSizeEstimate -Streams @($selected.MainAudio, $selected.FallbackAudio, $selected.MainSub, $selected.SdhSub) -DurationSec $sourceDuration
+    $copiedStreamsEstimate = Get-CopiedStreamsSizeEstimate -Streams @($selected.MainAudio, $selected.FallbackAudio, $selected.MainSub, $selected.SdhSub) -DurationSec $sourceDuration
+
+    $tempOutput  = Get-TempOutputPath  -InputPath $InputPath
+    $finalOutput = Get-FinalOutputPath -InputPath $InputPath
+    $displayOutputName = [System.IO.Path]::GetFileName($finalOutput)
+    $displayInputName = [System.IO.Path]::GetFileName($InputPath)
+    $resolvedEncodeLane = Get-ResolvedEncodeLaneName -EncodeMode $EncodeMode
+    if ([string]::IsNullOrWhiteSpace($LaneSelectionReason)) {
+        $LaneSelectionReason = if ($resolvedEncodeLane -eq 'Nvidia') {
+            'Encoder preference selected the Nvidia lane.'
+        } else {
+            'Encoder preference selected the CPU lane.'
+        }
+    }
+
+    if ((Test-Path -LiteralPath $finalOutput) -and
+        (-not [string]::Equals(
+            (Get-NormalizedPath $finalOutput),
+            (Get-NormalizedPath $InputPath),
+            [System.StringComparison]::OrdinalIgnoreCase))) {
+        throw "Final output path already exists and is not the source file: $finalOutput. Remove it manually before re-encoding."
+    }
+
+    if ($sourceProfile.HasDV -and $SkipDolbyVisionSources) {
+        return [ordered]@{
+            EarlyExit = 'SKIPPED_DV'
+            Row = @{
+                Timestamp         = (Get-Date).ToString("s")
+                Status            = "SKIPPED_DV"
+                InputPath         = $InputPath
+                OutputPath        = ""
+                SourceSizeGiB     = $sourceSizeGiB
+                OutputSizeGiB     = ""
+                ReductionPercent  = ""
+                SourceDurationSec = $sourceDuration
+                OutputDurationSec = ""
+                ElapsedSec        = ""
+                Profile           = $sourceProfile.Profile
+                HasHDR            = $sourceProfile.HasHDR
+                HasDV             = $sourceProfile.HasDV
+                SelectedAudio     = $selectedAudioSummary
+                SelectedSubtitles = $selectedSubtitleSummary
+                CRF               = $CRF
+                Preset            = $Preset
+                FilmGrain         = $FilmGrain
+                AutoCRFOffset     = $AutoCRFOffset
+                EncoderPreference = $EncoderPreferenceValue
+                ResolvedEncodeLane = $resolvedEncodeLane
+                LaneSelectionReason = $LaneSelectionReason
+                LaneSuitability  = $LaneSuitability
+                CpuOnlyReason    = $CpuOnlyReason
+                NvidiaFallbackAllowed = "$NvidiaFallbackAllowed"
+                HeldForCpuLane   = "$HeldForCpuLane"
+                WorkerProcessPriority = Get-WorkerProcessPriorityName -EncodeMode $EncodeMode
+                ScriptProcessPriority = $script:ResolvedScriptProcessPriority
+                EncodeMode        = $EncodeMode
+                ResolvedCRF       = ""
+                ResolvedPreset    = ""
+                ResolvedFilmGrain = ""
+                ResolvedCQ        = ""
+                ResolvedNvencPreset = ""
+                ResolvedNvencTune = ""
+                ResolvedDecodePath = ""
+                AutoReason        = ""
+                BPP               = ""
+                EffectiveVideoBitrate = ""
+                VideoBitratePerHourGiB = ""
+                ResolutionTier    = $sourceResolutionTier
+                CodecClass        = $sourceCodecClass
+                GrainClass        = ""
+                GrainScore        = ""
+                WasAutoSkipped    = "False"
+                NvencWorkerCountAtStart = ""
+                NvencEngineCountDetected = if ($NvencEnvironment) { $NvencEnvironment.NvencEngineCount } else { "" }
+                NvencCapacitySource = if ($NvencEnvironment) { $NvencEnvironment.CapacitySource } else { "" }
+                DetectedGpuName   = if ($NvencEnvironment) { $NvencEnvironment.GpuName } else { "" }
+                FilmGrainDisabledReason = ""
+                FfmpegPath        = $FfmpegPath
+                FfprobePath       = $FfprobePath
+                Notes             = "Dolby Vision source skipped by policy."
+            }
+        }
+    }
+
+    $autoSettings = Get-AutoEncodeSettings `
+        -Probe $probe `
+        -VideoStream $selected.Video `
+        -SourceProfile $sourceProfile `
+        -KeptAudioStreams @($selected.MainAudio, $selected.FallbackAudio) `
+        -InputPath $InputPath `
+        -ConfiguredCRF $CRF `
+        -ConfiguredPreset $Preset `
+        -ConfiguredFilmGrain $FilmGrain `
+        -ConfiguredAutoCRFOffset $AutoCRFOffset
+
+    if ($autoSettings.Skip) {
+        return [ordered]@{
+            EarlyExit = 'AUTO_SKIPPED_ALREADY_EFFICIENT'
+            Row = @{
+                Timestamp         = (Get-Date).ToString("s")
+                Status            = "AUTO_SKIPPED_ALREADY_EFFICIENT"
+                InputPath         = $InputPath
+                OutputPath        = ""
+                SourceSizeGiB     = $sourceSizeGiB
+                OutputSizeGiB     = ""
+                ReductionPercent  = ""
+                SourceDurationSec = [Math]::Round($sourceDuration, 3)
+                OutputDurationSec = ""
+                ElapsedSec        = ""
+                Profile           = $sourceProfile.Profile
+                HasHDR            = $sourceProfile.HasHDR
+                HasDV             = $sourceProfile.HasDV
+                SelectedAudio     = $selectedAudioSummary
+                SelectedSubtitles = $selectedSubtitleSummary
+                CRF               = $CRF
+                Preset            = $Preset
+                FilmGrain         = $FilmGrain
+                AutoCRFOffset     = $AutoCRFOffset
+                EncoderPreference = $EncoderPreferenceValue
+                ResolvedEncodeLane = $resolvedEncodeLane
+                LaneSelectionReason = if ($LaneSelectionReason) { $LaneSelectionReason } else { $autoSettings.SkipReason }
+                LaneSuitability  = $LaneSuitability
+                CpuOnlyReason    = $CpuOnlyReason
+                NvidiaFallbackAllowed = "$NvidiaFallbackAllowed"
+                HeldForCpuLane   = "$HeldForCpuLane"
+                WorkerProcessPriority = Get-WorkerProcessPriorityName -EncodeMode $EncodeMode
+                ScriptProcessPriority = $script:ResolvedScriptProcessPriority
+                EncodeMode        = $EncodeMode
+                ResolvedCRF       = $autoSettings.CRF
+                ResolvedPreset    = $autoSettings.Preset
+                ResolvedFilmGrain = $autoSettings.FilmGrain
+                ResolvedCQ        = ""
+                ResolvedNvencPreset = ""
+                ResolvedNvencTune = ""
+                ResolvedDecodePath = ""
+                AutoReason        = $autoSettings.SkipReason
+                BPP               = [Math]::Round($autoSettings.BPP, 6)
+                EffectiveVideoBitrate = $autoSettings.VideoBitrate
+                VideoBitratePerHourGiB = [Math]::Round($autoSettings.VideoBitratePerHourGiB, 3)
+                ResolutionTier    = $autoSettings.ResolutionTier
+                CodecClass        = $autoSettings.CodecClass
+                GrainClass        = $autoSettings.GrainClass
+                GrainScore        = $autoSettings.GrainScore
+                WasAutoSkipped    = "True"
+                NvencWorkerCountAtStart = ""
+                NvencEngineCountDetected = if ($NvencEnvironment) { $NvencEnvironment.NvencEngineCount } else { "" }
+                NvencCapacitySource = if ($NvencEnvironment) { $NvencEnvironment.CapacitySource } else { "" }
+                DetectedGpuName   = if ($NvencEnvironment) { $NvencEnvironment.GpuName } else { "" }
+                FilmGrainDisabledReason = ""
+                FfmpegPath        = $FfmpegPath
+                FfprobePath       = $FfprobePath
+                Notes             = $autoSettings.BitrateReason
+            }
+        }
+    }
+
+    $nvencSettings = $null
+    $filmGrainDisabledReason = ''
+    $effectiveFilmGrain = [int]$autoSettings.FilmGrain
+    $preflightWorkflow = [pscustomobject][ordered]@{
+        InitialResolvedCRF = [int]$autoSettings.CRF
+        InitialResolvedPreset = [int]$autoSettings.Preset
+        InitialResolvedFilmGrain = $effectiveFilmGrain
+        FinalResolvedCRF = [int]$autoSettings.CRF
+        FinalResolvedPreset = [int]$autoSettings.Preset
+        FinalResolvedFilmGrain = $effectiveFilmGrain
+        FinalNvencSettings = $nvencSettings
+        PreflightPassCount = 0
+        Preflight1 = $null
+        Preflight2 = $null
+        FinalPreflight = [pscustomobject][ordered]@{ Ran = $false; ShouldSkip = $false; Reason = '' }
+        PreflightAutoTuneReason = ''
+        WasPreflightRetuned = $false
+        WasSkippedByPreflight = $false
+        SkipStatus = ''
+    }
+    if ($EncodeMode -eq 'nvenc') {
+        if (-not $NvencEnvironment) {
+            throw "NVENC initialization requested without a detected NVENC environment."
+        }
+
+        $nvencSettings = Convert-SoftwareQualityToNvencSettings `
+            -AutoSettings $autoSettings `
+            -SourceProfile $sourceProfile `
+            -ConfiguredNvencPreset $NvencPreset `
+            -ConfiguredNvencCQ $NvencCQ `
+            -ConfiguredNvencTune $NvencTune `
+            -ConfiguredNvencDecode $NvencDecode `
+            -NvencEnvironment $NvencEnvironment
+
+        if ([int]$autoSettings.FilmGrain -gt 0) {
+            $effectiveFilmGrain = 0
+            $filmGrainDisabledReason = 'FFmpeg av1_nvenc does not expose AV1 film grain synthesis in this build; FilmGrain was forced to 0.'
+        }
+    }
+
+    $preflightWorkflow = Invoke-PreflightAutoTuneWorkflow `
+        -InputPath $InputPath `
+        -Selected $selected `
+        -SourceProfile $sourceProfile `
+        -EncodeMode $EncodeMode `
+        -SourceDurationSec $sourceDuration `
+        -SourceSizeBytes $sourceItem.Length `
+        -AutoSettings $autoSettings `
+        -InitialResolvedCRF ([int]$autoSettings.CRF) `
+        -InitialResolvedPreset ([int]$autoSettings.Preset) `
+        -InitialResolvedFilmGrain $effectiveFilmGrain `
+        -NvencEnvironment $NvencEnvironment
+
+    $preflightEstimate = $preflightWorkflow.FinalPreflight
+    $effectiveFilmGrain = [int]$preflightWorkflow.FinalResolvedFilmGrain
+    if ($EncodeMode -eq 'nvenc' -and $preflightWorkflow.FinalNvencSettings) {
+        $nvencSettings = $preflightWorkflow.FinalNvencSettings
+    }
+
+    if ($preflightEstimate.Ran) {
+        Write-Host ("Preflight estimate: {0:F2} GiB (projected savings {1:F1}%)" -f $preflightEstimate.EstimatedFinalSizeGiB, $preflightEstimate.EstimatedSavingsPercent) -ForegroundColor DarkCyan
+        Write-SessionTextLogMessage -Level Info -Message ("Preflight estimate | {0} | {1:F2} GiB | savings {2:F1}%" -f $displayInputName, $preflightEstimate.EstimatedFinalSizeGiB, $preflightEstimate.EstimatedSavingsPercent)
+        if ($preflightWorkflow.WasSkippedByPreflight) {
+            Write-Host "Decision: skipped (estimated output exceeds threshold)" -ForegroundColor Yellow
+            Write-SessionTextLogMessage -Level Warn -Message ("Preflight decision | skipped | {0} | estimated output exceeds threshold" -f $displayInputName)
+            return [ordered]@{
+                EarlyExit = 'PRECHECK_SKIPPED_UNFAVORABLE'
+                Row = @{
+                    Timestamp         = (Get-Date).ToString("s")
+                    Status            = "PRECHECK_SKIPPED_UNFAVORABLE"
+                    InputPath         = $InputPath
+                    OutputPath        = ""
+                    SourceSizeGiB     = $sourceSizeGiB
+                    OutputSizeGiB     = ""
+                    ReductionPercent  = ""
+                    SourceDurationSec = [Math]::Round($sourceDuration, 3)
+                    OutputDurationSec = ""
+                    ElapsedSec        = ""
+                    Profile           = $sourceProfile.Profile
+                    HasHDR            = $sourceProfile.HasHDR
+                    HasDV             = $sourceProfile.HasDV
+                    SelectedAudio     = $selectedAudioSummary
+                    SelectedSubtitles = $selectedSubtitleSummary
+                    EstimatedFinalSizeGiB = [Math]::Round($preflightEstimate.EstimatedFinalSizeGiB, 3)
+                    EstimatedSavingsPercent = [Math]::Round($preflightEstimate.EstimatedSavingsPercent, 2)
+                    EstimatedOutputGiBPerHour = [Math]::Round($preflightEstimate.EstimatedOutputGiBPerHour, 3)
+                    InitialResolvedCRF = $preflightWorkflow.InitialResolvedCRF
+                    InitialResolvedPreset = $preflightWorkflow.InitialResolvedPreset
+                    InitialResolvedFilmGrain = $preflightWorkflow.InitialResolvedFilmGrain
+                    PreflightPassCount = $preflightWorkflow.PreflightPassCount
+                    Preflight1EstimatedFinalGiB = if ($preflightWorkflow.Preflight1 -and $preflightWorkflow.Preflight1.Ran) { [Math]::Round($preflightWorkflow.Preflight1.EstimatedFinalSizeGiB, 3) } else { "" }
+                    Preflight1EstimatedSavingsPercent = if ($preflightWorkflow.Preflight1 -and $preflightWorkflow.Preflight1.Ran) { [Math]::Round($preflightWorkflow.Preflight1.EstimatedSavingsPercent, 2) } else { "" }
+                    Preflight1EstimatedGiBPerHour = if ($preflightWorkflow.Preflight1 -and $preflightWorkflow.Preflight1.Ran) { [Math]::Round($preflightWorkflow.Preflight1.EstimatedOutputGiBPerHour, 3) } else { "" }
+                    Preflight2EstimatedFinalGiB = if ($preflightWorkflow.Preflight2 -and $preflightWorkflow.Preflight2.Ran) { [Math]::Round($preflightWorkflow.Preflight2.EstimatedFinalSizeGiB, 3) } else { "" }
+                    Preflight2EstimatedSavingsPercent = if ($preflightWorkflow.Preflight2 -and $preflightWorkflow.Preflight2.Ran) { [Math]::Round($preflightWorkflow.Preflight2.EstimatedSavingsPercent, 2) } else { "" }
+                    Preflight2EstimatedGiBPerHour = if ($preflightWorkflow.Preflight2 -and $preflightWorkflow.Preflight2.Ran) { [Math]::Round($preflightWorkflow.Preflight2.EstimatedOutputGiBPerHour, 3) } else { "" }
+                    FinalResolvedCRF = $preflightWorkflow.FinalResolvedCRF
+                    FinalResolvedPreset = $preflightWorkflow.FinalResolvedPreset
+                    FinalResolvedFilmGrain = $preflightWorkflow.FinalResolvedFilmGrain
+                    PreflightAutoTuneReason = $preflightWorkflow.PreflightAutoTuneReason
+                    WasPreflightRetuned = "$($preflightWorkflow.WasPreflightRetuned)"
+                    WasSkippedByPreflight = 'True'
+                    CRF               = $CRF
+                    Preset            = $Preset
+                    FilmGrain         = $FilmGrain
+                    AutoCRFOffset     = $AutoCRFOffset
+                    EncoderPreference = $EncoderPreferenceValue
+                    ResolvedEncodeLane = $resolvedEncodeLane
+                    LaneSelectionReason = $LaneSelectionReason
+                    LaneSuitability  = $LaneSuitability
+                    CpuOnlyReason    = $CpuOnlyReason
+                    NvidiaFallbackAllowed = "$NvidiaFallbackAllowed"
+                    HeldForCpuLane   = "$HeldForCpuLane"
+                    WorkerProcessPriority = Get-WorkerProcessPriorityName -EncodeMode $EncodeMode
+                    ScriptProcessPriority = $script:ResolvedScriptProcessPriority
+                    EncodeMode        = $EncodeMode
+                    ResolvedCRF       = $preflightWorkflow.FinalResolvedCRF
+                    ResolvedPreset    = $preflightWorkflow.FinalResolvedPreset
+                    ResolvedFilmGrain = $effectiveFilmGrain
+                    ResolvedCQ        = if ($nvencSettings) { $nvencSettings.CQ } else { "" }
+                    ResolvedNvencPreset = if ($nvencSettings) { $nvencSettings.Preset } else { "" }
+                    ResolvedNvencTune = if ($nvencSettings) { $nvencSettings.Tune } else { "" }
+                    ResolvedDecodePath = if ($nvencSettings) { $nvencSettings.DecodePath } else { "" }
+                    AutoReason        = $preflightWorkflow.PreflightAutoTuneReason
+                    BPP               = [Math]::Round($autoSettings.BPP, 6)
+                    EffectiveVideoBitrate = $autoSettings.VideoBitrate
+                    VideoBitratePerHourGiB = [Math]::Round($autoSettings.VideoBitratePerHourGiB, 3)
+                    ResolutionTier    = $autoSettings.ResolutionTier
+                    CodecClass        = $autoSettings.CodecClass
+                    GrainClass        = $autoSettings.GrainClass
+                    GrainScore        = $autoSettings.GrainScore
+                    WasAutoSkipped    = "False"
+                    NvencWorkerCountAtStart = ""
+                    NvencEngineCountDetected = if ($NvencEnvironment) { $NvencEnvironment.NvencEngineCount } else { "" }
+                    NvencCapacitySource = if ($NvencEnvironment) { $NvencEnvironment.CapacitySource } else { "" }
+                    DetectedGpuName   = if ($NvencEnvironment) { $NvencEnvironment.GpuName } else { "" }
+                    FilmGrainDisabledReason = $filmGrainDisabledReason
+                    FfmpegPath        = $FfmpegPath
+                    FfprobePath       = $FfprobePath
+                    Notes             = $preflightWorkflow.PreflightAutoTuneReason
+                }
+            }
+        }
+
+        if ($preflightEstimate.WarningTriggered) {
+            Write-Host ("Warning: projected output is {0:F1}% of source size." -f $preflightEstimate.EstimatedPctOfSource) -ForegroundColor Yellow
+            Write-SessionTextLogMessage -Level Warn -Message ("Preflight warning | {0} | projected output is {1:F1}% of source size" -f $displayInputName, $preflightEstimate.EstimatedPctOfSource)
+        }
+        Write-Host "Proceeding with full encode" -ForegroundColor DarkCyan
+        Write-SessionTextLogMessage -Level Info -Message ("Preflight decision | proceed | {0}" -f $displayInputName)
+    } elseif ($EnablePreflightEstimate -and -not [string]::IsNullOrWhiteSpace($preflightEstimate.Reason)) {
+        Write-Warning $preflightEstimate.Reason
+        Write-SessionTextLogMessage -Level Warn -Message ("Preflight warning | {0} | {1}" -f $displayInputName, $preflightEstimate.Reason)
+    }
+
+    return [ordered]@{
+        EarlyExit               = ''
+        InputPath               = $InputPath
+        SourceItem              = $sourceItem
+        SourceSizeGiB           = $sourceSizeGiB
+        SourceDurationSec       = $sourceDuration
+        Probe                   = $probe
+        Selected                = $selected
+        SourceProfile           = $sourceProfile
+        EncodeColorProfile      = $encodeColorProfile
+        SelectedAudioSummary    = $selectedAudioSummary
+        SelectedSubtitleSummary = $selectedSubtitleSummary
+        CopiedStreamsEstimate   = $copiedStreamsEstimate
+        SourceResolutionTier    = $sourceResolutionTier
+        SourceCodecClass        = $sourceCodecClass
+        AutoSettings            = $autoSettings
+        NvencSettings           = $nvencSettings
+        PreflightEstimate       = $preflightEstimate
+        PreflightWorkflow       = $preflightWorkflow
+        FilmGrainDisabledReason = $filmGrainDisabledReason
+        EffectiveFilmGrain      = $effectiveFilmGrain
+        TempOutput              = $tempOutput
+        FinalOutput             = $finalOutput
+        DisplayOutputName       = $displayOutputName
+        DisplayInputName        = $displayInputName
+        OutputDir               = $outputDir
+        EncoderPreference       = $EncoderPreferenceValue
+        ResolvedEncodeLane      = $resolvedEncodeLane
+        LaneSelectionReason     = $LaneSelectionReason
+        LaneSuitability         = $LaneSuitability
+        CpuOnlyReason           = $CpuOnlyReason
+        NvidiaFallbackAllowed   = $NvidiaFallbackAllowed
+        HeldForCpuLane          = $HeldForCpuLane
+        WorkerProcessPriority   = Get-WorkerProcessPriorityName -EncodeMode $EncodeMode
+        ScriptProcessPriority   = $script:ResolvedScriptProcessPriority
+        EncodeMode              = $EncodeMode
+    }
+}
+
+function Resolve-EncoderLane {
+    param(
+        [string]$InputPath,
+        [string]$EncoderPreferenceValue,
+        [bool]$CpuLaneAvailable = $true,
+        [bool]$NvidiaLaneAvailable = $false,
+        $NvencEnvironment = $null
+    )
+
+    if ($EncoderPreferenceValue -eq 'CPU') {
+        if (-not $CpuLaneAvailable) {
+            return [pscustomobject][ordered]@{
+                Ready  = $false
+                Reason = 'CPU lane is currently busy.'
+                Init   = $null
+            }
+        }
+
+        return [pscustomobject][ordered]@{
+            Ready  = $true
+            Reason = 'Encoder preference forced the CPU lane.'
+            Init   = (Get-EncodeInitialization -InputPath $InputPath -EncodeMode 'software' -EncoderPreferenceValue $EncoderPreferenceValue -LaneSelectionReason 'forced CPU lane by encoder preference')
+        }
+    }
+
+    if ($EncoderPreferenceValue -eq 'Nvidia') {
+        if (-not $NvencEnvironment) {
+            throw "EncoderPreference='Nvidia' requires a usable NVIDIA AV1 NVENC environment."
+        }
+        if (-not $NvidiaLaneAvailable) {
+            return [pscustomobject][ordered]@{
+                Ready  = $false
+                Reason = 'Nvidia lane is currently at capacity.'
+                Init   = $null
+            }
+        }
+
+        return [pscustomobject][ordered]@{
+            Ready  = $true
+            Reason = 'Encoder preference forced the Nvidia lane.'
+            Init   = (Get-EncodeInitialization -InputPath $InputPath -EncodeMode 'nvenc' -NvencEnvironment $NvencEnvironment -EncoderPreferenceValue $EncoderPreferenceValue -LaneSelectionReason 'forced Nvidia lane by encoder preference')
+        }
+    }
+
+    if (-not $NvencEnvironment) {
+        if (-not $CpuLaneAvailable) {
+            return [pscustomobject][ordered]@{
+                Ready  = $false
+                Reason = 'Nvidia lane is unavailable and the CPU lane is currently busy.'
+                Init   = $null
+            }
+        }
+
+        return [pscustomobject][ordered]@{
+            Ready  = $true
+            Reason = 'Nvidia lane unavailable; using CPU lane.'
+            Init   = (Get-EncodeInitialization -InputPath $InputPath -EncodeMode 'software' -EncoderPreferenceValue $EncoderPreferenceValue -LaneSelectionReason 'Nvidia lane unavailable; using CPU lane')
+        }
+    }
+
+    $probe = Invoke-FfprobeJson -InputPath $InputPath
+    $selected = Select-Streams -Probe $probe
+    $sourceProfile = Get-SourceProfile -Probe $probe -VideoStream $selected.Video
+    $autoSettings = Get-AutoEncodeSettings `
+        -Probe $probe `
+        -VideoStream $selected.Video `
+        -SourceProfile $sourceProfile `
+        -KeptAudioStreams @($selected.MainAudio, $selected.FallbackAudio) `
+        -InputPath $InputPath `
+        -ConfiguredCRF $CRF `
+        -ConfiguredPreset $Preset `
+        -ConfiguredFilmGrain $FilmGrain `
+        -ConfiguredAutoCRFOffset $AutoCRFOffset
+    $laneSuitability = Get-EncoderLaneSuitability -SourceProfile $sourceProfile -AutoSettings $autoSettings
+    $hint = [pscustomobject][ordered]@{
+        Lane   = $laneSuitability.PreferredLane
+        Reason = $laneSuitability.Reason
+    }
+    $preferredLane = $hint.Lane
+    $preferredLaneAvailable = if ($preferredLane -eq 'Nvidia') { $NvidiaLaneAvailable } else { $CpuLaneAvailable }
+    $alternateLane = if ($preferredLane -eq 'Nvidia') { 'CPU' } else { 'Nvidia' }
+    $alternateLaneAvailable = if ($alternateLane -eq 'Nvidia') { $NvidiaLaneAvailable } else { $CpuLaneAvailable }
+
+    if ($laneSuitability.Suitability -eq 'CpuOnly' -and -not $CpuLaneAvailable) {
+        return [pscustomobject][ordered]@{
+            Ready                 = $false
+            Reason                = "Queued for CPU: $($laneSuitability.CpuOnlyReason). NVENC not recommended for this source."
+            Init                  = $null
+            HeldForCpuLane        = $true
+            LaneSuitability       = $laneSuitability.Suitability
+            CpuOnlyReason         = $laneSuitability.CpuOnlyReason
+            NvidiaFallbackAllowed = $laneSuitability.NvidiaFallbackAllowed
+        }
+    }
+
+    if (-not $preferredLaneAvailable) {
+        if (-not $alternateLaneAvailable) {
+            return [pscustomobject][ordered]@{
+                Ready                 = $false
+                Reason                = "$preferredLane lane preferred but not currently available."
+                Init                  = $null
+                HeldForCpuLane        = $false
+                LaneSuitability       = $laneSuitability.Suitability
+                CpuOnlyReason         = $laneSuitability.CpuOnlyReason
+                NvidiaFallbackAllowed = $laneSuitability.NvidiaFallbackAllowed
+            }
+        }
+
+        if ($alternateLane -eq 'Nvidia' -and -not $laneSuitability.NvidiaFallbackAllowed) {
+            return [pscustomobject][ordered]@{
+                Ready                 = $false
+                Reason                = "CPU-only decision: Nvidia fallback disabled for this file. $($laneSuitability.CpuOnlyReason)."
+                Init                  = $null
+                HeldForCpuLane        = $true
+                LaneSuitability       = $laneSuitability.Suitability
+                CpuOnlyReason         = $laneSuitability.CpuOnlyReason
+                NvidiaFallbackAllowed = $laneSuitability.NvidiaFallbackAllowed
+            }
+        }
+
+        $alternateMode = if ($alternateLane -eq 'Nvidia') { 'nvenc' } else { 'software' }
+        $alternateReason = "$($hint.Reason); preferred $preferredLane lane busy, evaluating $alternateLane lane to keep workers active"
+        $alternateInit = Get-EncodeInitialization `
+            -InputPath $InputPath `
+            -EncodeMode $alternateMode `
+            -NvencEnvironment $NvencEnvironment `
+            -EncoderPreferenceValue $EncoderPreferenceValue `
+            -LaneSelectionReason $alternateReason `
+            -LaneSuitability $laneSuitability.Suitability `
+            -CpuOnlyReason $laneSuitability.CpuOnlyReason `
+            -NvidiaFallbackAllowed $laneSuitability.NvidiaFallbackAllowed
+
+        if ($alternateLane -eq 'Nvidia') {
+            $nvencFallback = Test-NvencFallbackSuitable -LaneSuitability $laneSuitability -Init $alternateInit
+            if (-not $nvencFallback.Allowed) {
+                return [pscustomobject][ordered]@{
+                    Ready                 = $false
+                    Reason                = "Queued for CPU: $($nvencFallback.Reason)"
+                    Init                  = $null
+                    HeldForCpuLane        = $true
+                    LaneSuitability       = $laneSuitability.Suitability
+                    CpuOnlyReason         = if ($laneSuitability.CpuOnlyReason) { $laneSuitability.CpuOnlyReason } else { $nvencFallback.Reason }
+                    NvidiaFallbackAllowed = $false
+                }
+            }
+        }
+
+        if ($alternateInit.EarlyExit -eq 'PRECHECK_SKIPPED_UNFAVORABLE') {
+            return [pscustomobject][ordered]@{
+                Ready                 = $false
+                Reason                = "$alternateReason; alternate $alternateLane lane preflight was unfavorable, waiting for preferred $preferredLane lane"
+                Init                  = $null
+                HeldForCpuLane        = ($preferredLane -eq 'CPU')
+                LaneSuitability       = $laneSuitability.Suitability
+                CpuOnlyReason         = $laneSuitability.CpuOnlyReason
+                NvidiaFallbackAllowed = $laneSuitability.NvidiaFallbackAllowed
+            }
+        }
+
+        return [pscustomobject][ordered]@{
+            Ready                 = $true
+            Reason                = $alternateReason
+            Init                  = $alternateInit
+            HeldForCpuLane        = $false
+            LaneSuitability       = $laneSuitability.Suitability
+            CpuOnlyReason         = $laneSuitability.CpuOnlyReason
+            NvidiaFallbackAllowed = $laneSuitability.NvidiaFallbackAllowed
+        }
+    }
+
+    $firstMode = if ($preferredLane -eq 'Nvidia') { 'nvenc' } else { 'software' }
+    $firstInit = Get-EncodeInitialization `
+        -InputPath $InputPath `
+        -EncodeMode $firstMode `
+        -NvencEnvironment $NvencEnvironment `
+        -EncoderPreferenceValue $EncoderPreferenceValue `
+        -LaneSelectionReason $hint.Reason `
+        -LaneSuitability $laneSuitability.Suitability `
+        -CpuOnlyReason $laneSuitability.CpuOnlyReason `
+        -NvidiaFallbackAllowed $laneSuitability.NvidiaFallbackAllowed
+
+    if ($firstInit.EarlyExit -ne 'PRECHECK_SKIPPED_UNFAVORABLE') {
+        return [pscustomobject][ordered]@{
+            Ready                 = $true
+            Reason                = $hint.Reason
+            Init                  = $firstInit
+            HeldForCpuLane        = $false
+            LaneSuitability       = $laneSuitability.Suitability
+            CpuOnlyReason         = $laneSuitability.CpuOnlyReason
+            NvidiaFallbackAllowed = $laneSuitability.NvidiaFallbackAllowed
+        }
+    }
+
+    if (-not $alternateLaneAvailable) {
+        $holdReason = "$($hint.Reason); alternate $alternateLane lane unavailable after unfavorable preflight."
+        if ($alternateLane -eq 'CPU') {
+            return [pscustomobject][ordered]@{
+                Ready                 = $false
+                Reason                = "Queued for CPU: NVENC not recommended for this source. $holdReason"
+                Init                  = $null
+                HeldForCpuLane        = $true
+                LaneSuitability       = $laneSuitability.Suitability
+                CpuOnlyReason         = $laneSuitability.CpuOnlyReason
+                NvidiaFallbackAllowed = $laneSuitability.NvidiaFallbackAllowed
+            }
+        }
+
+        $firstInit.Row.LaneSelectionReason = $holdReason
+        return [pscustomobject][ordered]@{
+            Ready                 = $true
+            Reason                = $firstInit.Row.LaneSelectionReason
+            Init                  = $firstInit
+            HeldForCpuLane        = $false
+            LaneSuitability       = $laneSuitability.Suitability
+            CpuOnlyReason         = $laneSuitability.CpuOnlyReason
+            NvidiaFallbackAllowed = $laneSuitability.NvidiaFallbackAllowed
+        }
+    }
+
+    $alternateMode = if ($alternateLane -eq 'Nvidia') { 'nvenc' } else { 'software' }
+    $alternateReason = "preferred $preferredLane lane preflight was unfavorable; trying $alternateLane lane"
+    $alternateInit = Get-EncodeInitialization `
+        -InputPath $InputPath `
+        -EncodeMode $alternateMode `
+        -NvencEnvironment $NvencEnvironment `
+        -EncoderPreferenceValue $EncoderPreferenceValue `
+        -LaneSelectionReason $alternateReason `
+        -LaneSuitability $laneSuitability.Suitability `
+        -CpuOnlyReason $laneSuitability.CpuOnlyReason `
+        -NvidiaFallbackAllowed $laneSuitability.NvidiaFallbackAllowed
+
+    if ($alternateLane -eq 'Nvidia') {
+        $nvencFallback = Test-NvencFallbackSuitable -LaneSuitability $laneSuitability -Init $alternateInit
+        if (-not $nvencFallback.Allowed) {
+            return [pscustomobject][ordered]@{
+                Ready                 = $false
+                Reason                = "Queued for CPU: $($nvencFallback.Reason)"
+                Init                  = $null
+                HeldForCpuLane        = $true
+                LaneSuitability       = $laneSuitability.Suitability
+                CpuOnlyReason         = if ($laneSuitability.CpuOnlyReason) { $laneSuitability.CpuOnlyReason } else { $nvencFallback.Reason }
+                NvidiaFallbackAllowed = $false
+            }
+        }
+    }
+
+    if ($alternateInit.EarlyExit -eq 'PRECHECK_SKIPPED_UNFAVORABLE') {
+        if ($alternateLane -eq 'Nvidia') {
+            return [pscustomobject][ordered]@{
+                Ready                 = $false
+                Reason                = "Queued for CPU: NVENC not recommended for this source. $alternateReason; Nvidia preflight was unfavorable."
+                Init                  = $null
+                HeldForCpuLane        = $true
+                LaneSuitability       = $laneSuitability.Suitability
+                CpuOnlyReason         = $laneSuitability.CpuOnlyReason
+                NvidiaFallbackAllowed = $laneSuitability.NvidiaFallbackAllowed
+            }
+        }
+
+        $alternateInit.Row.LaneSelectionReason = "$alternateReason; both lanes were unfavorable"
+    }
+
+    return [pscustomobject][ordered]@{
+        Ready                 = $true
+        Reason                = $alternateInit.Row.LaneSelectionReason
+        Init                  = $alternateInit
+        HeldForCpuLane        = $false
+        LaneSuitability       = $laneSuitability.Suitability
+        CpuOnlyReason         = $laneSuitability.CpuOnlyReason
+        NvidiaFallbackAllowed = $laneSuitability.NvidiaFallbackAllowed
+    }
+}
+
 # =============================================================================
 # FUNCTION: Format-StreamSummary
 #
@@ -1862,15 +5001,19 @@ function Write-ProgressUI {
         [string] $CRFLabel,
         [string] $PresetLabel,
         [double] $SourceDurationSec,
+        [int64]  $SourceSizeBytes = 0,
         [double] $ElapsedSec,
         [double] $OutTimeSec   = 0,
         [double] $OutSizeBytes = 0,
         [double] $SpeedX       = 0,
+        $EstimateState = $null,
         [int]    $UICursorRow  = -1
     )
 
     # ── Geometry ──────────────────────────────────────────────────────────────
-    $conW  = [Math]::Max(60, $Host.UI.RawUI.WindowSize.Width - 1)
+    # Keep a small right margin so Windows console hosts do not soft-wrap
+    # full-width box lines onto the next row during repaint.
+    $conW  = [Math]::Max(60, $Host.UI.RawUI.WindowSize.Width - 4)
     $inner = $conW - 4   # usable content width inside the border glyphs
 
     # ── Derived display values ────────────────────────────────────────────────
@@ -1886,6 +5029,11 @@ function Write-ProgressUI {
     $sizeStr  = if ($OutSizeBytes -gt 0) { "{0:F2} GiB" -f ($OutSizeBytes / 1GB) } else { "---" }
     $speedStr = if ($SpeedX -gt 0.001)   { "{0:F2}x"   -f $SpeedX               } else { "---" }
     $elapsStr = Format-Duration -Seconds $ElapsedSec
+    $estimate = if ($EstimateState) {
+        Update-LiveEstimateState -State $EstimateState -SourceDurationSec $SourceDurationSec -SourceSizeBytes $SourceSizeBytes
+    } else {
+        $null
+    }
 
     # ── Progress bar geometry ─────────────────────────────────────────────────
     # Reserve 9 characters on the right for the "  XX.X%" label.
@@ -1929,8 +5077,13 @@ function Write-ProgressUI {
     # ── Inner row helpers ─────────────────────────────────────────────────────
     # Row: pads/truncates $content to exactly $inner chars, wraps in border glyphs.
     function Row ([string]$content, [string]$color = "") {
-        $safe = Limit-String -Value $content -MaxWidth $inner
-        $pad  = " " * ($inner - $safe.Length)
+        $visible = Remove-AnsiDisplayFormatting $content
+        $safe = if ($visible.Length -gt $inner) {
+            Limit-String -Value $visible -MaxWidth $inner
+        } else {
+            $content
+        }
+        $pad  = " " * [Math]::Max(0, $inner - (Remove-AnsiDisplayFormatting $safe).Length)
         "${cBorder}${VL} ${reset}${color}${safe}${reset}${pad} ${cBorder}${VL}${reset}"
     }
 
@@ -1958,10 +5111,14 @@ function Write-ProgressUI {
     $lines = [System.Collections.Generic.List[string]]::new()
     $lines.Add($topBorder)
     $lines.Add((Row (Limit-String $FileName $inner) $cFile))
-    $lines.Add((Row "$Profile  |  $EncodeColorLabel" $cColor))
+    $colorSummaryLine = Add-RainbowHdrHighlights -Text "$Profile  |  $EncodeColorLabel" -BaseColor $cColor
+    $lines.Add((Row $colorSummaryLine $cColor))
     $lines.Add((Row "CRF $CRFLabel  |  Preset $PresetLabel  |  $elapsStr elapsed" $cMeta))
     $lines.Add($barRow)
     $lines.Add((Row "Encoded: $sizeStr   Speed: $speedStr   ETA: $eta" $cStats))
+    if ($EnableLiveSizeEstimate) {
+        $lines.Add((Row (Get-LiveEstimateSummaryText -Estimate $estimate) $cStats))
+    }
 
     if ($queueNames.Count -gt 0) {
         $lines.Add((DivRow "Queue ($($queueNames.Count) pending)"))
@@ -1982,17 +5139,1244 @@ function Write-ProgressUI {
     $sb = [System.Text.StringBuilder]::new()
 
     if ($UICursorRow -ge 0) {
-        $null = $sb.Append("${ESC}[${lineCount}A")   # move cursor up $lineCount rows
+        $null = $sb.Append("${ESC}[${UICursorRow}A")   # move cursor up by the previously rendered frame height
+        $null = $sb.Append("`r")
     }
 
     foreach ($l in $lines) {
+        $null = $sb.Append("`r")
         $null = $sb.Append($l)
         $null = $sb.Append("${ESC}[K")   # erase to end of line (handles terminal resize)
-        $null = $sb.Append("`n")
+        $null = $sb.Append("`r`n")
     }
 
     [Console]::Write($sb.ToString())
     return $lineCount
+}
+
+function Start-TrackedFfmpegProcess {
+    param(
+        [string[]]$Arguments,
+        [string]$PriorityName = 'Normal'
+    )
+
+    $psi                       = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName              = $FfmpegPath
+    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardInput = $true
+    $psi.UseShellExecute       = $false
+    $psi.CreateNoWindow        = $false
+
+    foreach ($a in $Arguments) { $psi.ArgumentList.Add($a) }
+
+    $proc           = [System.Diagnostics.Process]::new()
+    $proc.StartInfo = $psi
+
+    $shared = [hashtable]::Synchronized(@{
+        OutTimeSec                  = 0.0
+        OutSizeBytes                = 0.0
+        SpeedX                      = 0.0
+        LogLines                    = [System.Collections.Generic.List[string]]::new()
+        SmoothedEstimatedFinalBytes = 0.0
+        LastRawEstimatedFinalBytes  = 0.0
+        EstimatedSavingsPercent     = 0.0
+        EstimatedOutputGiBPerHour   = 0.0
+        EstimateReady               = $false
+    })
+
+    $stderrRunspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $stderrRunspace.Open()
+    $stderrRunspace.SessionStateProxy.SetVariable('shared', $shared)
+    $stderrRunspace.SessionStateProxy.SetVariable('proc',   $proc)
+
+    $stderrPs = [System.Management.Automation.PowerShell]::Create()
+    $stderrPs.Runspace = $stderrRunspace
+    $null = $stderrPs.AddScript({
+        try {
+            while ($true) {
+                $line = $proc.StandardError.ReadLine()
+                if ($null -eq $line) { break }
+                if ([string]::IsNullOrEmpty($line)) { continue }
+
+                if ($line -match '^([a-z_]+)=(.+)$') {
+                    $k = $Matches[1]; $v = $Matches[2]
+                    switch ($k) {
+                        'out_time_us' {
+                            $us = 0L
+                            if ([long]::TryParse($v, [ref]$us)) {
+                                $shared.OutTimeSec = [Math]::Max(0.0, $us / 1000000.0)
+                            }
+                        }
+                        'total_size' {
+                            $sz = 0L
+                            if ([long]::TryParse($v, [ref]$sz)) {
+                                $shared.OutSizeBytes = [Math]::Max(0.0, [double]$sz)
+                            }
+                        }
+                        'speed' {
+                            $sp = 0.0
+                            if ([double]::TryParse(($v -replace 'x',''),
+                                    [Globalization.NumberStyles]::Any,
+                                    [Globalization.CultureInfo]::InvariantCulture,
+                                    [ref]$sp)) {
+                                $shared.SpeedX = [Math]::Max(0.0, $sp)
+                            }
+                        }
+                    }
+                } else {
+                    $shared.LogLines.Add($line)
+                }
+            }
+        } catch {}
+    })
+
+    $null = $proc.Start()
+    $priorityResolution = Set-TrackedProcessPriority -Process $proc -PriorityName $PriorityName
+    if ($priorityResolution.Warning) {
+        Write-Warning $priorityResolution.Warning
+    }
+    $stderrAsync = $stderrPs.BeginInvoke()
+
+    return [pscustomobject][ordered]@{
+        Process        = $proc
+        Shared         = $shared
+        StderrRunspace = $stderrRunspace
+        StderrPs       = $stderrPs
+        StderrAsync    = $stderrAsync
+        WorkerProcessPriority = $priorityResolution.AppliedPriority
+        WorkerPriorityReason  = $priorityResolution.Reason
+    }
+}
+
+function Stop-TrackedFfmpegProcess {
+    param($TrackedProcess)
+
+    try {
+        $TrackedProcess.Process.WaitForExit()
+    } catch {}
+
+    try {
+        $null = $TrackedProcess.StderrPs.EndInvoke($TrackedProcess.StderrAsync)
+    } catch {}
+
+    try { $TrackedProcess.StderrPs.Dispose() } catch {}
+    try { $TrackedProcess.StderrRunspace.Close() } catch {}
+    try { $TrackedProcess.StderrRunspace.Dispose() } catch {}
+    try { $TrackedProcess.Process.Dispose() } catch {}
+}
+
+function Build-SoftwareFfmpegArgs {
+    param($Init)
+
+    $selected = $Init.Selected
+    $sourceProfile = $Init.SourceProfile
+    $encodeColorProfile = $Init.EncodeColorProfile
+
+    $ffArgs = New-Object System.Collections.Generic.List[string]
+    $ffArgs.AddRange([string[]]@(
+        '-hide_banner',
+        '-y',
+        '-i', $Init.InputPath,
+        '-map', "0:$($selected.Video.index)",
+        '-map', "0:$($selected.MainAudio.index)"
+    ))
+
+    if ($selected.FallbackAudio) { $ffArgs.AddRange([string[]]@('-map', "0:$($selected.FallbackAudio.index)")) }
+    if ($selected.MainSub)       { $ffArgs.AddRange([string[]]@('-map', "0:$($selected.MainSub.index)")) }
+    if ($selected.SdhSub)        { $ffArgs.AddRange([string[]]@('-map', "0:$($selected.SdhSub.index)")) }
+
+    $ffArgs.AddRange([string[]]@(
+        '-map_chapters', '0',
+        '-map_metadata', '-1',
+        '-max_muxing_queue_size', '4096',
+        '-c:v', 'libsvtav1',
+        '-preset', "$($Init.PreflightWorkflow.FinalResolvedPreset)",
+        '-crf', "$($Init.PreflightWorkflow.FinalResolvedCRF)",
+        '-pix_fmt', 'yuv420p10le'
+    ))
+
+    if ([int]$Init.EffectiveFilmGrain -gt 0) {
+        $ffArgs.AddRange([string[]]@('-svtav1-params', "film-grain=$($Init.EffectiveFilmGrain)`:film-grain-denoise=0"))
+    }
+
+    if ($sourceProfile.HasHDR) {
+        $ffArgs.AddRange([string[]]@(
+            '-color_primaries', 'bt2020',
+            '-color_trc', 'smpte2084',
+            '-colorspace', 'bt2020nc'
+        ))
+    }
+
+    $ffArgs.AddRange([string[]]@('-c:a', 'copy'))
+    if ($selected.MainSub -or $selected.SdhSub) { $ffArgs.AddRange([string[]]@('-c:s', 'copy')) }
+
+    $ffArgs.AddRange([string[]]@(
+        '-disposition:v:0', 'default',
+        '-disposition:a:0', 'default'
+    ))
+    if ($selected.FallbackAudio) { $ffArgs.AddRange([string[]]@('-disposition:a:1', '0')) }
+    if ($selected.MainSub)       { $ffArgs.AddRange([string[]]@('-disposition:s:0', 'default')) }
+    if ($selected.SdhSub) {
+        $subIndex = if ($selected.MainSub) { 1 } else { 0 }
+        $ffArgs.AddRange([string[]]@("-disposition:s:$subIndex", '0'))
+    }
+
+    $baseTitle = [System.IO.Path]::GetFileNameWithoutExtension($Init.InputPath)
+    $videoTitle = "AV1 $($encodeColorProfile.DynamicRangeLabel) $($encodeColorProfile.BitDepth)-bit"
+    $ffArgs.AddRange([string[]]@(
+        '-metadata', "title=$baseTitle",
+        '-metadata:s:v:0', "title=$videoTitle",
+        '-metadata:s:a:0', "title=$(Get-StreamTitle $selected.MainAudio)"
+    ))
+    if ($selected.FallbackAudio) {
+        $ffArgs.AddRange([string[]]@('-metadata:s:a:1', "title=$(Get-StreamTitle $selected.FallbackAudio)"))
+    }
+    if ($selected.MainSub) {
+        $ffArgs.AddRange([string[]]@('-metadata:s:s:0', "title=$(Get-StreamTitle $selected.MainSub)"))
+    }
+    if ($selected.SdhSub) {
+        $subIndex = if ($selected.MainSub) { 1 } else { 0 }
+        $ffArgs.AddRange([string[]]@("-metadata:s:s:$subIndex", "title=$(Get-StreamTitle $selected.SdhSub)"))
+    }
+
+    $ffArgs.AddRange([string[]]@('-progress', 'pipe:2', '-stats_period', '2'))
+    $ffArgs.Add($Init.TempOutput)
+
+    return ,$ffArgs
+}
+
+function Build-NvencFfmpegArgs {
+    param(
+        $Init,
+        $NvencEnvironment
+    )
+
+    $selected = $Init.Selected
+    $sourceProfile = $Init.SourceProfile
+    $encodeColorProfile = $Init.EncodeColorProfile
+    $nvencSettings = $Init.NvencSettings
+
+    $ffArgs = New-Object System.Collections.Generic.List[string]
+    $ffArgs.Add('-hide_banner')
+    $ffArgs.Add('-y')
+
+    if ($nvencSettings.DecodePath -eq 'cuda') {
+        $ffArgs.AddRange([string[]]@('-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'))
+    }
+
+    $ffArgs.AddRange([string[]]@(
+        '-i', $Init.InputPath,
+        '-map', "0:$($selected.Video.index)",
+        '-map', "0:$($selected.MainAudio.index)"
+    ))
+
+    if ($selected.FallbackAudio) { $ffArgs.AddRange([string[]]@('-map', "0:$($selected.FallbackAudio.index)")) }
+    if ($selected.MainSub)       { $ffArgs.AddRange([string[]]@('-map', "0:$($selected.MainSub.index)")) }
+    if ($selected.SdhSub)        { $ffArgs.AddRange([string[]]@('-map', "0:$($selected.SdhSub.index)")) }
+
+    $ffArgs.AddRange([string[]]@(
+        '-map_chapters', '0',
+        '-map_metadata', '-1',
+        '-max_muxing_queue_size', '4096',
+        '-c:v', 'av1_nvenc'
+    ))
+
+    if ($NvencEnvironment.SupportsPreset -and -not [string]::IsNullOrWhiteSpace($nvencSettings.Preset)) {
+        $ffArgs.AddRange([string[]]@('-preset', $nvencSettings.Preset))
+    }
+
+    if ($NvencEnvironment.SupportsTune -and -not [string]::IsNullOrWhiteSpace($nvencSettings.Tune)) {
+        $ffArgs.AddRange([string[]]@('-tune', $nvencSettings.Tune))
+    }
+
+    if ($NvencEnvironment.SupportsRc) {
+        $ffArgs.AddRange([string[]]@('-rc', 'vbr'))
+    }
+
+    if ($NvencEnvironment.SupportsCQ) {
+        $ffArgs.AddRange([string[]]@('-cq', "$($nvencSettings.CQ)"))
+    }
+
+    if ($NvencEnvironment.SupportsLookahead) {
+        $ffArgs.AddRange([string[]]@('-rc-lookahead', '32'))
+    }
+
+    if ($NvencEnvironment.SupportsSpatialAQ)  { $ffArgs.AddRange([string[]]@('-spatial-aq', '1')) }
+    if ($NvencEnvironment.SupportsTemporalAQ) { $ffArgs.AddRange([string[]]@('-temporal-aq', '1')) }
+    if ($NvencEnvironment.SupportsAQStrength) { $ffArgs.AddRange([string[]]@('-aq-strength', '8')) }
+    if ($NvencEnvironment.SupportsBRefMode)   { $ffArgs.AddRange([string[]]@('-b_ref_mode', 'middle')) }
+    if ($NvencEnvironment.SupportsMultipass)  { $ffArgs.AddRange([string[]]@('-multipass', 'fullres')) }
+
+    if ($NvencEnvironment.SupportsSplitEncode -and -not $NvencAllowSplitFrame) {
+        $ffArgs.AddRange([string[]]@('-split_encode_mode', 'disabled'))
+    }
+
+    $ffArgs.AddRange([string[]]@('-pix_fmt', $nvencSettings.PixFmt))
+    if ($NvencEnvironment.SupportsHighBitDepth -and $nvencSettings.BitDepth -ge 10) {
+        $ffArgs.AddRange([string[]]@('-highbitdepth', '1'))
+    }
+
+    $primaries = if (-not [string]::IsNullOrWhiteSpace($sourceProfile.SourcePrimaries)) { $sourceProfile.SourcePrimaries } elseif ($sourceProfile.HasHDR) { 'bt2020' } else { 'bt709' }
+    $transfer  = if (-not [string]::IsNullOrWhiteSpace($sourceProfile.SourceTransfer))  { $sourceProfile.SourceTransfer  } elseif ($sourceProfile.HasHDR) { 'smpte2084' } else { 'bt709' }
+    $matrix    = if (-not [string]::IsNullOrWhiteSpace($sourceProfile.SourceMatrix))    { $sourceProfile.SourceMatrix    } elseif ($sourceProfile.HasHDR) { 'bt2020nc' } else { 'bt709' }
+
+    $ffArgs.AddRange([string[]]@(
+        '-color_primaries', $primaries,
+        '-color_trc',       $transfer,
+        '-colorspace',      $matrix
+    ))
+
+    $ffArgs.AddRange([string[]]@('-c:a', 'copy'))
+    if ($selected.MainSub -or $selected.SdhSub) { $ffArgs.AddRange([string[]]@('-c:s', 'copy')) }
+
+    $ffArgs.AddRange([string[]]@(
+        '-disposition:v:0', 'default',
+        '-disposition:a:0', 'default'
+    ))
+
+    if ($selected.FallbackAudio) { $ffArgs.AddRange([string[]]@('-disposition:a:1', '0')) }
+    if ($selected.MainSub)       { $ffArgs.AddRange([string[]]@('-disposition:s:0', 'default')) }
+    if ($selected.SdhSub) {
+        $subIndex = if ($selected.MainSub) { 1 } else { 0 }
+        $ffArgs.AddRange([string[]]@("-disposition:s:$subIndex", '0'))
+    }
+
+    $baseTitle  = [System.IO.Path]::GetFileNameWithoutExtension($Init.FinalOutput)
+    $videoTitle = "AV1 NVENC $($encodeColorProfile.DynamicRangeLabel) $($encodeColorProfile.BitDepth)-bit"
+    $ffArgs.AddRange([string[]]@(
+        '-metadata',       "title=$baseTitle",
+        '-metadata:s:v:0', "title=$videoTitle",
+        '-metadata:s:a:0', "title=$(Get-StreamTitle $selected.MainAudio)"
+    ))
+
+    if ($selected.FallbackAudio) {
+        $ffArgs.AddRange([string[]]@('-metadata:s:a:1', "title=$(Get-StreamTitle $selected.FallbackAudio)"))
+    }
+    if ($selected.MainSub) {
+        $ffArgs.AddRange([string[]]@('-metadata:s:s:0', "title=$(Get-StreamTitle $selected.MainSub)"))
+    }
+    if ($selected.SdhSub) {
+        $subIndex = if ($selected.MainSub) { 1 } else { 0 }
+        $ffArgs.AddRange([string[]]@("-metadata:s:s:$subIndex", "title=$(Get-StreamTitle $selected.SdhSub)"))
+    }
+
+    $ffArgs.AddRange([string[]]@('-progress', 'pipe:2', '-stats_period', '2'))
+    $ffArgs.Add($Init.TempOutput)
+
+    return ,$ffArgs
+}
+
+function Start-LaneWorker {
+    param(
+        $Init,
+        $NvencEnvironment,
+        [int]$SlotNumber
+    )
+
+    if (Test-Path -LiteralPath $Init.TempOutput) {
+        Remove-Item -LiteralPath $Init.TempOutput -Force -ErrorAction SilentlyContinue
+    }
+
+    $ffArgs = if ($Init.ResolvedEncodeLane -eq 'Nvidia') {
+        Build-NvencFfmpegArgs -Init $Init -NvencEnvironment $NvencEnvironment
+    } else {
+        Build-SoftwareFfmpegArgs -Init $Init
+    }
+
+    $tracked = Start-TrackedFfmpegProcess -Arguments $ffArgs -PriorityName $Init.WorkerProcessPriority
+    $Init.WorkerProcessPriority = $tracked.WorkerProcessPriority
+    Write-SessionEncodeStart -Init $Init
+    return [pscustomobject][ordered]@{
+        SlotNumber              = $SlotNumber
+        WorkingJobPath          = $null
+        Init                    = $Init
+        TrackedProcess          = $tracked
+        Stopwatch               = [System.Diagnostics.Stopwatch]::StartNew()
+        NvencWorkerCountAtStart = if ($Init.ResolvedEncodeLane -eq 'Nvidia' -and $NvencEnvironment) { $NvencEnvironment.MaxParallel } else { '' }
+        WorkerProcessPriority   = $tracked.WorkerProcessPriority
+        WorkerState             = 'Running'
+        ShutdownRequestedAt     = $null
+        ManualStopRequested     = $false
+        PendingResumeRequested  = $false
+        HeldInputPath           = ''
+        HeldEncodeMode          = ''
+        HeldRestartReason       = ''
+    }
+}
+
+function Write-LaneProgressUI {
+    param(
+        [object[]]$Workers,
+        $Summary,
+        $NvencEnvironment,
+        [int]$UICursorRow = -1
+    )
+
+    $conW  = [Math]::Max(70, $Host.UI.RawUI.WindowSize.Width - 4)
+    $inner = $conW - 4
+
+    $ESC      = [char]27
+    $reset    = "${ESC}[0m"
+    $cBorder  = "${ESC}[38;5;240m"
+    $cTitle   = "${ESC}[1;97m"
+    $cFile    = "${ESC}[1;96m"
+    $cHdr     = "${ESC}[1;93m"
+    $cSdr     = "${ESC}[38;5;117m"
+    $cMeta    = "${ESC}[38;5;250m"
+    $cBarDone = "${ESC}[38;5;76m"
+    $cBarTodo = "${ESC}[38;5;238m"
+    $cPct     = "${ESC}[1;92m"
+    $cQueue   = "${ESC}[38;5;245m"
+
+    $TL = [char]0x2554
+    $TR = [char]0x2557
+    $BL = [char]0x255A
+    $BR = [char]0x255D
+    $HL = [char]0x2550
+    $VL = [char]0x2551
+    $LM = [char]0x2560
+    $RM = [char]0x2563
+
+    function Row ([string]$content, [string]$color = "") {
+        $visible = Remove-AnsiDisplayFormatting $content
+        $safe = if ($visible.Length -gt $inner) {
+            Limit-String -Value $visible -MaxWidth $inner
+        } else {
+            $content
+        }
+        $pad  = " " * [Math]::Max(0, $inner - (Remove-AnsiDisplayFormatting $safe).Length)
+        "${cBorder}${VL} ${reset}${color}${safe}${reset}${pad} ${cBorder}${VL}${reset}"
+    }
+
+    function DivRow ([string]$label) {
+        $mid   = " $label "
+        $left  = [int][Math]::Floor(($conW - 2 - $mid.Length) / 2)
+        $right = $conW - 2 - $left - $mid.Length
+        "${cBorder}${LM}$([string]$HL * $left)${cTitle}${mid}${reset}${cBorder}$([string]$HL * $right)${RM}${reset}"
+    }
+
+    $titleLabel = " Encoder Lanes "
+    $tLeft      = [int][Math]::Floor(($conW - 2 - $titleLabel.Length) / 2)
+    $tRight     = $conW - 2 - $tLeft - $titleLabel.Length
+    $topBorder  = "${cBorder}${TL}$([string]$HL * $tLeft)${cTitle}${titleLabel}${reset}${cBorder}$([string]$HL * $tRight)${TR}${reset}"
+    $botBorder  = "${cBorder}${BL}$([string]$HL * ($conW - 2))${BR}${reset}"
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add($topBorder)
+    $lines.Add((Row "Encoder preference: $($Summary.EncoderPreference)  |  CPU active: $($Summary.CpuActive)/1  |  Nvidia active: $($Summary.NvidiaActive)/$($Summary.NvidiaCapacity)" $cMeta))
+    $lines.Add((Row (Get-QueueControlStateText) $cMeta))
+    if ($NvencEnvironment) {
+        $lines.Add((Row "GPU: $($NvencEnvironment.GpuName)  |  NVENC engines: $($NvencEnvironment.NvencEngineCount)  |  Nvidia capacity: $($NvencEnvironment.MaxParallel) ($($NvencEnvironment.CapacitySource))" $cMeta))
+    } else {
+        $lines.Add((Row 'GPU: unavailable  |  Nvidia lane disabled for this session' $cMeta))
+    }
+    $lines.Add((Row "Pending: $($Summary.Pending)  |  Active: $($Summary.Active)  |  Completed: $($Summary.Completed)  |  Skipped: $($Summary.Skipped)  |  Failed: $($Summary.Failed)" $cQueue))
+
+    foreach ($worker in @($Workers | Sort-Object SlotNumber)) {
+        $workerState = Get-WorkerStateLabel -Worker $worker
+        $shared = if ($worker.TrackedProcess) { $worker.TrackedProcess.Shared } else { [pscustomobject]@{ OutTimeSec = 0.0; OutSizeBytes = 0.0; SpeedX = 0.0 } }
+        $workerPriority = Get-OptionalProperty -InputObject $worker -PropertyName 'WorkerProcessPriority' -Default $worker.Init.WorkerProcessPriority
+        $estimate = if ($worker.TrackedProcess) { Update-LiveEstimateState -State $shared -SourceDurationSec $worker.Init.SourceDurationSec -SourceSizeBytes $worker.Init.SourceItem.Length } else { $null }
+        $pct = if ($worker.Init.SourceDurationSec -gt 0) {
+            [Math]::Min(100.0, ($shared.OutTimeSec / $worker.Init.SourceDurationSec) * 100.0)
+        } else { 0.0 }
+        $eta = if ($shared.SpeedX -gt 0.001 -and $worker.Init.SourceDurationSec -gt 0) {
+            Format-Duration -Seconds (($worker.Init.SourceDurationSec - $shared.OutTimeSec) / $shared.SpeedX)
+        } else { '--' }
+        $sizeStr = if ($shared.OutSizeBytes -gt 0) { "{0:F2} GiB" -f ($shared.OutSizeBytes / 1GB) } else { "---" }
+        $speedStr = if ($shared.SpeedX -gt 0.001) { "{0:F2}x" -f $shared.SpeedX } else { '---' }
+        $color = if ($worker.Init.SourceProfile.Profile -eq 'HDR') { $cHdr } else { $cSdr }
+        $barInner = [Math]::Max(20, $inner - 16)
+        $filled = [int][Math]::Round($barInner * $pct / 100.0)
+        $empty = $barInner - $filled
+        $pctLabel = ("{0,5:F1}%" -f $pct)
+        $bar = "[${cBarDone}$([string][char]0x2588 * $filled)${reset}${cBarTodo}$([string][char]0x2591 * $empty)${reset}] ${cPct}$pctLabel${reset}"
+        $laneLabel = if ($worker.Init.ResolvedEncodeLane -eq 'Nvidia') {
+            "Lane Nvidia  |  Mode NVENC  |  $($worker.Init.SourceProfile.Profile)  |  CQ $($worker.Init.NvencSettings.CQ)  |  Preset $($worker.Init.NvencSettings.Preset)"
+        } else {
+            "Lane CPU  |  Mode SVT-AV1  |  $($worker.Init.SourceProfile.Profile)  |  CRF $($worker.Init.PreflightWorkflow.FinalResolvedCRF)  |  Preset $($worker.Init.PreflightWorkflow.FinalResolvedPreset)  |  FilmGrain $($worker.Init.EffectiveFilmGrain)"
+        }
+        if ($worker.Init.ResolvedEncodeLane -eq 'Nvidia') {
+            $laneLabel += "  |  Tune $($worker.Init.NvencSettings.TuneDisplay)  |  Decode $($worker.Init.NvencSettings.DecodePath)"
+        }
+        $laneLabel += "  |  State $workerState  |  Priority $workerPriority"
+        $laneLabel = Add-RainbowHdrHighlights -Text $laneLabel -BaseColor $color
+        $colorLine = Add-RainbowHdrHighlights -Text ("Color  |  Source {0}  ->  Output {1}" -f $worker.Init.SourceProfile.SourceColorSummary, $worker.Init.EncodeColorProfile.Summary) -BaseColor $color
+
+        $lines.Add((DivRow "Worker $($worker.SlotNumber)"))
+        $lines.Add((Row "$($worker.Init.DisplayInputName)  ->  $($worker.Init.DisplayOutputName)" $cFile))
+        $lines.Add((Row $laneLabel $color))
+        $lines.Add((Row $colorLine $color))
+        $lines.Add((Row "Reason: $($worker.Init.LaneSelectionReason)" $cMeta))
+        if ($workerState -eq 'Held') {
+            $lines.Add((Row 'Held: manual stop. Press worker number then [r] to restart from scratch.' $cMeta))
+        } elseif ($workerState -eq 'Paused') {
+            $lines.Add((Row "Paused  |  Elapsed $(Format-Duration -Seconds $worker.Stopwatch.Elapsed.TotalSeconds)  |  Encoded $sizeStr" $cMeta))
+        } else {
+            $lines.Add((Row "Elapsed $(Format-Duration -Seconds $worker.Stopwatch.Elapsed.TotalSeconds)  |  Encoded $sizeStr  |  Speed $speedStr  |  ETA $eta" $cMeta))
+        }
+        if ($EnableLiveSizeEstimate -and $worker.TrackedProcess) {
+            $lines.Add((Row (Get-LiveEstimateSummaryText -Estimate $estimate) $cMeta))
+        }
+        $lines.Add((Row $bar))
+    }
+
+    if ($Workers.Count -eq 0) {
+        $lines.Add((DivRow 'Idle'))
+        $lines.Add((Row 'No active encode workers.'))
+    }
+
+    $commandPrompt = Get-ConsoleCommandPrompt
+    if (-not [string]::IsNullOrWhiteSpace($commandPrompt)) {
+        $lines.Add((DivRow 'Command'))
+        $lines.Add((Row $commandPrompt $cMeta))
+    }
+
+    $statusMessage = Get-ConsoleStatusMessage
+    if (-not [string]::IsNullOrWhiteSpace($statusMessage)) {
+        $lines.Add((Row $statusMessage $cMeta))
+    }
+
+    if ($script:ShowHelpOverlay) {
+        $lines.Add((DivRow 'Help'))
+        foreach ($helpLine in (Get-ConsoleHelpLines)) {
+            $lines.Add((Row $helpLine $cMeta))
+        }
+    }
+
+    $lines.Add($botBorder)
+
+    $lineCount = $lines.Count
+    $sb = [System.Text.StringBuilder]::new()
+    if ($UICursorRow -ge 0) {
+        $null = $sb.Append("${ESC}[${UICursorRow}A")
+        $null = $sb.Append("`r")
+    }
+    foreach ($l in $lines) {
+        $null = $sb.Append("`r")
+        $null = $sb.Append($l)
+        $null = $sb.Append("${ESC}[K")
+        $null = $sb.Append("`r`n")
+    }
+
+    [Console]::Write($sb.ToString())
+    return $lineCount
+}
+
+function Complete-LaneWorker {
+    param(
+        $Worker,
+        $NvencEnvironment
+    )
+
+    $init = $Worker.Init
+    $tracked = $Worker.TrackedProcess
+    $ffExit = $tracked.Process.ExitCode
+    Stop-TrackedFfmpegProcess -TrackedProcess $tracked
+    $liveEstimate = Update-LiveEstimateState -State $tracked.Shared -SourceDurationSec $init.SourceDurationSec -SourceSizeBytes $init.SourceItem.Length
+    $isNvenc = ($init.ResolvedEncodeLane -eq 'Nvidia')
+
+    $notesList = [System.Collections.Generic.List[string]]::new()
+    if ($init.AutoSettings.BitrateReason) { $notesList.Add($init.AutoSettings.BitrateReason) }
+    if ($init.LaneSelectionReason) { $notesList.Add($init.LaneSelectionReason) }
+    if ($init.CpuOnlyReason) { $notesList.Add($init.CpuOnlyReason) }
+    if ($init.PreflightEstimate.Ran) { $notesList.Add($init.PreflightEstimate.Reason) }
+    if ($init.FilmGrainDisabledReason) { $notesList.Add($init.FilmGrainDisabledReason) }
+    if ($isNvenc -and $init.NvencSettings.Reason) { $notesList.Add($init.NvencSettings.Reason) }
+    if ($isNvenc -and $init.NvencSettings.TuneReason) { $notesList.Add($init.NvencSettings.TuneReason) }
+    if ($tracked.WorkerPriorityReason) { $notesList.Add($tracked.WorkerPriorityReason) }
+
+    if ($ffExit -ne 0) {
+        if ($tracked.Shared.LogLines.Count -gt 0) {
+            $notesList.Add(($tracked.Shared.LogLines | Select-Object -Last 6) -join ' || ')
+        }
+
+        Write-LogRow @{
+            Timestamp         = (Get-Date).ToString("s")
+            Status            = "FAILED"
+            InputPath         = $init.InputPath
+            OutputPath        = ""
+            SourceSizeGiB     = $init.SourceSizeGiB
+            OutputSizeGiB     = ""
+            ReductionPercent  = ""
+            SourceDurationSec = [Math]::Round($init.SourceDurationSec, 3)
+            OutputDurationSec = ""
+            ElapsedSec        = [Math]::Round($Worker.Stopwatch.Elapsed.TotalSeconds, 2)
+            Profile           = $init.SourceProfile.Profile
+            HasHDR            = $init.SourceProfile.HasHDR
+            HasDV             = $init.SourceProfile.HasDV
+            SelectedAudio     = $init.SelectedAudioSummary
+            SelectedSubtitles = $init.SelectedSubtitleSummary
+            EstimatedFinalSizeGiB = if ($liveEstimate.Ready) { [Math]::Round($liveEstimate.EstimatedFinalSizeGiB, 3) } elseif ($init.PreflightEstimate.Ran) { [Math]::Round($init.PreflightEstimate.EstimatedFinalSizeGiB, 3) } else { "" }
+            EstimatedSavingsPercent = if ($liveEstimate.Ready) { [Math]::Round($liveEstimate.EstimatedSavingsPercent, 2) } elseif ($init.PreflightEstimate.Ran) { [Math]::Round($init.PreflightEstimate.EstimatedSavingsPercent, 2) } else { "" }
+            EstimatedOutputGiBPerHour = if ($liveEstimate.Ready) { [Math]::Round($liveEstimate.EstimatedOutputGiBPerHour, 3) } elseif ($init.PreflightEstimate.Ran) { [Math]::Round($init.PreflightEstimate.EstimatedOutputGiBPerHour, 3) } else { "" }
+            InitialResolvedCRF = $init.PreflightWorkflow.InitialResolvedCRF
+            InitialResolvedPreset = $init.PreflightWorkflow.InitialResolvedPreset
+            InitialResolvedFilmGrain = $init.PreflightWorkflow.InitialResolvedFilmGrain
+            PreflightPassCount = $init.PreflightWorkflow.PreflightPassCount
+            Preflight1EstimatedFinalGiB = if ($init.PreflightWorkflow.Preflight1 -and $init.PreflightWorkflow.Preflight1.Ran) { [Math]::Round($init.PreflightWorkflow.Preflight1.EstimatedFinalSizeGiB, 3) } else { "" }
+            Preflight1EstimatedSavingsPercent = if ($init.PreflightWorkflow.Preflight1 -and $init.PreflightWorkflow.Preflight1.Ran) { [Math]::Round($init.PreflightWorkflow.Preflight1.EstimatedSavingsPercent, 2) } else { "" }
+            Preflight1EstimatedGiBPerHour = if ($init.PreflightWorkflow.Preflight1 -and $init.PreflightWorkflow.Preflight1.Ran) { [Math]::Round($init.PreflightWorkflow.Preflight1.EstimatedOutputGiBPerHour, 3) } else { "" }
+            Preflight2EstimatedFinalGiB = if ($init.PreflightWorkflow.Preflight2 -and $init.PreflightWorkflow.Preflight2.Ran) { [Math]::Round($init.PreflightWorkflow.Preflight2.EstimatedFinalSizeGiB, 3) } else { "" }
+            Preflight2EstimatedSavingsPercent = if ($init.PreflightWorkflow.Preflight2 -and $init.PreflightWorkflow.Preflight2.Ran) { [Math]::Round($init.PreflightWorkflow.Preflight2.EstimatedSavingsPercent, 2) } else { "" }
+            Preflight2EstimatedGiBPerHour = if ($init.PreflightWorkflow.Preflight2 -and $init.PreflightWorkflow.Preflight2.Ran) { [Math]::Round($init.PreflightWorkflow.Preflight2.EstimatedOutputGiBPerHour, 3) } else { "" }
+            FinalResolvedCRF = $init.PreflightWorkflow.FinalResolvedCRF
+            FinalResolvedPreset = $init.PreflightWorkflow.FinalResolvedPreset
+            FinalResolvedFilmGrain = $init.PreflightWorkflow.FinalResolvedFilmGrain
+            PreflightAutoTuneReason = $init.PreflightWorkflow.PreflightAutoTuneReason
+            WasPreflightRetuned = "$($init.PreflightWorkflow.WasPreflightRetuned)"
+            WasSkippedByPreflight = "$($init.PreflightWorkflow.WasSkippedByPreflight)"
+            CRF               = $CRF
+            Preset            = $Preset
+            FilmGrain         = $FilmGrain
+            AutoCRFOffset     = $AutoCRFOffset
+            EncoderPreference = $init.EncoderPreference
+            ResolvedEncodeLane = $init.ResolvedEncodeLane
+            LaneSelectionReason = $init.LaneSelectionReason
+            LaneSuitability   = $init.LaneSuitability
+            CpuOnlyReason     = $init.CpuOnlyReason
+            NvidiaFallbackAllowed = "$($init.NvidiaFallbackAllowed)"
+            HeldForCpuLane    = "$($init.HeldForCpuLane)"
+            WorkerProcessPriority = Get-OptionalProperty -InputObject $Worker -PropertyName 'WorkerProcessPriority' -Default $init.WorkerProcessPriority
+            ScriptProcessPriority = $script:ResolvedScriptProcessPriority
+            EncodeMode        = $init.EncodeMode
+            ResolvedCRF       = $init.PreflightWorkflow.FinalResolvedCRF
+            ResolvedPreset    = $init.PreflightWorkflow.FinalResolvedPreset
+            ResolvedFilmGrain = $init.EffectiveFilmGrain
+            ResolvedCQ        = if ($isNvenc) { $init.NvencSettings.CQ } else { "" }
+            ResolvedNvencPreset = if ($isNvenc) { $init.NvencSettings.Preset } else { "" }
+            ResolvedNvencTune = if ($isNvenc) { $init.NvencSettings.Tune } else { "" }
+            ResolvedDecodePath = if ($isNvenc) { $init.NvencSettings.DecodePath } else { "" }
+            AutoReason        = if (-not [string]::IsNullOrWhiteSpace($init.PreflightWorkflow.PreflightAutoTuneReason)) { $init.PreflightWorkflow.PreflightAutoTuneReason } else { $init.AutoSettings.Reason }
+            BPP               = [Math]::Round($init.AutoSettings.BPP, 6)
+            EffectiveVideoBitrate = $init.AutoSettings.VideoBitrate
+            VideoBitratePerHourGiB = [Math]::Round($init.AutoSettings.VideoBitratePerHourGiB, 3)
+            ResolutionTier    = $init.AutoSettings.ResolutionTier
+            CodecClass        = $init.AutoSettings.CodecClass
+            GrainClass        = $init.AutoSettings.GrainClass
+            GrainScore        = $init.AutoSettings.GrainScore
+            WasAutoSkipped    = "False"
+            NvencWorkerCountAtStart = if ($isNvenc) { $Worker.NvencWorkerCountAtStart } else { "" }
+            NvencEngineCountDetected = if ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.NvencEngineCount } else { "" }
+            NvencCapacitySource = if ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.CapacitySource } else { "" }
+            DetectedGpuName   = if ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.GpuName } else { "" }
+            FilmGrainDisabledReason = $init.FilmGrainDisabledReason
+            FfmpegPath        = $FfmpegPath
+            FfprobePath       = $FfprobePath
+            Notes             = ($notesList -join ' | ')
+        }
+        return 'FAILED'
+    }
+
+    if (-not (Test-Path -LiteralPath $init.TempOutput)) {
+        throw "Temporary output was not created: $($init.TempOutput)"
+    }
+
+    $outProbe       = Invoke-FfprobeJson -InputPath $init.TempOutput
+    $outputDuration = [double](Get-StreamProp (Get-StreamProp $outProbe 'format' ([PSCustomObject]@{})) 'duration' 0)
+    if ($init.SourceDurationSec -gt 0) {
+        $allowedDelta = [Math]::Max(10.0, $init.SourceDurationSec * 0.02)
+        if ($outputDuration -lt ($init.SourceDurationSec - $allowedDelta)) {
+            throw ("Output duration check failed. Source={0:F3}s  Output={1:F3}s  AllowedDelta={2:F3}s" -f $init.SourceDurationSec, $outputDuration, $allowedDelta)
+        }
+    }
+
+    $outItem       = Get-Item -LiteralPath $init.TempOutput
+    $outputSizeGiB = [Math]::Round(($outItem.Length / 1GB), 3)
+    $reduction     = if ($init.SourceItem.Length -gt 0) {
+        [Math]::Round((1 - ($outItem.Length / [double]$init.SourceItem.Length)) * 100, 2)
+    } else { 0 }
+
+    $outputPathForLog = $init.FinalOutput
+    if ($ReplaceOriginal) {
+        try {
+            if ($KeepBackupOriginal) {
+                $backupPath = Move-ToBackup -OriginalPath $init.InputPath
+                Write-Host "Moved original to backup: $backupPath" -ForegroundColor Yellow
+            } else {
+                Remove-Item -LiteralPath $init.InputPath -Force
+            }
+            Move-Item -LiteralPath $init.TempOutput -Destination $init.FinalOutput -Force
+        } catch {
+            $tempStillExists = Test-Path -LiteralPath $init.TempOutput
+            $recovery = if ($tempStillExists) {
+                "Encoded temp file still exists and can be recovered: $($init.TempOutput)"
+            } else {
+                "Encoded temp file is also missing. Check disk for partial writes."
+            }
+            throw "Post-encode file management failed: $_`n$recovery"
+        }
+    } else {
+        Move-Item -LiteralPath $init.TempOutput -Destination $init.FinalOutput -Force
+    }
+
+    Write-LogRow @{
+        Timestamp         = (Get-Date).ToString("s")
+        Status            = "SUCCESS"
+        InputPath         = $init.InputPath
+        OutputPath        = $outputPathForLog
+        SourceSizeGiB     = $init.SourceSizeGiB
+        OutputSizeGiB     = $outputSizeGiB
+        ReductionPercent  = $reduction
+        SourceDurationSec = [Math]::Round($init.SourceDurationSec, 3)
+        OutputDurationSec = [Math]::Round($outputDuration, 3)
+        ElapsedSec        = [Math]::Round($Worker.Stopwatch.Elapsed.TotalSeconds, 2)
+        Profile           = $init.SourceProfile.Profile
+        HasHDR            = $init.SourceProfile.HasHDR
+        HasDV             = $init.SourceProfile.HasDV
+        SelectedAudio     = $init.SelectedAudioSummary
+        SelectedSubtitles = $init.SelectedSubtitleSummary
+        EstimatedFinalSizeGiB = $outputSizeGiB
+        EstimatedSavingsPercent = $reduction
+        EstimatedOutputGiBPerHour = if ($init.SourceDurationSec -gt 0) { [Math]::Round($outputSizeGiB / ($init.SourceDurationSec / 3600.0), 3) } else { "" }
+        InitialResolvedCRF = $init.PreflightWorkflow.InitialResolvedCRF
+        InitialResolvedPreset = $init.PreflightWorkflow.InitialResolvedPreset
+        InitialResolvedFilmGrain = $init.PreflightWorkflow.InitialResolvedFilmGrain
+        PreflightPassCount = $init.PreflightWorkflow.PreflightPassCount
+        Preflight1EstimatedFinalGiB = if ($init.PreflightWorkflow.Preflight1 -and $init.PreflightWorkflow.Preflight1.Ran) { [Math]::Round($init.PreflightWorkflow.Preflight1.EstimatedFinalSizeGiB, 3) } else { "" }
+        Preflight1EstimatedSavingsPercent = if ($init.PreflightWorkflow.Preflight1 -and $init.PreflightWorkflow.Preflight1.Ran) { [Math]::Round($init.PreflightWorkflow.Preflight1.EstimatedSavingsPercent, 2) } else { "" }
+        Preflight1EstimatedGiBPerHour = if ($init.PreflightWorkflow.Preflight1 -and $init.PreflightWorkflow.Preflight1.Ran) { [Math]::Round($init.PreflightWorkflow.Preflight1.EstimatedOutputGiBPerHour, 3) } else { "" }
+        Preflight2EstimatedFinalGiB = if ($init.PreflightWorkflow.Preflight2 -and $init.PreflightWorkflow.Preflight2.Ran) { [Math]::Round($init.PreflightWorkflow.Preflight2.EstimatedFinalSizeGiB, 3) } else { "" }
+        Preflight2EstimatedSavingsPercent = if ($init.PreflightWorkflow.Preflight2 -and $init.PreflightWorkflow.Preflight2.Ran) { [Math]::Round($init.PreflightWorkflow.Preflight2.EstimatedSavingsPercent, 2) } else { "" }
+        Preflight2EstimatedGiBPerHour = if ($init.PreflightWorkflow.Preflight2 -and $init.PreflightWorkflow.Preflight2.Ran) { [Math]::Round($init.PreflightWorkflow.Preflight2.EstimatedOutputGiBPerHour, 3) } else { "" }
+        FinalResolvedCRF = $init.PreflightWorkflow.FinalResolvedCRF
+        FinalResolvedPreset = $init.PreflightWorkflow.FinalResolvedPreset
+        FinalResolvedFilmGrain = $init.PreflightWorkflow.FinalResolvedFilmGrain
+        PreflightAutoTuneReason = $init.PreflightWorkflow.PreflightAutoTuneReason
+        WasPreflightRetuned = "$($init.PreflightWorkflow.WasPreflightRetuned)"
+        WasSkippedByPreflight = "$($init.PreflightWorkflow.WasSkippedByPreflight)"
+        CRF               = $CRF
+        Preset            = $Preset
+        FilmGrain         = $FilmGrain
+        AutoCRFOffset     = $AutoCRFOffset
+        EncoderPreference = $init.EncoderPreference
+        ResolvedEncodeLane = $init.ResolvedEncodeLane
+        LaneSelectionReason = $init.LaneSelectionReason
+        LaneSuitability   = $init.LaneSuitability
+        CpuOnlyReason     = $init.CpuOnlyReason
+        NvidiaFallbackAllowed = "$($init.NvidiaFallbackAllowed)"
+        HeldForCpuLane    = "$($init.HeldForCpuLane)"
+        WorkerProcessPriority = Get-OptionalProperty -InputObject $Worker -PropertyName 'WorkerProcessPriority' -Default $init.WorkerProcessPriority
+        ScriptProcessPriority = $script:ResolvedScriptProcessPriority
+        EncodeMode        = $init.EncodeMode
+        ResolvedCRF       = $init.PreflightWorkflow.FinalResolvedCRF
+        ResolvedPreset    = $init.PreflightWorkflow.FinalResolvedPreset
+        ResolvedFilmGrain = $init.EffectiveFilmGrain
+        ResolvedCQ        = if ($isNvenc) { $init.NvencSettings.CQ } else { "" }
+        ResolvedNvencPreset = if ($isNvenc) { $init.NvencSettings.Preset } else { "" }
+        ResolvedNvencTune = if ($isNvenc) { $init.NvencSettings.Tune } else { "" }
+        ResolvedDecodePath = if ($isNvenc) { $init.NvencSettings.DecodePath } else { "" }
+        AutoReason        = if (-not [string]::IsNullOrWhiteSpace($init.PreflightWorkflow.PreflightAutoTuneReason)) { $init.PreflightWorkflow.PreflightAutoTuneReason } else { $init.AutoSettings.Reason }
+        BPP               = [Math]::Round($init.AutoSettings.BPP, 6)
+        EffectiveVideoBitrate = $init.AutoSettings.VideoBitrate
+        VideoBitratePerHourGiB = [Math]::Round($init.AutoSettings.VideoBitratePerHourGiB, 3)
+        ResolutionTier    = $init.AutoSettings.ResolutionTier
+        CodecClass        = $init.AutoSettings.CodecClass
+        GrainClass        = $init.AutoSettings.GrainClass
+        GrainScore        = $init.AutoSettings.GrainScore
+        WasAutoSkipped    = "False"
+        NvencWorkerCountAtStart = if ($isNvenc) { $Worker.NvencWorkerCountAtStart } else { "" }
+        NvencEngineCountDetected = if ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.NvencEngineCount } else { "" }
+        NvencCapacitySource = if ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.CapacitySource } else { "" }
+        DetectedGpuName   = if ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.GpuName } else { "" }
+        FilmGrainDisabledReason = $init.FilmGrainDisabledReason
+        FfmpegPath        = $FfmpegPath
+        FfprobePath       = $FfprobePath
+        Notes             = ($notesList -join ' | ')
+    }
+
+    return 'SUCCESS'
+}
+
+function Write-NvencProgressUI {
+    param(
+        [object[]]$Workers,
+        $Summary,
+        $NvencEnvironment,
+        [int]$UICursorRow = -1
+    )
+
+    $conW  = [Math]::Max(70, $Host.UI.RawUI.WindowSize.Width - 4)
+    $inner = $conW - 4
+
+    $ESC      = [char]27
+    $reset    = "${ESC}[0m"
+    $cBorder  = "${ESC}[38;5;240m"
+    $cTitle   = "${ESC}[1;97m"
+    $cFile    = "${ESC}[1;96m"
+    $cHdr     = "${ESC}[1;93m"
+    $cSdr     = "${ESC}[38;5;117m"
+    $cMeta    = "${ESC}[38;5;250m"
+    $cBarDone = "${ESC}[38;5;76m"
+    $cBarTodo = "${ESC}[38;5;238m"
+    $cPct     = "${ESC}[1;92m"
+    $cQueue   = "${ESC}[38;5;245m"
+
+    $TL = [char]0x2554
+    $TR = [char]0x2557
+    $BL = [char]0x255A
+    $BR = [char]0x255D
+    $HL = [char]0x2550
+    $VL = [char]0x2551
+    $LM = [char]0x2560
+    $RM = [char]0x2563
+
+    function Row ([string]$content, [string]$color = "") {
+        $visible = Remove-AnsiDisplayFormatting $content
+        $safe = if ($visible.Length -gt $inner) {
+            Limit-String -Value $visible -MaxWidth $inner
+        } else {
+            $content
+        }
+        $pad  = " " * [Math]::Max(0, $inner - (Remove-AnsiDisplayFormatting $safe).Length)
+        "${cBorder}${VL} ${reset}${color}${safe}${reset}${pad} ${cBorder}${VL}${reset}"
+    }
+
+    function DivRow ([string]$label) {
+        $mid   = " $label "
+        $left  = [int][Math]::Floor(($conW - 2 - $mid.Length) / 2)
+        $right = $conW - 2 - $left - $mid.Length
+        "${cBorder}${LM}$([string]$HL * $left)${cTitle}${mid}${reset}${cBorder}$([string]$HL * $right)${RM}${reset}"
+    }
+
+    $titleLabel = " NVENC Queue "
+    $tLeft      = [int][Math]::Floor(($conW - 2 - $titleLabel.Length) / 2)
+    $tRight     = $conW - 2 - $tLeft - $titleLabel.Length
+    $topBorder  = "${cBorder}${TL}$([string]$HL * $tLeft)${cTitle}${titleLabel}${reset}${cBorder}$([string]$HL * $tRight)${TR}${reset}"
+    $botBorder  = "${cBorder}${BL}$([string]$HL * ($conW - 2))${BR}${reset}"
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add($topBorder)
+    $lines.Add((Row "Encoder preference: $EncoderPreference  |  GPU: $($NvencEnvironment.GpuName)  |  NVENC engines: $($NvencEnvironment.NvencEngineCount)  |  Parallel capacity: $($NvencEnvironment.MaxParallel) ($($NvencEnvironment.CapacitySource))" $cMeta))
+    $lines.Add((Row (Get-QueueControlStateText) $cMeta))
+    $lines.Add((Row "Pending: $($Summary.Pending)  |  Active: $($Summary.Active)  |  Completed: $($Summary.Completed)  |  Skipped: $($Summary.Skipped)  |  Failed: $($Summary.Failed)" $cQueue))
+
+    foreach ($worker in @($Workers | Sort-Object SlotNumber)) {
+        $workerState = Get-WorkerStateLabel -Worker $worker
+        $shared = if ($worker.TrackedProcess) { $worker.TrackedProcess.Shared } else { [pscustomobject]@{ OutTimeSec = 0.0; OutSizeBytes = 0.0; SpeedX = 0.0 } }
+        $workerPriority = Get-OptionalProperty -InputObject $worker -PropertyName 'WorkerProcessPriority' -Default $worker.Init.WorkerProcessPriority
+        $estimate = if ($worker.TrackedProcess) { Update-LiveEstimateState -State $shared -SourceDurationSec $worker.Init.SourceDurationSec -SourceSizeBytes $worker.Init.SourceItem.Length } else { $null }
+        $pct = if ($worker.Init.SourceDurationSec -gt 0) {
+            [Math]::Min(100.0, ($shared.OutTimeSec / $worker.Init.SourceDurationSec) * 100.0)
+        } else { 0.0 }
+        $eta = if ($shared.SpeedX -gt 0.001 -and $worker.Init.SourceDurationSec -gt 0) {
+            Format-Duration -Seconds (($worker.Init.SourceDurationSec - $shared.OutTimeSec) / $shared.SpeedX)
+        } else { '--' }
+        $sizeStr = if ($shared.OutSizeBytes -gt 0) { "{0:F2} GiB" -f ($shared.OutSizeBytes / 1GB) } else { "---" }
+        $speedStr = if ($shared.SpeedX -gt 0.001) { "{0:F2}x" -f $shared.SpeedX } else { '---' }
+        $color = if ($worker.Init.SourceProfile.Profile -eq 'HDR') { $cHdr } else { $cSdr }
+        $barInner = [Math]::Max(20, $inner - 16)
+        $filled = [int][Math]::Round($barInner * $pct / 100.0)
+        $empty = $barInner - $filled
+        $pctLabel = ("{0,5:F1}%" -f $pct)
+        $bar = "[${cBarDone}$([string][char]0x2588 * $filled)${reset}${cBarTodo}$([string][char]0x2591 * $empty)${reset}] ${cPct}$pctLabel${reset}"
+
+        $lines.Add((DivRow "Worker $($worker.SlotNumber)"))
+        $lines.Add((Row "$($worker.Init.DisplayInputName)  ->  $($worker.Init.DisplayOutputName)" $cFile))
+        $nvencModeLine = Add-RainbowHdrHighlights -Text "Mode NVENC  |  $($worker.Init.SourceProfile.Profile)  |  CQ $($worker.Init.NvencSettings.CQ)  |  Preset $($worker.Init.NvencSettings.Preset)  |  Tune $($worker.Init.NvencSettings.TuneDisplay)  |  Decode $($worker.Init.NvencSettings.DecodePath)  |  State $workerState  |  Priority $workerPriority" -BaseColor $color
+        $nvencColorLine = Add-RainbowHdrHighlights -Text ("Color  |  Source {0}  ->  Output {1}" -f $worker.Init.SourceProfile.SourceColorSummary, $worker.Init.EncodeColorProfile.Summary) -BaseColor $color
+        $lines.Add((Row $nvencModeLine $color))
+        $lines.Add((Row $nvencColorLine $color))
+        $lines.Add((Row "Resolved lane: $($worker.Init.ResolvedEncodeLane)  |  Reason: $($worker.Init.LaneSelectionReason)" $cMeta))
+        if ($workerState -eq 'Held') {
+            $lines.Add((Row 'Held: manual stop. Press worker number then [r] to restart from scratch.' $cMeta))
+        } elseif ($workerState -eq 'Paused') {
+            $lines.Add((Row "Paused  |  Elapsed $(Format-Duration -Seconds $worker.Stopwatch.Elapsed.TotalSeconds)  |  Encoded $sizeStr" $cMeta))
+        } else {
+            $lines.Add((Row "Elapsed $(Format-Duration -Seconds $worker.Stopwatch.Elapsed.TotalSeconds)  |  Encoded $sizeStr  |  Speed $speedStr  |  ETA $eta" $cMeta))
+        }
+        if ($EnableLiveSizeEstimate -and $worker.TrackedProcess) {
+            $lines.Add((Row (Get-LiveEstimateSummaryText -Estimate $estimate) $cMeta))
+        }
+        $lines.Add((Row $bar))
+    }
+
+    if ($Workers.Count -eq 0) {
+        $lines.Add((DivRow 'Idle'))
+        $lines.Add((Row 'No active NVENC workers.'))
+    }
+
+    $commandPrompt = Get-ConsoleCommandPrompt
+    if (-not [string]::IsNullOrWhiteSpace($commandPrompt)) {
+        $lines.Add((DivRow 'Command'))
+        $lines.Add((Row $commandPrompt $cMeta))
+    }
+
+    $statusMessage = Get-ConsoleStatusMessage
+    if (-not [string]::IsNullOrWhiteSpace($statusMessage)) {
+        $lines.Add((Row $statusMessage $cMeta))
+    }
+
+    if ($script:ShowHelpOverlay) {
+        $lines.Add((DivRow 'Help'))
+        foreach ($helpLine in (Get-ConsoleHelpLines)) {
+            $lines.Add((Row $helpLine $cMeta))
+        }
+    }
+
+    $lines.Add($botBorder)
+
+    $lineCount = $lines.Count
+    $sb = [System.Text.StringBuilder]::new()
+    if ($UICursorRow -ge 0) {
+        $null = $sb.Append("${ESC}[${UICursorRow}A")
+        $null = $sb.Append("`r")
+    }
+    foreach ($l in $lines) {
+        $null = $sb.Append("`r")
+        $null = $sb.Append($l)
+        $null = $sb.Append("${ESC}[K")
+        $null = $sb.Append("`r`n")
+    }
+
+    [Console]::Write($sb.ToString())
+    return $lineCount
+}
+
+function Complete-NvencWorker {
+    param(
+        $Worker,
+        $NvencEnvironment
+    )
+    return (Complete-LaneWorker -Worker $Worker -NvencEnvironment $NvencEnvironment)
+}
+
+function Invoke-NvencQueueProcessing {
+    param($NvencEnvironment)
+
+    $summary = [ordered]@{
+        Completed = 0
+        Skipped   = 0
+        Failed    = 0
+        Pending   = 0
+        Active    = 0
+    }
+
+    $activeWorkers = New-Object System.Collections.Generic.List[object]
+    $uiLineCount = -1
+    $shutdownBannerShown = $false
+
+    while ($true) {
+        if (Test-QueueShutdownRequested -Workers $activeWorkers.ToArray() -NvencEnvironment $NvencEnvironment) {
+            if (-not $shutdownBannerShown) {
+                if ($uiLineCount -ge 0) { Write-Host ""; $uiLineCount = -1 }
+                Write-Host "Shutdown: stopping new queue launches and draining active workers..." -ForegroundColor Yellow
+                $shutdownBannerShown = $true
+            }
+            $workersSnapshot = [object[]]$activeWorkers.ToArray()
+            foreach ($worker in $workersSnapshot) {
+                Request-WorkerShutdown -Worker $worker
+            }
+        }
+
+        $pendingJobs = @(Get-ChildItem -LiteralPath $QueuePendingDir -Filter *.json -File -ErrorAction SilentlyContinue | Sort-Object CreationTimeUtc)
+
+        while (-not $script:QueueShutdownRequested -and $activeWorkers.Count -lt $NvencEnvironment.MaxParallel -and $pendingJobs.Count -gt 0) {
+            $nextJob = $pendingJobs[0]
+            $pendingJobs = @($pendingJobs | Select-Object -Skip 1)
+            $workingJobPath = Join-Path $QueueWorkingDir $nextJob.Name
+
+            try {
+                Move-Item -LiteralPath $nextJob.FullName -Destination $workingJobPath -Force
+
+                $job = Get-Content -LiteralPath $workingJobPath -Raw | ConvertFrom-Json
+                $init = Get-EncodeInitialization -InputPath $job.InputPath -EncodeMode 'nvenc' -NvencEnvironment $NvencEnvironment
+
+                if ($init.EarlyExit) {
+                    $row = $init.Row
+                    $row.NvencWorkerCountAtStart = $NvencEnvironment.MaxParallel
+                    Write-LogRow $row
+                    if ($init.EarlyExit -like 'AUTO_SKIPPED*' -or $init.EarlyExit -eq 'SKIPPED_DV' -or $init.EarlyExit -eq 'PRECHECK_SKIPPED_UNFAVORABLE') {
+                        $summary.Skipped++
+                    } else {
+                        $summary.Failed++
+                    }
+                    Remove-Item -LiteralPath $workingJobPath -Force -ErrorAction SilentlyContinue
+                    continue
+                }
+
+                if (Test-Path -LiteralPath $init.TempOutput) {
+                    Remove-Item -LiteralPath $init.TempOutput -Force -ErrorAction SilentlyContinue
+                }
+
+                $ffArgs = Build-NvencFfmpegArgs -Init $init -NvencEnvironment $NvencEnvironment
+                $tracked = Start-TrackedFfmpegProcess -Arguments $ffArgs -PriorityName $init.WorkerProcessPriority
+                $init.WorkerProcessPriority = $tracked.WorkerProcessPriority
+                $slotNumber = 1
+                while (@($activeWorkers | Where-Object { $_.SlotNumber -eq $slotNumber }).Count -gt 0) {
+                    $slotNumber++
+                }
+
+                $activeWorkers.Add([pscustomobject][ordered]@{
+                    SlotNumber               = $slotNumber
+                    WorkingJobPath           = $workingJobPath
+                    Init                     = $init
+                    TrackedProcess           = $tracked
+                    Stopwatch                = [System.Diagnostics.Stopwatch]::StartNew()
+                    NvencWorkerCountAtStart  = $NvencEnvironment.MaxParallel
+                    WorkerProcessPriority    = $tracked.WorkerProcessPriority
+                    ShutdownRequestedAt      = $null
+                }) | Out-Null
+            } catch {
+                if ($_.Exception.Message -eq $script:QueueShutdownSentinel) {
+                    $script:QueueShutdownRequested = $true
+                    Requeue-WorkingJob -WorkingJobPath $workingJobPath
+                    break
+                }
+
+                throw
+            }
+        }
+
+        $summary.Pending = @(Get-ChildItem -LiteralPath $QueuePendingDir -Filter *.json -File -ErrorAction SilentlyContinue).Count
+        $summary.Active  = $activeWorkers.Count
+        if (-not $script:QueueShutdownRequested) {
+            $uiLineCount = Write-NvencProgressUI -Workers $activeWorkers.ToArray() -Summary $summary -NvencEnvironment $NvencEnvironment -UICursorRow $uiLineCount
+        }
+
+        for ($i = $activeWorkers.Count - 1; $i -ge 0; $i--) {
+            $worker = $activeWorkers[$i]
+            if (Test-TrackedWorkerProcessExited -Worker $worker) {
+                try {
+                    if ($script:QueueShutdownRequested) {
+                        Stop-TrackedFfmpegProcess -TrackedProcess $worker.TrackedProcess
+                        if (Test-Path -LiteralPath $worker.Init.TempOutput) {
+                            Remove-Item -LiteralPath $worker.Init.TempOutput -Force -ErrorAction SilentlyContinue
+                        }
+                        Requeue-WorkingJob -WorkingJobPath $worker.WorkingJobPath
+                        Write-Host ("Shutdown: requeued {0}" -f $worker.Init.DisplayInputName) -ForegroundColor DarkYellow
+                    } else {
+                        $result = Complete-NvencWorker -Worker $worker -NvencEnvironment $NvencEnvironment
+                        switch ($result) {
+                            'SUCCESS' { $summary.Completed++ }
+                            'FAILED'  { $summary.Failed++ }
+                        }
+                    }
+                } catch {
+                    Write-Host ""
+                    Write-Host "FAILED: $($_.Exception.Message)" -ForegroundColor Red
+                    $summary.Failed++
+                } finally {
+                    if (Test-Path -LiteralPath $worker.WorkingJobPath) {
+                        Remove-Item -LiteralPath $worker.WorkingJobPath -Force -ErrorAction SilentlyContinue
+                    }
+                    $activeWorkers.RemoveAt($i)
+                }
+            }
+        }
+
+        if ($script:QueueShutdownRequested -and $activeWorkers.Count -eq 0) { break }
+        if ($activeWorkers.Count -eq 0 -and $summary.Pending -eq 0) { break }
+        Start-Sleep -Milliseconds 200
+    }
+
+    if ($uiLineCount -ge 0) { Write-Host "" }
+}
+
+function Invoke-AutoEncoderLaneQueueProcessing {
+    param($NvencEnvironment = $null)
+
+    $nvidiaCapacity = if ($NvencEnvironment) { [Math]::Max(1, $NvencEnvironment.MaxParallel) } else { 0 }
+    $summary = [pscustomobject][ordered]@{
+        EncoderPreference = 'Auto'
+        Completed         = 0
+        Skipped           = 0
+        Failed            = 0
+        Pending           = 0
+        Active            = 0
+        CpuActive         = 0
+        NvidiaActive      = 0
+        NvidiaCapacity    = $nvidiaCapacity
+    }
+
+    $activeWorkers = New-Object System.Collections.Generic.List[object]
+    $uiLineCount = -1
+    $shutdownBannerShown = $false
+
+    while ($true) {
+        if (Test-QueueShutdownRequested -Workers $activeWorkers.ToArray() -NvencEnvironment $NvencEnvironment) {
+            if (-not $shutdownBannerShown) {
+                if ($uiLineCount -ge 0) { Write-Host ""; $uiLineCount = -1 }
+                Write-Host "Shutdown: stopping new queue launches and draining active workers..." -ForegroundColor Yellow
+                $shutdownBannerShown = $true
+            }
+            $workersSnapshot = [object[]]$activeWorkers.ToArray()
+            foreach ($worker in $workersSnapshot) {
+                Request-WorkerShutdown -Worker $worker
+            }
+        }
+
+        $pendingJobs = @(Get-ChildItem -LiteralPath $QueuePendingDir -Filter *.json -File -ErrorAction SilentlyContinue | Sort-Object CreationTimeUtc)
+
+        while (-not $script:QueueShutdownRequested -and $pendingJobs.Count -gt 0) {
+            $cpuAvailable = (@($activeWorkers | Where-Object { $_.Init.ResolvedEncodeLane -eq 'CPU' }).Count -lt 1)
+            $nvidiaAvailable = (@($activeWorkers | Where-Object { $_.Init.ResolvedEncodeLane -eq 'Nvidia' }).Count -lt $nvidiaCapacity)
+            if (-not $cpuAvailable -and -not $nvidiaAvailable) { break }
+
+            $scheduledAny = $false
+            foreach ($nextJob in @($pendingJobs)) {
+                $job = $null
+                $workingJobPath = $null
+                try {
+                    $job = Get-Content -LiteralPath $nextJob.FullName -Raw | ConvertFrom-Json
+                    $resolution = Resolve-EncoderLane `
+                        -InputPath $job.InputPath `
+                        -EncoderPreferenceValue 'Auto' `
+                        -CpuLaneAvailable $cpuAvailable `
+                        -NvidiaLaneAvailable $nvidiaAvailable `
+                        -NvencEnvironment $NvencEnvironment
+
+                    if (-not $resolution.Ready) {
+                        if ($resolution.HeldForCpuLane -and $job.InputPath) {
+                            if ($script:HeldForCpuAnnouncements.Add($job.InputPath)) {
+                                Write-Host $resolution.Reason -ForegroundColor DarkYellow
+                                Write-SessionTextLogMessage -Level Info -Message $resolution.Reason
+                            }
+                        }
+                        continue
+                    }
+
+                    $workingJobPath = Join-Path $QueueWorkingDir $nextJob.Name
+                    Move-Item -LiteralPath $nextJob.FullName -Destination $workingJobPath -Force
+
+                    if ($resolution.Init.EarlyExit) {
+                        $row = $resolution.Init.Row
+                        $row.NvencWorkerCountAtStart = if ($resolution.Init.ResolvedEncodeLane -eq 'Nvidia' -and $NvencEnvironment) { $NvencEnvironment.MaxParallel } else { "" }
+                        Write-LogRow $row
+                        if ($resolution.Init.EarlyExit -like 'AUTO_SKIPPED*' -or $resolution.Init.EarlyExit -eq 'SKIPPED_DV' -or $resolution.Init.EarlyExit -eq 'PRECHECK_SKIPPED_UNFAVORABLE') {
+                            $summary.Skipped++
+                        } else {
+                            $summary.Failed++
+                        }
+                        Remove-Item -LiteralPath $workingJobPath -Force -ErrorAction SilentlyContinue
+                    } else {
+                        $slotNumber = 1
+                        while (@($activeWorkers | Where-Object { $_.SlotNumber -eq $slotNumber }).Count -gt 0) { $slotNumber++ }
+                        if ($job.InputPath) { $null = $script:HeldForCpuAnnouncements.Remove($job.InputPath) }
+                        $worker = Start-LaneWorker -Init $resolution.Init -NvencEnvironment $NvencEnvironment -SlotNumber $slotNumber
+                        $worker.WorkingJobPath = $workingJobPath
+                        $activeWorkers.Add($worker) | Out-Null
+                    }
+                } catch {
+                    if ($_.Exception.Message -eq $script:QueueShutdownSentinel) {
+                        $script:QueueShutdownRequested = $true
+                        break
+                    }
+
+                    Write-Host ""
+                    Write-Host "FAILED: $($_.Exception.Message)" -ForegroundColor Red
+                    Write-LogRow @{
+                        Timestamp         = (Get-Date).ToString("s")
+                        Status            = "FAILED"
+                        InputPath         = if ($job) { $job.InputPath } else { $nextJob.Name }
+                        OutputPath        = ""
+                        SourceSizeGiB     = ""
+                        OutputSizeGiB     = ""
+                        ReductionPercent  = ""
+                        SourceDurationSec = ""
+                        OutputDurationSec = ""
+                        ElapsedSec        = ""
+                        Profile           = ""
+                        HasHDR            = ""
+                        HasDV             = ""
+                        SelectedAudio     = ""
+                        SelectedSubtitles = ""
+                        CRF               = $CRF
+                        Preset            = $Preset
+                        FilmGrain         = $FilmGrain
+                        AutoCRFOffset     = $AutoCRFOffset
+                        EncoderPreference = 'Auto'
+                        ResolvedEncodeLane = ""
+                        LaneSelectionReason = ""
+                        WorkerProcessPriority = ""
+                        ScriptProcessPriority = $script:ResolvedScriptProcessPriority
+                        EncodeMode        = ""
+                        ResolvedCRF       = ""
+                        ResolvedPreset    = ""
+                        ResolvedFilmGrain = ""
+                        ResolvedCQ        = ""
+                        ResolvedNvencPreset = ""
+                        ResolvedNvencTune = ""
+                        ResolvedDecodePath = ""
+                        AutoReason        = ""
+                        BPP               = ""
+                        EffectiveVideoBitrate = ""
+                        VideoBitratePerHourGiB = ""
+                        ResolutionTier    = ""
+                        CodecClass        = ""
+                        GrainClass        = ""
+                        GrainScore        = ""
+                        WasAutoSkipped    = "False"
+                        NvencWorkerCountAtStart = ""
+                        NvencEngineCountDetected = if ($NvencEnvironment) { $NvencEnvironment.NvencEngineCount } else { "" }
+                        NvencCapacitySource = if ($NvencEnvironment) { $NvencEnvironment.CapacitySource } else { "" }
+                        DetectedGpuName   = if ($NvencEnvironment) { $NvencEnvironment.GpuName } else { "" }
+                        FilmGrainDisabledReason = ""
+                        FfmpegPath        = $FfmpegPath
+                        FfprobePath       = $FfprobePath
+                        Notes             = $_.Exception.Message
+                    }
+                    $summary.Failed++
+                    if ($workingJobPath -and (Test-Path -LiteralPath $workingJobPath)) {
+                        Remove-Item -LiteralPath $workingJobPath -Force -ErrorAction SilentlyContinue
+                    } elseif (Test-Path -LiteralPath $nextJob.FullName) {
+                        Remove-Item -LiteralPath $nextJob.FullName -Force -ErrorAction SilentlyContinue
+                    }
+                }
+
+                $pendingJobs = @($pendingJobs | Where-Object { $_.FullName -ne $nextJob.FullName })
+                $scheduledAny = $true
+                break
+            }
+
+            if (-not $scheduledAny) { break }
+        }
+
+        $summary.Pending = @(Get-ChildItem -LiteralPath $QueuePendingDir -Filter *.json -File -ErrorAction SilentlyContinue).Count
+        $summary.CpuActive = @($activeWorkers | Where-Object { $_.Init.ResolvedEncodeLane -eq 'CPU' }).Count
+        $summary.NvidiaActive = @($activeWorkers | Where-Object { $_.Init.ResolvedEncodeLane -eq 'Nvidia' }).Count
+        $summary.Active = $activeWorkers.Count
+        if (-not $script:QueueShutdownRequested) {
+            $uiLineCount = Write-LaneProgressUI -Workers $activeWorkers.ToArray() -Summary $summary -NvencEnvironment $NvencEnvironment -UICursorRow $uiLineCount
+        }
+
+        for ($i = $activeWorkers.Count - 1; $i -ge 0; $i--) {
+            $worker = $activeWorkers[$i]
+            if (Test-TrackedWorkerProcessExited -Worker $worker) {
+                try {
+                    if ($script:QueueShutdownRequested) {
+                        Stop-TrackedFfmpegProcess -TrackedProcess $worker.TrackedProcess
+                        if (Test-Path -LiteralPath $worker.Init.TempOutput) {
+                            Remove-Item -LiteralPath $worker.Init.TempOutput -Force -ErrorAction SilentlyContinue
+                        }
+                        Requeue-WorkingJob -WorkingJobPath $worker.WorkingJobPath
+                        Write-Host ("Shutdown: requeued {0}" -f $worker.Init.DisplayInputName) -ForegroundColor DarkYellow
+                    } else {
+                        $result = Complete-LaneWorker -Worker $worker -NvencEnvironment $NvencEnvironment
+                        switch ($result) {
+                            'SUCCESS' { $summary.Completed++ }
+                            'FAILED'  { $summary.Failed++ }
+                        }
+                    }
+                } catch {
+                    Write-Host ""
+                    Write-Host "FAILED: $($_.Exception.Message)" -ForegroundColor Red
+                    $summary.Failed++
+                } finally {
+                    if (Test-Path -LiteralPath $worker.WorkingJobPath) {
+                        Remove-Item -LiteralPath $worker.WorkingJobPath -Force -ErrorAction SilentlyContinue
+                    }
+                    $activeWorkers.RemoveAt($i)
+                }
+            }
+        }
+
+        if ($script:QueueShutdownRequested -and $activeWorkers.Count -eq 0) { break }
+        if ($activeWorkers.Count -eq 0 -and $summary.Pending -eq 0) { break }
+        Start-Sleep -Milliseconds 200
+    }
+
+    if ($uiLineCount -ge 0) { Write-Host "" }
 }
 
 # =============================================================================
@@ -2083,9 +6467,17 @@ function Invoke-EncodeJob {
             Preset            = $Preset
             FilmGrain         = $FilmGrain
             AutoCRFOffset     = $AutoCRFOffset
+            EncoderPreference = $EncoderPreference
+            ResolvedEncodeLane = 'CPU'
+            LaneSelectionReason = 'forced CPU lane by encoder preference'
+            EncodeMode        = 'software'
             ResolvedCRF       = ""
             ResolvedPreset    = ""
             ResolvedFilmGrain = ""
+            ResolvedCQ        = ""
+            ResolvedNvencPreset = ""
+            ResolvedNvencTune = ""
+            ResolvedDecodePath = ""
             AutoReason        = ""
             BPP               = ""
             EffectiveVideoBitrate = ""
@@ -2095,6 +6487,11 @@ function Invoke-EncodeJob {
             GrainClass        = ""
             GrainScore        = ""
             WasAutoSkipped    = "False"
+            NvencWorkerCountAtStart = ""
+            NvencEngineCountDetected = ""
+            NvencCapacitySource = ""
+            DetectedGpuName   = ""
+            FilmGrainDisabledReason = ""
             FfmpegPath        = $FfmpegPath
             FfprobePath       = $FfprobePath
             Notes             = "Dolby Vision source skipped by policy."
@@ -2119,6 +6516,23 @@ function Invoke-EncodeJob {
     $resolvedCRFLabel = [string]$resolvedCRF
     $resolvedPresetLabel = [string]$resolvedPreset
     $encodeColorLabel = $encodeColorProfile.Summary
+    $preflightWorkflow = [pscustomobject][ordered]@{
+        InitialResolvedCRF = $resolvedCRF
+        InitialResolvedPreset = $resolvedPreset
+        InitialResolvedFilmGrain = $resolvedFilmGrain
+        FinalResolvedCRF = $resolvedCRF
+        FinalResolvedPreset = $resolvedPreset
+        FinalResolvedFilmGrain = $resolvedFilmGrain
+        FinalNvencSettings = $null
+        PreflightPassCount = 0
+        Preflight1 = $null
+        Preflight2 = $null
+        FinalPreflight = [pscustomobject][ordered]@{ Ran = $false; ShouldSkip = $false; Reason = '' }
+        PreflightAutoTuneReason = ''
+        WasPreflightRetuned = $false
+        WasSkippedByPreflight = $false
+        SkipStatus = ''
+    }
 
     if ($autoSettings.Skip) {
         Write-Host ""
@@ -2146,9 +6560,17 @@ function Invoke-EncodeJob {
             Preset            = $Preset
             FilmGrain         = $FilmGrain
             AutoCRFOffset     = $AutoCRFOffset
+            EncoderPreference = $EncoderPreference
+            ResolvedEncodeLane = 'CPU'
+            LaneSelectionReason = $autoSettings.SkipReason
+            EncodeMode        = 'software'
             ResolvedCRF       = $resolvedCRF
             ResolvedPreset    = $resolvedPreset
             ResolvedFilmGrain = $resolvedFilmGrain
+            ResolvedCQ        = ""
+            ResolvedNvencPreset = ""
+            ResolvedNvencTune = ""
+            ResolvedDecodePath = ""
             AutoReason        = $autoSettings.SkipReason
             BPP               = [Math]::Round($autoSettings.BPP, 6)
             EffectiveVideoBitrate = $autoSettings.VideoBitrate
@@ -2158,6 +6580,11 @@ function Invoke-EncodeJob {
             GrainClass        = $autoSettings.GrainClass
             GrainScore        = $autoSettings.GrainScore
             WasAutoSkipped    = "True"
+            NvencWorkerCountAtStart = ""
+            NvencEngineCountDetected = ""
+            NvencCapacitySource = ""
+            DetectedGpuName   = ""
+            FilmGrainDisabledReason = ""
             FfmpegPath        = $FfmpegPath
             FfprobePath       = $FfprobePath
             Notes             = $autoSettings.BitrateReason
@@ -2181,6 +6608,110 @@ function Invoke-EncodeJob {
 
     if (Test-Path -LiteralPath $tempOutput) {
         Remove-Item -LiteralPath $tempOutput -Force
+    }
+
+    $preflightWorkflow = Invoke-PreflightAutoTuneWorkflow `
+        -InputPath $InputPath `
+        -Selected $selected `
+        -SourceProfile $sourceProfile `
+        -EncodeMode 'software' `
+        -SourceDurationSec $sourceDuration `
+        -SourceSizeBytes $sourceItem.Length `
+        -AutoSettings $autoSettings `
+        -InitialResolvedCRF $resolvedCRF `
+        -InitialResolvedPreset $resolvedPreset `
+        -InitialResolvedFilmGrain $resolvedFilmGrain
+
+    $preflightEstimate = $preflightWorkflow.FinalPreflight
+    $resolvedCRF = [int]$preflightWorkflow.FinalResolvedCRF
+    $resolvedPreset = [int]$preflightWorkflow.FinalResolvedPreset
+    $resolvedFilmGrain = [int]$preflightWorkflow.FinalResolvedFilmGrain
+    $resolvedCRFLabel = [string]$resolvedCRF
+    $resolvedPresetLabel = [string]$resolvedPreset
+
+    if ($preflightEstimate.Ran) {
+        Write-Host ("Preflight estimate: {0:F2} GiB (projected savings {1:F1}%)" -f $preflightEstimate.EstimatedFinalSizeGiB, $preflightEstimate.EstimatedSavingsPercent) -ForegroundColor DarkCyan
+        if ($preflightWorkflow.WasSkippedByPreflight) {
+            Write-Host "Decision: skipped (estimated output exceeds threshold)" -ForegroundColor Yellow
+            Write-Host ""
+
+            Write-LogRow @{
+                Timestamp         = (Get-Date).ToString("s")
+                Status            = "PRECHECK_SKIPPED_UNFAVORABLE"
+                InputPath         = $InputPath
+                OutputPath        = ""
+                SourceSizeGiB     = $sourceSizeGiB
+                OutputSizeGiB     = ""
+                ReductionPercent  = ""
+                SourceDurationSec = [Math]::Round($sourceDuration, 3)
+                OutputDurationSec = ""
+                ElapsedSec        = ""
+                Profile           = $sourceProfile.Profile
+                HasHDR            = $sourceProfile.HasHDR
+                HasDV             = $sourceProfile.HasDV
+                SelectedAudio     = $selectedAudioSummary
+                SelectedSubtitles = $selectedSubtitleSummary
+                EstimatedFinalSizeGiB = [Math]::Round($preflightEstimate.EstimatedFinalSizeGiB, 3)
+                EstimatedSavingsPercent = [Math]::Round($preflightEstimate.EstimatedSavingsPercent, 2)
+                EstimatedOutputGiBPerHour = [Math]::Round($preflightEstimate.EstimatedOutputGiBPerHour, 3)
+                InitialResolvedCRF = $preflightWorkflow.InitialResolvedCRF
+                InitialResolvedPreset = $preflightWorkflow.InitialResolvedPreset
+                InitialResolvedFilmGrain = $preflightWorkflow.InitialResolvedFilmGrain
+                PreflightPassCount = $preflightWorkflow.PreflightPassCount
+                Preflight1EstimatedFinalGiB = if ($preflightWorkflow.Preflight1 -and $preflightWorkflow.Preflight1.Ran) { [Math]::Round($preflightWorkflow.Preflight1.EstimatedFinalSizeGiB, 3) } else { "" }
+                Preflight1EstimatedSavingsPercent = if ($preflightWorkflow.Preflight1 -and $preflightWorkflow.Preflight1.Ran) { [Math]::Round($preflightWorkflow.Preflight1.EstimatedSavingsPercent, 2) } else { "" }
+                Preflight1EstimatedGiBPerHour = if ($preflightWorkflow.Preflight1 -and $preflightWorkflow.Preflight1.Ran) { [Math]::Round($preflightWorkflow.Preflight1.EstimatedOutputGiBPerHour, 3) } else { "" }
+                Preflight2EstimatedFinalGiB = if ($preflightWorkflow.Preflight2 -and $preflightWorkflow.Preflight2.Ran) { [Math]::Round($preflightWorkflow.Preflight2.EstimatedFinalSizeGiB, 3) } else { "" }
+                Preflight2EstimatedSavingsPercent = if ($preflightWorkflow.Preflight2 -and $preflightWorkflow.Preflight2.Ran) { [Math]::Round($preflightWorkflow.Preflight2.EstimatedSavingsPercent, 2) } else { "" }
+                Preflight2EstimatedGiBPerHour = if ($preflightWorkflow.Preflight2 -and $preflightWorkflow.Preflight2.Ran) { [Math]::Round($preflightWorkflow.Preflight2.EstimatedOutputGiBPerHour, 3) } else { "" }
+                FinalResolvedCRF = $preflightWorkflow.FinalResolvedCRF
+                FinalResolvedPreset = $preflightWorkflow.FinalResolvedPreset
+                FinalResolvedFilmGrain = $preflightWorkflow.FinalResolvedFilmGrain
+                PreflightAutoTuneReason = $preflightWorkflow.PreflightAutoTuneReason
+                WasPreflightRetuned = "$($preflightWorkflow.WasPreflightRetuned)"
+                WasSkippedByPreflight = 'True'
+                CRF               = $CRF
+                Preset            = $Preset
+                FilmGrain         = $FilmGrain
+                AutoCRFOffset     = $AutoCRFOffset
+                EncoderPreference = $EncoderPreference
+                ResolvedEncodeLane = 'CPU'
+                LaneSelectionReason = 'forced CPU lane by encoder preference'
+                EncodeMode        = 'software'
+                ResolvedCRF       = $preflightWorkflow.FinalResolvedCRF
+                ResolvedPreset    = $preflightWorkflow.FinalResolvedPreset
+                ResolvedFilmGrain = $preflightWorkflow.FinalResolvedFilmGrain
+                ResolvedCQ        = ""
+                ResolvedNvencPreset = ""
+                ResolvedNvencTune = ""
+                ResolvedDecodePath = ""
+                AutoReason        = $preflightWorkflow.PreflightAutoTuneReason
+                BPP               = [Math]::Round($autoSettings.BPP, 6)
+                EffectiveVideoBitrate = $autoSettings.VideoBitrate
+                VideoBitratePerHourGiB = [Math]::Round($autoSettings.VideoBitratePerHourGiB, 3)
+                ResolutionTier    = $autoSettings.ResolutionTier
+                CodecClass        = $autoSettings.CodecClass
+                GrainClass        = $autoSettings.GrainClass
+                GrainScore        = $autoSettings.GrainScore
+                WasAutoSkipped    = "False"
+                NvencWorkerCountAtStart = ""
+                NvencEngineCountDetected = ""
+                NvencCapacitySource = ""
+                DetectedGpuName   = ""
+                FilmGrainDisabledReason = ""
+                FfmpegPath        = $FfmpegPath
+                FfprobePath       = $FfprobePath
+                Notes             = $preflightWorkflow.PreflightAutoTuneReason
+            }
+            return
+        }
+
+        if ($preflightEstimate.WarningTriggered) {
+            Write-Host ("Warning: projected output is {0:F1}% of source size." -f $preflightEstimate.EstimatedPctOfSource) -ForegroundColor Yellow
+        }
+        Write-Host "Proceeding with full encode" -ForegroundColor DarkCyan
+    } elseif ($EnablePreflightEstimate -and -not [string]::IsNullOrWhiteSpace($preflightEstimate.Reason)) {
+        Write-Warning $preflightEstimate.Reason
     }
 
     # ── Build ffmpeg argument list ────────────────────────────────────────────
@@ -2288,14 +6819,43 @@ function Invoke-EncodeJob {
         Profile      = $sourceProfile.Profile
         HasHDR       = $sourceProfile.HasHDR
         HasDV        = $sourceProfile.HasDV
+        EstimatedFinalSizeGiB = if ($preflightEstimate.Ran) { [Math]::Round($preflightEstimate.EstimatedFinalSizeGiB, 3) } else { "" }
+        EstimatedSavingsPercent = if ($preflightEstimate.Ran) { [Math]::Round($preflightEstimate.EstimatedSavingsPercent, 2) } else { "" }
+        EstimatedOutputGiBPerHour = if ($preflightEstimate.Ran) { [Math]::Round($preflightEstimate.EstimatedOutputGiBPerHour, 3) } else { "" }
+        InitialResolvedCRF = $preflightWorkflow.InitialResolvedCRF
+        InitialResolvedPreset = $preflightWorkflow.InitialResolvedPreset
+        InitialResolvedFilmGrain = $preflightWorkflow.InitialResolvedFilmGrain
+        PreflightPassCount = $preflightWorkflow.PreflightPassCount
+        Preflight1EstimatedFinalGiB = if ($preflightWorkflow.Preflight1 -and $preflightWorkflow.Preflight1.Ran) { [Math]::Round($preflightWorkflow.Preflight1.EstimatedFinalSizeGiB, 3) } else { "" }
+        Preflight1EstimatedSavingsPercent = if ($preflightWorkflow.Preflight1 -and $preflightWorkflow.Preflight1.Ran) { [Math]::Round($preflightWorkflow.Preflight1.EstimatedSavingsPercent, 2) } else { "" }
+        Preflight1EstimatedGiBPerHour = if ($preflightWorkflow.Preflight1 -and $preflightWorkflow.Preflight1.Ran) { [Math]::Round($preflightWorkflow.Preflight1.EstimatedOutputGiBPerHour, 3) } else { "" }
+        Preflight2EstimatedFinalGiB = if ($preflightWorkflow.Preflight2 -and $preflightWorkflow.Preflight2.Ran) { [Math]::Round($preflightWorkflow.Preflight2.EstimatedFinalSizeGiB, 3) } else { "" }
+        Preflight2EstimatedSavingsPercent = if ($preflightWorkflow.Preflight2 -and $preflightWorkflow.Preflight2.Ran) { [Math]::Round($preflightWorkflow.Preflight2.EstimatedSavingsPercent, 2) } else { "" }
+        Preflight2EstimatedGiBPerHour = if ($preflightWorkflow.Preflight2 -and $preflightWorkflow.Preflight2.Ran) { [Math]::Round($preflightWorkflow.Preflight2.EstimatedOutputGiBPerHour, 3) } else { "" }
+        FinalResolvedCRF = $preflightWorkflow.FinalResolvedCRF
+        FinalResolvedPreset = $preflightWorkflow.FinalResolvedPreset
+        FinalResolvedFilmGrain = $preflightWorkflow.FinalResolvedFilmGrain
+        PreflightAutoTuneReason = $preflightWorkflow.PreflightAutoTuneReason
+        WasPreflightRetuned = "$($preflightWorkflow.WasPreflightRetuned)"
+        WasSkippedByPreflight = "$($preflightWorkflow.WasSkippedByPreflight)"
         CRF          = $CRF
         Preset       = $Preset
         FilmGrain    = $FilmGrain
         AutoCRFOffset = $AutoCRFOffset
+        EncoderPreference = $EncoderPreference
+        ResolvedEncodeLane = 'CPU'
+        LaneSelectionReason = 'forced CPU lane by encoder preference'
+        WorkerProcessPriority = $SoftwareEncodePriority
+        ScriptProcessPriority = $script:ResolvedScriptProcessPriority
+        EncodeMode   = 'software'
         ResolvedCRF  = $resolvedCRF
         ResolvedPreset = $resolvedPreset
         ResolvedFilmGrain = $resolvedFilmGrain
-        AutoReason   = $autoSettings.Reason
+        ResolvedCQ   = ''
+        ResolvedNvencPreset = ''
+        ResolvedNvencTune = ''
+        ResolvedDecodePath = ''
+        AutoReason   = if (-not [string]::IsNullOrWhiteSpace($preflightWorkflow.PreflightAutoTuneReason)) { $preflightWorkflow.PreflightAutoTuneReason } else { $autoSettings.Reason }
         BPP          = [Math]::Round($autoSettings.BPP, 6)
         EffectiveVideoBitrate = $autoSettings.VideoBitrate
         VideoBitratePerHourGiB = [Math]::Round($autoSettings.VideoBitratePerHourGiB, 3)
@@ -2304,6 +6864,11 @@ function Invoke-EncodeJob {
         GrainClass   = $autoSettings.GrainClass
         GrainScore   = $autoSettings.GrainScore
         WasAutoSkipped = $false
+        NvencWorkerCountAtStart = ''
+        NvencEngineCountDetected = ''
+        NvencCapacitySource = ''
+        DetectedGpuName = ''
+        FilmGrainDisabledReason = ''
     } | ConvertTo-Json -Depth 8
 
     Set-Content -LiteralPath $StatePath -Value $currentState -Encoding UTF8
@@ -2313,11 +6878,19 @@ function Invoke-EncodeJob {
     Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "Source   : $InputPath"                                          -ForegroundColor Green
     Write-Host "Encoding : $displayOutputName"                                  -ForegroundColor Green
-    Write-Host "Profile : $($sourceProfile.Profile)"                           -ForegroundColor Green
-    Write-Host "Source Color: $($sourceProfile.SourceColorSummary)"            -ForegroundColor Green
-    Write-Host "Encode Color: $($encodeColorProfile.Summary)"                  -ForegroundColor Green
+    Write-Host "Encoder Preference: $EncoderPreference"                         -ForegroundColor Green
+    Write-Host "Resolved Lane: CPU (forced CPU lane by encoder preference)"     -ForegroundColor Green
+    Write-Host ("Profile : {0}" -f (Add-RainbowHdrHighlights -Text $sourceProfile.Profile)) -ForegroundColor Green
+    Write-Host ("Source Color: {0}" -f (Add-RainbowHdrHighlights -Text $sourceProfile.SourceColorSummary)) -ForegroundColor Green
+    Write-Host ("Encode Color: {0}" -f (Add-RainbowHdrHighlights -Text $encodeColorProfile.Summary)) -ForegroundColor Green
     if (-not [string]::IsNullOrWhiteSpace($encodeColorProfile.Note)) {
         Write-Host "Color Note : $($encodeColorProfile.Note)"                   -ForegroundColor Yellow
+    }
+    if ($preflightEstimate.Ran) {
+        Write-Host ("Preflight  : {0:F2} GiB estimate (projected savings {1:F1}%)" -f $preflightEstimate.EstimatedFinalSizeGiB, $preflightEstimate.EstimatedSavingsPercent) -ForegroundColor Green
+    }
+    if ($preflightWorkflow.WasPreflightRetuned -and -not [string]::IsNullOrWhiteSpace($preflightWorkflow.PreflightAutoTuneReason)) {
+        Write-Host "Preflight Tune: $($preflightWorkflow.PreflightAutoTuneReason)" -ForegroundColor Green
     }
     if ($CRF -eq 'Auto') {
         Write-Host "Auto CRF    : $resolvedCRF ($($autoSettings.CRFReason))"   -ForegroundColor Green
@@ -2337,12 +6910,25 @@ function Invoke-EncodeJob {
     Write-Host "Subs    : $selectedSubtitleSummary" -ForegroundColor Green
     Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
+    Write-SessionEncodeStart -Init ([pscustomobject]@{
+        DisplayInputName      = $displayInputName
+        DisplayOutputName     = $displayOutputName
+        ResolvedEncodeLane    = 'CPU'
+        SourceProfile         = $sourceProfile
+        EncodeColorProfile    = $encodeColorProfile
+        PreflightWorkflow     = $preflightWorkflow
+        EffectiveFilmGrain    = $resolvedFilmGrain
+        WorkerProcessPriority = $SoftwareEncodePriority
+        AutoSettings          = $autoSettings
+        NvencSettings         = $null
+        LaneSelectionReason   = 'forced CPU lane by encoder preference'
+    })
 
     # ── Launch ffmpeg with redirected stderr ──────────────────────────────────
     $psi                       = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName              = $FfmpegPath
     $psi.RedirectStandardError = $true
-    $psi.RedirectStandardInput = $false
+    $psi.RedirectStandardInput = $true
     $psi.UseShellExecute       = $false
     $psi.CreateNoWindow        = $false
 
@@ -2355,10 +6941,15 @@ function Invoke-EncodeJob {
     # [hashtable]::Synchronized wraps every read/write in a monitor lock so
     # the threadpool callback and the main thread cannot race on these values.
     $shared = [hashtable]::Synchronized(@{
-        OutTimeSec   = 0.0
-        OutSizeBytes = 0.0
-        SpeedX       = 0.0
-        LogLines     = [System.Collections.Generic.List[string]]::new()
+        OutTimeSec                  = 0.0
+        OutSizeBytes                = 0.0
+        SpeedX                      = 0.0
+        LogLines                    = [System.Collections.Generic.List[string]]::new()
+        SmoothedEstimatedFinalBytes = 0.0
+        LastRawEstimatedFinalBytes  = 0.0
+        EstimatedSavingsPercent     = 0.0
+        EstimatedOutputGiBPerHour   = 0.0
+        EstimateReady               = $false
     })
 
     # ── Background runspace: reads stderr from ffmpeg synchronously ───────────
@@ -2418,12 +7009,24 @@ function Invoke-EncodeJob {
     })
 
     $null = $proc.Start()
+    $workerPriorityResolution = Set-TrackedProcessPriority -Process $proc -PriorityName $SoftwareEncodePriority
+    if ($workerPriorityResolution.Warning) {
+        Write-Warning $workerPriorityResolution.Warning
+    }
     $stderrAsync = $stderrPs.BeginInvoke()
 
     # ── Live UI loop ──────────────────────────────────────────────────────────
     $uiFileName     = $displayOutputName
     $uiLineCount    = -1   # -1 signals first paint; no cursor-up on first call
+    $shutdownRequested = $false
     while (-not $proc.HasExited) {
+        if (Test-QueueShutdownRequested) {
+            $shutdownRequested = $true
+            Write-Host "Shutdown: requesting active software encode to stop gracefully..." -ForegroundColor Yellow
+            Request-FfmpegProcessQuit -Process $proc
+            break
+        }
+
         $uiLineCount = Write-ProgressUI `
             -FileName          $uiFileName `
             -Profile           $sourceProfile.Profile `
@@ -2431,13 +7034,26 @@ function Invoke-EncodeJob {
             -CRFLabel          $resolvedCRFLabel `
             -PresetLabel       $resolvedPresetLabel `
             -SourceDurationSec $sourceDuration `
+            -SourceSizeBytes   $sourceItem.Length `
             -ElapsedSec        $stopwatch.Elapsed.TotalSeconds `
             -OutTimeSec        $shared.OutTimeSec `
             -OutSizeBytes      $shared.OutSizeBytes `
             -SpeedX            $shared.SpeedX `
+            -EstimateState     $shared `
             -UICursorRow       $uiLineCount
 
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds 200
+    }
+
+    if ($shutdownRequested) {
+        $deadline = (Get-Date).AddSeconds(20)
+        while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 200
+        }
+        if (-not $proc.HasExited) {
+            Write-Host "Shutdown: software encode did not exit in time; terminating ffmpeg." -ForegroundColor Yellow
+            try { $proc.Kill() } catch {}
+        }
     }
 
     $proc.WaitForExit()
@@ -2450,6 +7066,14 @@ function Invoke-EncodeJob {
     $stderrRunspace.Close()
     $stderrRunspace.Dispose()
 
+    if ($shutdownRequested) {
+        if (Test-Path -LiteralPath $tempOutput) {
+            Remove-Item -LiteralPath $tempOutput -Force -ErrorAction SilentlyContinue
+        }
+        Write-Host ("Shutdown: requeued {0}" -f ([System.IO.Path]::GetFileName($InputPath))) -ForegroundColor DarkYellow
+        throw $script:QueueShutdownSentinel
+    }
+
     # Final paint: snap to 100% on success, leave at actual position on failure.
     $null = Write-ProgressUI `
         -FileName          $uiFileName `
@@ -2458,10 +7082,12 @@ function Invoke-EncodeJob {
         -CRFLabel          $resolvedCRFLabel `
         -PresetLabel       $resolvedPresetLabel `
         -SourceDurationSec $sourceDuration `
+        -SourceSizeBytes   $sourceItem.Length `
         -ElapsedSec        $stopwatch.Elapsed.TotalSeconds `
         -OutTimeSec        $(if ($ffExit -eq 0) { $sourceDuration } else { $shared.OutTimeSec }) `
         -OutSizeBytes      $shared.OutSizeBytes `
         -SpeedX            $shared.SpeedX `
+        -EstimateState     $shared `
         -UICursorRow       $uiLineCount
 
     Write-Host ""
@@ -2498,6 +7124,7 @@ function Invoke-EncodeJob {
     $reduction     = if ($sourceItem.Length -gt 0) {
         [Math]::Round((1 - ($outItem.Length / [double]$sourceItem.Length)) * 100, 2)
     } else { 0 }
+    $finalOutputGiBPerHour = if ($sourceDuration -gt 0) { [Math]::Round($outputSizeGiB / ($sourceDuration / 3600.0), 3) } else { "" }
 
     # ── Replace original ──────────────────────────────────────────────────────
     # The delete and move are wrapped together so that if Move-Item fails after
@@ -2544,14 +7171,41 @@ function Invoke-EncodeJob {
         HasDV             = $sourceProfile.HasDV
         SelectedAudio     = $selectedAudioSummary
         SelectedSubtitles = $selectedSubtitleSummary
+        EstimatedFinalSizeGiB = $outputSizeGiB
+        EstimatedSavingsPercent = $reduction
+        EstimatedOutputGiBPerHour = $finalOutputGiBPerHour
+        InitialResolvedCRF = $preflightWorkflow.InitialResolvedCRF
+        InitialResolvedPreset = $preflightWorkflow.InitialResolvedPreset
+        InitialResolvedFilmGrain = $preflightWorkflow.InitialResolvedFilmGrain
+        PreflightPassCount = $preflightWorkflow.PreflightPassCount
+        Preflight1EstimatedFinalGiB = if ($preflightWorkflow.Preflight1 -and $preflightWorkflow.Preflight1.Ran) { [Math]::Round($preflightWorkflow.Preflight1.EstimatedFinalSizeGiB, 3) } else { "" }
+        Preflight1EstimatedSavingsPercent = if ($preflightWorkflow.Preflight1 -and $preflightWorkflow.Preflight1.Ran) { [Math]::Round($preflightWorkflow.Preflight1.EstimatedSavingsPercent, 2) } else { "" }
+        Preflight1EstimatedGiBPerHour = if ($preflightWorkflow.Preflight1 -and $preflightWorkflow.Preflight1.Ran) { [Math]::Round($preflightWorkflow.Preflight1.EstimatedOutputGiBPerHour, 3) } else { "" }
+        Preflight2EstimatedFinalGiB = if ($preflightWorkflow.Preflight2 -and $preflightWorkflow.Preflight2.Ran) { [Math]::Round($preflightWorkflow.Preflight2.EstimatedFinalSizeGiB, 3) } else { "" }
+        Preflight2EstimatedSavingsPercent = if ($preflightWorkflow.Preflight2 -and $preflightWorkflow.Preflight2.Ran) { [Math]::Round($preflightWorkflow.Preflight2.EstimatedSavingsPercent, 2) } else { "" }
+        Preflight2EstimatedGiBPerHour = if ($preflightWorkflow.Preflight2 -and $preflightWorkflow.Preflight2.Ran) { [Math]::Round($preflightWorkflow.Preflight2.EstimatedOutputGiBPerHour, 3) } else { "" }
+        FinalResolvedCRF = $preflightWorkflow.FinalResolvedCRF
+        FinalResolvedPreset = $preflightWorkflow.FinalResolvedPreset
+        FinalResolvedFilmGrain = $preflightWorkflow.FinalResolvedFilmGrain
+        PreflightAutoTuneReason = $preflightWorkflow.PreflightAutoTuneReason
+        WasPreflightRetuned = "$($preflightWorkflow.WasPreflightRetuned)"
+        WasSkippedByPreflight = "$($preflightWorkflow.WasSkippedByPreflight)"
         CRF               = $CRF
         Preset            = $Preset
         FilmGrain         = $FilmGrain
         AutoCRFOffset     = $AutoCRFOffset
-        ResolvedCRF       = $resolvedCRF
-        ResolvedPreset    = $resolvedPreset
+        EncoderPreference = $EncoderPreference
+        ResolvedEncodeLane = 'CPU'
+        LaneSelectionReason = 'forced CPU lane by encoder preference'
+        EncodeMode        = 'software'
+        ResolvedCRF       = $preflightWorkflow.FinalResolvedCRF
+        ResolvedPreset    = $preflightWorkflow.FinalResolvedPreset
         ResolvedFilmGrain = $resolvedFilmGrain
-        AutoReason        = $autoSettings.Reason
+        ResolvedCQ        = ""
+        ResolvedNvencPreset = ""
+        ResolvedNvencTune = ""
+        ResolvedDecodePath = ""
+        AutoReason        = if (-not [string]::IsNullOrWhiteSpace($preflightWorkflow.PreflightAutoTuneReason)) { $preflightWorkflow.PreflightAutoTuneReason } else { $autoSettings.Reason }
         BPP               = [Math]::Round($autoSettings.BPP, 6)
         EffectiveVideoBitrate = $autoSettings.VideoBitrate
         VideoBitratePerHourGiB = [Math]::Round($autoSettings.VideoBitratePerHourGiB, 3)
@@ -2560,9 +7214,14 @@ function Invoke-EncodeJob {
         GrainClass        = $autoSettings.GrainClass
         GrainScore        = $autoSettings.GrainScore
         WasAutoSkipped    = "False"
+        NvencWorkerCountAtStart = ""
+        NvencEngineCountDetected = ""
+        NvencCapacitySource = ""
+        DetectedGpuName   = ""
+        FilmGrainDisabledReason = ""
         FfmpegPath        = $FfmpegPath
         FfprobePath       = $FfprobePath
-        Notes             = $autoSettings.BitrateReason
+        Notes             = if ($preflightEstimate.Ran) { $autoSettings.BitrateReason + ' | ' + $preflightWorkflow.PreflightAutoTuneReason } else { $autoSettings.BitrateReason }
     }
 
     Write-Host ""
@@ -2597,7 +7256,6 @@ function Invoke-EncodeJob {
 #       loop so that only a genuine crash leaves it on disk for detection.
 # =============================================================================
 function Invoke-QueueProcessing {
-
     if (Test-Path -LiteralPath $StatePath) {
         try {
             $interrupted = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
@@ -2626,13 +7284,42 @@ function Invoke-QueueProcessing {
                 HasDV             = $interrupted.HasDV
                 SelectedAudio     = ""
                 SelectedSubtitles = ""
+                EstimatedFinalSizeGiB = Get-OptionalProperty $interrupted 'EstimatedFinalSizeGiB' ''
+                EstimatedSavingsPercent = Get-OptionalProperty $interrupted 'EstimatedSavingsPercent' ''
+                EstimatedOutputGiBPerHour = Get-OptionalProperty $interrupted 'EstimatedOutputGiBPerHour' ''
+                InitialResolvedCRF = Get-OptionalProperty $interrupted 'InitialResolvedCRF' ''
+                InitialResolvedPreset = Get-OptionalProperty $interrupted 'InitialResolvedPreset' ''
+                InitialResolvedFilmGrain = Get-OptionalProperty $interrupted 'InitialResolvedFilmGrain' ''
+                PreflightPassCount = Get-OptionalProperty $interrupted 'PreflightPassCount' ''
+                Preflight1EstimatedFinalGiB = Get-OptionalProperty $interrupted 'Preflight1EstimatedFinalGiB' ''
+                Preflight1EstimatedSavingsPercent = Get-OptionalProperty $interrupted 'Preflight1EstimatedSavingsPercent' ''
+                Preflight1EstimatedGiBPerHour = Get-OptionalProperty $interrupted 'Preflight1EstimatedGiBPerHour' ''
+                Preflight2EstimatedFinalGiB = Get-OptionalProperty $interrupted 'Preflight2EstimatedFinalGiB' ''
+                Preflight2EstimatedSavingsPercent = Get-OptionalProperty $interrupted 'Preflight2EstimatedSavingsPercent' ''
+                Preflight2EstimatedGiBPerHour = Get-OptionalProperty $interrupted 'Preflight2EstimatedGiBPerHour' ''
+                FinalResolvedCRF = Get-OptionalProperty $interrupted 'FinalResolvedCRF' ''
+                FinalResolvedPreset = Get-OptionalProperty $interrupted 'FinalResolvedPreset' ''
+                FinalResolvedFilmGrain = Get-OptionalProperty $interrupted 'FinalResolvedFilmGrain' ''
+                PreflightAutoTuneReason = Get-OptionalProperty $interrupted 'PreflightAutoTuneReason' ''
+                WasPreflightRetuned = Get-OptionalProperty $interrupted 'WasPreflightRetuned' 'False'
+                WasSkippedByPreflight = Get-OptionalProperty $interrupted 'WasSkippedByPreflight' 'False'
                 CRF               = $interrupted.CRF
                 Preset            = $interrupted.Preset
                 FilmGrain         = $interrupted.FilmGrain
                 AutoCRFOffset     = Get-OptionalProperty $interrupted 'AutoCRFOffset' ''
+                EncoderPreference = Get-OptionalProperty $interrupted 'EncoderPreference' $EncoderPreference
+                ResolvedEncodeLane = Get-OptionalProperty $interrupted 'ResolvedEncodeLane' 'CPU'
+                LaneSelectionReason = Get-OptionalProperty $interrupted 'LaneSelectionReason' ''
+                WorkerProcessPriority = Get-OptionalProperty $interrupted 'WorkerProcessPriority' ''
+                ScriptProcessPriority = Get-OptionalProperty $interrupted 'ScriptProcessPriority' $script:ResolvedScriptProcessPriority
+                EncodeMode        = Get-OptionalProperty $interrupted 'EncodeMode' 'software'
                 ResolvedCRF       = Get-OptionalProperty $interrupted 'ResolvedCRF' ''
                 ResolvedPreset    = Get-OptionalProperty $interrupted 'ResolvedPreset' ''
                 ResolvedFilmGrain = Get-OptionalProperty $interrupted 'ResolvedFilmGrain' ''
+                ResolvedCQ        = Get-OptionalProperty $interrupted 'ResolvedCQ' ''
+                ResolvedNvencPreset = Get-OptionalProperty $interrupted 'ResolvedNvencPreset' ''
+                ResolvedNvencTune = Get-OptionalProperty $interrupted 'ResolvedNvencTune' ''
+                ResolvedDecodePath = Get-OptionalProperty $interrupted 'ResolvedDecodePath' ''
                 AutoReason        = Get-OptionalProperty $interrupted 'AutoReason' ''
                 BPP               = Get-OptionalProperty $interrupted 'BPP' ''
                 EffectiveVideoBitrate = Get-OptionalProperty $interrupted 'EffectiveVideoBitrate' ''
@@ -2642,6 +7329,11 @@ function Invoke-QueueProcessing {
                 GrainClass        = Get-OptionalProperty $interrupted 'GrainClass' ''
                 GrainScore        = Get-OptionalProperty $interrupted 'GrainScore' ''
                 WasAutoSkipped    = Get-OptionalProperty $interrupted 'WasAutoSkipped' 'False'
+                NvencWorkerCountAtStart = Get-OptionalProperty $interrupted 'NvencWorkerCountAtStart' ''
+                NvencEngineCountDetected = Get-OptionalProperty $interrupted 'NvencEngineCountDetected' ''
+                NvencCapacitySource = Get-OptionalProperty $interrupted 'NvencCapacitySource' ''
+                DetectedGpuName   = Get-OptionalProperty $interrupted 'DetectedGpuName' ''
+                FilmGrainDisabledReason = Get-OptionalProperty $interrupted 'FilmGrainDisabledReason' ''
                 FfmpegPath        = $FfmpegPath
                 FfprobePath       = $FfprobePath
                 Notes             = "Process was interrupted. Temp output may exist at: $tempPath"
@@ -2653,7 +7345,36 @@ function Invoke-QueueProcessing {
         Remove-Item -LiteralPath $StatePath -Force -ErrorAction SilentlyContinue
     }
 
+    $staleWorkingJobs = @(Get-ChildItem -LiteralPath $QueueWorkingDir -Filter *.json -File -ErrorAction SilentlyContinue | Sort-Object CreationTimeUtc)
+    foreach ($staleJob in $staleWorkingJobs) {
+        $requeuePath = Join-Path $QueuePendingDir $staleJob.Name
+        try {
+            if (Test-Path -LiteralPath $requeuePath) {
+                Remove-Item -LiteralPath $staleJob.FullName -Force -ErrorAction SilentlyContinue
+                continue
+            }
+
+            Move-Item -LiteralPath $staleJob.FullName -Destination $requeuePath -Force
+            Write-Warning "Recovered stale working queue item back to pending: $($staleJob.Name)"
+        } catch {
+            Write-Warning "Could not recover stale working queue item $($staleJob.FullName): $($_.Exception.Message)"
+        }
+    }
+
+    switch ($EncoderPreference) {
+        'Nvidia' {
+            Invoke-NvencQueueProcessing -NvencEnvironment $script:NvencEnvironment
+            return
+        }
+        'Auto' {
+            Invoke-AutoEncoderLaneQueueProcessing -NvencEnvironment $script:NvencEnvironment
+            return
+        }
+    }
+
     while ($true) {
+        if (Test-QueueShutdownRequested) { break }
+
         $nextJob = Get-ChildItem -LiteralPath $QueuePendingDir -Filter *.json -File |
             Sort-Object CreationTimeUtc |
             Select-Object -First 1
@@ -2669,6 +7390,11 @@ function Invoke-QueueProcessing {
         }
         catch {
             $message = $_.Exception.Message
+            if ($message -eq $script:QueueShutdownSentinel) {
+                Requeue-WorkingJob -WorkingJobPath $workingJobPath
+                break
+            }
+
             $position = $_.InvocationInfo.PositionMessage
             $stack = $_.ScriptStackTrace
             $state = $null
@@ -2708,13 +7434,42 @@ function Invoke-QueueProcessing {
                 HasDV             = if ($state) { Get-OptionalProperty $state 'HasDV' '' } else { "" }
                 SelectedAudio     = ""
                 SelectedSubtitles = ""
+                EstimatedFinalSizeGiB = if ($state) { Get-OptionalProperty $state 'EstimatedFinalSizeGiB' '' } else { "" }
+                EstimatedSavingsPercent = if ($state) { Get-OptionalProperty $state 'EstimatedSavingsPercent' '' } else { "" }
+                EstimatedOutputGiBPerHour = if ($state) { Get-OptionalProperty $state 'EstimatedOutputGiBPerHour' '' } else { "" }
+                InitialResolvedCRF = if ($state) { Get-OptionalProperty $state 'InitialResolvedCRF' '' } else { "" }
+                InitialResolvedPreset = if ($state) { Get-OptionalProperty $state 'InitialResolvedPreset' '' } else { "" }
+                InitialResolvedFilmGrain = if ($state) { Get-OptionalProperty $state 'InitialResolvedFilmGrain' '' } else { "" }
+                PreflightPassCount = if ($state) { Get-OptionalProperty $state 'PreflightPassCount' '' } else { "" }
+                Preflight1EstimatedFinalGiB = if ($state) { Get-OptionalProperty $state 'Preflight1EstimatedFinalGiB' '' } else { "" }
+                Preflight1EstimatedSavingsPercent = if ($state) { Get-OptionalProperty $state 'Preflight1EstimatedSavingsPercent' '' } else { "" }
+                Preflight1EstimatedGiBPerHour = if ($state) { Get-OptionalProperty $state 'Preflight1EstimatedGiBPerHour' '' } else { "" }
+                Preflight2EstimatedFinalGiB = if ($state) { Get-OptionalProperty $state 'Preflight2EstimatedFinalGiB' '' } else { "" }
+                Preflight2EstimatedSavingsPercent = if ($state) { Get-OptionalProperty $state 'Preflight2EstimatedSavingsPercent' '' } else { "" }
+                Preflight2EstimatedGiBPerHour = if ($state) { Get-OptionalProperty $state 'Preflight2EstimatedGiBPerHour' '' } else { "" }
+                FinalResolvedCRF = if ($state) { Get-OptionalProperty $state 'FinalResolvedCRF' '' } else { "" }
+                FinalResolvedPreset = if ($state) { Get-OptionalProperty $state 'FinalResolvedPreset' '' } else { "" }
+                FinalResolvedFilmGrain = if ($state) { Get-OptionalProperty $state 'FinalResolvedFilmGrain' '' } else { "" }
+                PreflightAutoTuneReason = if ($state) { Get-OptionalProperty $state 'PreflightAutoTuneReason' '' } else { "" }
+                WasPreflightRetuned = if ($state) { Get-OptionalProperty $state 'WasPreflightRetuned' 'False' } else { "False" }
+                WasSkippedByPreflight = if ($state) { Get-OptionalProperty $state 'WasSkippedByPreflight' 'False' } else { "False" }
                 CRF               = if ($state) { Get-OptionalProperty $state 'CRF' $CRF } else { $CRF }
                 Preset            = if ($state) { Get-OptionalProperty $state 'Preset' $Preset } else { $Preset }
                 FilmGrain         = if ($state) { Get-OptionalProperty $state 'FilmGrain' $FilmGrain } else { $FilmGrain }
                 AutoCRFOffset     = if ($state) { Get-OptionalProperty $state 'AutoCRFOffset' $AutoCRFOffset } else { $AutoCRFOffset }
+                EncoderPreference = if ($state) { Get-OptionalProperty $state 'EncoderPreference' $EncoderPreference } else { $EncoderPreference }
+                ResolvedEncodeLane = if ($state) { Get-OptionalProperty $state 'ResolvedEncodeLane' 'CPU' } else { 'CPU' }
+                LaneSelectionReason = if ($state) { Get-OptionalProperty $state 'LaneSelectionReason' '' } else { 'forced CPU lane by encoder preference' }
+                WorkerProcessPriority = if ($state) { Get-OptionalProperty $state 'WorkerProcessPriority' '' } else { '' }
+                ScriptProcessPriority = if ($state) { Get-OptionalProperty $state 'ScriptProcessPriority' $script:ResolvedScriptProcessPriority } else { $script:ResolvedScriptProcessPriority }
+                EncodeMode        = if ($state) { Get-OptionalProperty $state 'EncodeMode' 'software' } else { 'software' }
                 ResolvedCRF       = if ($state) { Get-OptionalProperty $state 'ResolvedCRF' '' } else { "" }
                 ResolvedPreset    = if ($state) { Get-OptionalProperty $state 'ResolvedPreset' '' } else { "" }
                 ResolvedFilmGrain = if ($state) { Get-OptionalProperty $state 'ResolvedFilmGrain' '' } else { "" }
+                ResolvedCQ        = if ($state) { Get-OptionalProperty $state 'ResolvedCQ' '' } else { "" }
+                ResolvedNvencPreset = if ($state) { Get-OptionalProperty $state 'ResolvedNvencPreset' '' } else { "" }
+                ResolvedNvencTune = if ($state) { Get-OptionalProperty $state 'ResolvedNvencTune' '' } else { "" }
+                ResolvedDecodePath = if ($state) { Get-OptionalProperty $state 'ResolvedDecodePath' '' } else { "" }
                 AutoReason        = if ($state) { Get-OptionalProperty $state 'AutoReason' '' } else { "" }
                 BPP               = if ($state) { Get-OptionalProperty $state 'BPP' '' } else { "" }
                 EffectiveVideoBitrate = if ($state) { Get-OptionalProperty $state 'EffectiveVideoBitrate' '' } else { "" }
@@ -2724,6 +7479,11 @@ function Invoke-QueueProcessing {
                 GrainClass        = if ($state) { Get-OptionalProperty $state 'GrainClass' '' } else { "" }
                 GrainScore        = if ($state) { Get-OptionalProperty $state 'GrainScore' '' } else { "" }
                 WasAutoSkipped    = if ($state) { Get-OptionalProperty $state 'WasAutoSkipped' 'False' } else { "False" }
+                NvencWorkerCountAtStart = if ($state) { Get-OptionalProperty $state 'NvencWorkerCountAtStart' '' } else { "" }
+                NvencEngineCountDetected = if ($state) { Get-OptionalProperty $state 'NvencEngineCountDetected' '' } else { "" }
+                NvencCapacitySource = if ($state) { Get-OptionalProperty $state 'NvencCapacitySource' '' } else { "" }
+                DetectedGpuName   = if ($state) { Get-OptionalProperty $state 'DetectedGpuName' '' } else { "" }
+                FilmGrainDisabledReason = if ($state) { Get-OptionalProperty $state 'FilmGrainDisabledReason' '' } else { "" }
                 FfmpegPath        = $FfmpegPath
                 FfprobePath       = $FfprobePath
                 Notes             = ($message + " | " + $position)
@@ -2762,15 +7522,75 @@ $CRF       = Resolve-ConfigValue -Name 'CRF'       -Value $CRF       -Minimum 0 
 $Preset    = Resolve-ConfigValue -Name 'Preset'    -Value $Preset    -Minimum 0 -Maximum 13
 $FilmGrain = Resolve-ConfigValue -Name 'FilmGrain' -Value $FilmGrain -Minimum 0 -Maximum 50
 $AutoCRFOffset = Resolve-OffsetConfigValue -Name 'AutoCRFOffset' -Value $AutoCRFOffset
+$EncoderPreference = Resolve-EncoderPreferenceConfigValue -Name 'EncoderPreference' -Value $EncoderPreference
+$SoftwareEncodePriority = Resolve-ProcessPriorityConfigValue -Name 'SoftwareEncodePriority' -Value $SoftwareEncodePriority
+$HardwareEncodePriority = Resolve-ProcessPriorityConfigValue -Name 'HardwareEncodePriority' -Value $HardwareEncodePriority
+$ScriptProcessPriority = Resolve-ProcessPriorityConfigValue -Name 'ScriptProcessPriority' -Value $ScriptProcessPriority
+$ApplyProcessPriority = Resolve-BooleanConfigValue -Name 'ApplyProcessPriority' -Value $ApplyProcessPriority
+$NvencMaxParallel = Resolve-ConfigValue -Name 'NvencMaxParallel' -Value $NvencMaxParallel -Minimum 1 -Maximum 16
+$NvencCQ = Resolve-ConfigValue -Name 'NvencCQ' -Value $NvencCQ -Minimum 0 -Maximum 63
+$NvencPreset = Resolve-NvencPresetConfigValue -Name 'NvencPreset' -Value $NvencPreset
+$NvencDecode = Resolve-NvencDecodeConfigValue -Name 'NvencDecode' -Value $NvencDecode
+$NvencTune = Resolve-NvencTuneConfigValue -Name 'NvencTune' -Value $NvencTune
+$EnablePreflightEstimate = Resolve-BooleanConfigValue -Name 'EnablePreflightEstimate' -Value $EnablePreflightEstimate
+$PreflightSampleCount = Resolve-ConfigValue -Name 'PreflightSampleCount' -Value $PreflightSampleCount -Minimum 1 -Maximum 12
+$PreflightSampleDurationSec = Resolve-ConfigValue -Name 'PreflightSampleDurationSec' -Value $PreflightSampleDurationSec -Minimum 5 -Maximum 300
+$PreflightWarnIfEstimatedPctOfSource = Resolve-ConfigValue -Name 'PreflightWarnIfEstimatedPctOfSource' -Value $PreflightWarnIfEstimatedPctOfSource -Minimum 1 -Maximum 500
+$PreflightAbortIfEstimatedPctOfSource = Resolve-ConfigValue -Name 'PreflightAbortIfEstimatedPctOfSource' -Value $PreflightAbortIfEstimatedPctOfSource -Minimum 1 -Maximum 500
+$EnablePreflightAutoTune = Resolve-BooleanConfigValue -Name 'EnablePreflightAutoTune' -Value $EnablePreflightAutoTune
+$EnableSecondPreflightPass = Resolve-BooleanConfigValue -Name 'EnableSecondPreflightPass' -Value $EnableSecondPreflightPass
+$PreflightAutoTuneQuality = Resolve-PreflightAutoTuneQualityConfigValue -Name 'PreflightAutoTuneQuality' -Value $PreflightAutoTuneQuality
+$PreflightAutoTuneCustomTargetGiBPerHour = Resolve-NullableDoubleRangeConfigValue -Name 'PreflightAutoTuneCustomTargetGiBPerHour' -Value $PreflightAutoTuneCustomTargetGiBPerHour -Minimum 0.1 -Maximum 100.0
+$PreflightAutoTuneCustomUpperGiBPerHour = Resolve-NullableDoubleRangeConfigValue -Name 'PreflightAutoTuneCustomUpperGiBPerHour' -Value $PreflightAutoTuneCustomUpperGiBPerHour -Minimum 0.1 -Maximum 100.0
+$PreflightAutoTuneCustomLowerGiBPerHour = Resolve-NullableDoubleRangeConfigValue -Name 'PreflightAutoTuneCustomLowerGiBPerHour' -Value $PreflightAutoTuneCustomLowerGiBPerHour -Minimum 0.1 -Maximum 100.0
+$PreflightTinyOutputPctThreshold = Resolve-DoubleRangeConfigValue -Name 'PreflightTinyOutputPctThreshold' -Value $PreflightTinyOutputPctThreshold -Minimum 1.0 -Maximum 100.0
+$PreflightTinyOutputAbsoluteGiBThreshold = Resolve-DoubleRangeConfigValue -Name 'PreflightTinyOutputAbsoluteGiBThreshold' -Value $PreflightTinyOutputAbsoluteGiBThreshold -Minimum 0.1 -Maximum 100.0
+$EnableLiveSizeEstimate = Resolve-BooleanConfigValue -Name 'EnableLiveSizeEstimate' -Value $EnableLiveSizeEstimate
+$LiveEstimateStartPercent = Resolve-ConfigValue -Name 'LiveEstimateStartPercent' -Value $LiveEstimateStartPercent -Minimum 1 -Maximum 99
+$LiveEstimateSmoothingFactor = Resolve-DoubleRangeConfigValue -Name 'LiveEstimateSmoothingFactor' -Value $LiveEstimateSmoothingFactor -Minimum 0.01 -Maximum 1.0
+
+if ($PreflightAbortIfEstimatedPctOfSource -lt $PreflightWarnIfEstimatedPctOfSource) {
+    throw "PreflightAbortIfEstimatedPctOfSource must be greater than or equal to PreflightWarnIfEstimatedPctOfSource."
+}
+if ($null -ne $PreflightAutoTuneCustomTargetGiBPerHour -and $null -ne $PreflightAutoTuneCustomUpperGiBPerHour -and $PreflightAutoTuneCustomUpperGiBPerHour -lt $PreflightAutoTuneCustomTargetGiBPerHour) {
+    throw "PreflightAutoTuneCustomUpperGiBPerHour must be greater than or equal to PreflightAutoTuneCustomTargetGiBPerHour."
+}
+if ($null -ne $PreflightAutoTuneCustomTargetGiBPerHour -and $null -ne $PreflightAutoTuneCustomLowerGiBPerHour -and $PreflightAutoTuneCustomLowerGiBPerHour -gt $PreflightAutoTuneCustomTargetGiBPerHour) {
+    throw "PreflightAutoTuneCustomLowerGiBPerHour must be less than or equal to PreflightAutoTuneCustomTargetGiBPerHour."
+}
+if ($null -ne $PreflightAutoTuneCustomUpperGiBPerHour -and $null -ne $PreflightAutoTuneCustomLowerGiBPerHour -and $PreflightAutoTuneCustomUpperGiBPerHour -lt $PreflightAutoTuneCustomLowerGiBPerHour) {
+    throw "PreflightAutoTuneCustomUpperGiBPerHour must be greater than or equal to PreflightAutoTuneCustomLowerGiBPerHour."
+}
+
+$script:FfmpegBuildInfo = Test-RequiredFfmpegBuild -ExecutablePath $FfmpegPath
+
+$scriptPriorityResolution = Set-TrackedProcessPriority -Process (Get-Process -Id $PID) -PriorityName $ScriptProcessPriority
+$script:ResolvedScriptProcessPriority = $scriptPriorityResolution.AppliedPriority
+if ($scriptPriorityResolution.Warning) {
+    Write-Warning $scriptPriorityResolution.Warning
+}
 
 Update-LogSchemaIfNeeded
 
-if (-not $InputPaths -or $InputPaths.Count -eq 0) {
-    Write-Host "Drag one or more files onto the .bat launcher, or call this script with file paths." -ForegroundColor Yellow
-    exit 1
+$script:NvencEnvironment = $null
+if ($EncoderPreference -eq 'Nvidia') {
+    $script:NvencEnvironment = Get-NvencEnvironment
+    $startupTuneResolution = Resolve-NvencTune -ConfiguredNvencTune $NvencTune -NvencEnvironment $script:NvencEnvironment
+    if ($startupTuneResolution.Warning) {
+        Write-Warning $startupTuneResolution.Warning
+    }
+} elseif ($EncoderPreference -eq 'Auto') {
+    $script:NvencEnvironment = Try-Get-NvencEnvironment
+    if ($script:NvencEnvironment) {
+        $startupTuneResolution = Resolve-NvencTune -ConfiguredNvencTune $NvencTune -NvencEnvironment $script:NvencEnvironment
+        if ($startupTuneResolution.Warning) {
+            Write-Warning $startupTuneResolution.Warning
+        }
+    }
 }
 
-Add-QueueInputs -Paths $InputPaths
+Initialize-ConsoleShutdownHandling
+Initialize-TestHooks
 
 $createdNew = $false
 $mutex      = [System.Threading.Mutex]::new($false, $MutexName, [ref]$createdNew)
@@ -2778,14 +7598,56 @@ $mutex      = [System.Threading.Mutex]::new($false, $MutexName, [ref]$createdNew
 $hasLock = $false
 try {
     $hasLock = $mutex.WaitOne(0)
-    if (-not $hasLock) {
-        Write-Host "Another encode worker is already running. Files were added to queue." -ForegroundColor Yellow
-        exit 0
+    if ($hasLock) {
+        Recover-StaleQueueArtifactsForEnqueue
     }
 
-    Invoke-QueueProcessing
+    if ($InputPaths -and $InputPaths.Count -gt 0) {
+        Add-QueueInputs -Paths $InputPaths
+    }
+
+    if (-not $hasLock) {
+        if ($InputPaths -and $InputPaths.Count -gt 0) {
+            Write-Host "Another encode worker is already running. Files were added to queue." -ForegroundColor Yellow
+        } else {
+            Write-Host "Another encode worker is already running." -ForegroundColor Yellow
+        }
+        return
+    }
+
+    $pendingCount = @(Get-ChildItem -LiteralPath $QueuePendingDir -Filter *.json -File -ErrorAction SilentlyContinue).Count
+    $workingCount = @(Get-ChildItem -LiteralPath $QueueWorkingDir -Filter *.json -File -ErrorAction SilentlyContinue).Count
+    $hasInterruptedState = Test-Path -LiteralPath $StatePath
+    if ((-not $InputPaths -or $InputPaths.Count -eq 0) -and $pendingCount -eq 0 -and $workingCount -eq 0 -and -not $hasInterruptedState) {
+        Show-NoWorkToResumeMessage
+        return
+    }
+
+    Start-SessionTextLog
+    Write-SessionTextLogMessage -Level Info -Message ("Queue start: pending={0} working={1}" -f $pendingCount, $workingCount)
+    if ($script:TestAutoShutdownSeconds -gt 0) {
+        Write-SessionTextLogMessage -Level Warn -Message ("Test hook | auto shutdown after {0}s" -f $script:TestAutoShutdownSeconds)
+    }
+
+    try {
+        Invoke-QueueProcessing
+    } catch {
+        $message = $_.Exception.Message
+        $position = $_.InvocationInfo.PositionMessage
+        $stack = $_.ScriptStackTrace
+
+        Write-SessionTextLogMessage -Level Err -Message ("Unhandled queue error | {0}" -f $message)
+        if (-not [string]::IsNullOrWhiteSpace($position)) {
+            Write-SessionTextLogMessage -Level Err -Message ("Position | {0}" -f (($position -replace '\r?\n', ' | ').Trim()))
+        }
+        if (-not [string]::IsNullOrWhiteSpace($stack)) {
+            Write-SessionTextLogMessage -Level Err -Message ("Stack | {0}" -f (($stack -replace '\r?\n', ' | ').Trim()))
+        }
+        throw
+    }
 }
 finally {
+    Restore-ConsoleShutdownHandling
     if ($hasLock) { $mutex.ReleaseMutex() | Out-Null }
     $mutex.Dispose()
 }
