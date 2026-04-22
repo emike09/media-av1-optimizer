@@ -1,91 +1,69 @@
 # 🎬 Media AV1 Optimizer
 
-A queue-based, drag-and-drop AV1 encoding pipeline for video libraries.
+A queue-based AV1 encoding pipeline for video libraries with:
 
-Built for high-quality archival compression using **SVT-AV1**, with intelligent stream selection, HDR handling, source-aware Auto mode, and safe batch processing.
+- software AV1 via `libsvtav1`
+- hardware AV1 via NVIDIA `av1_nvenc`
+- source-aware Auto mode
+- queue persistence
+- live console controls
 
-If you have large Blu-ray libraries or high-bitrate video files and want to compress them using AV1, this script is for you.
+Built for large media libraries where quality, automation, and safe batch handling all matter.
 
 > Optimized for English-language media libraries.
 
 ---
 
-## ⚡ Performance
+## 🚀 Highlights
 
-- CPU: Ryzen 9 9950X3D (PBO)
-- Speed: ~1.4× realtime
-- Recommended: **16+ core CPU**
-- Average output size: **~11 GB/hour**
+- AV1 encoding with **SVT-AV1** or **NVIDIA NVENC**
+- **Auto lane selection**: CPU or Nvidia chosen per file
+- **Per-file Auto analysis** for `CRF`, `Preset`, `FilmGrain`, and `AutoCRFOffset`
+- **Concurrent workers**: CPU + multiple NVENC workers when available
+- **FFmpeg-only preflight estimation** with optional auto-retuning
+- **Auto skip** for already-efficient files
+- **Color-aware UI** with SDR / HDR / HDR10 / HDR10+ output info
+- **Interactive live controls** for workers and queue
+- **CSV logging** plus a readable per-session text log
 
 ---
 
-## 🚀 Features
+## ⚡ Software vs NVENC
 
-- 🎬 **AV1 (SVT-AV1) encoding**
-- 🧠 **Source-aware Auto mode** for `CRF`, `Preset`, `FilmGrain`, and `AutoCRFOffset`
-- 📦 **Massive space savings** (5–10× vs H.265 typical)
-- 🌈 **HDR-aware processing**
-- 🧾 **Detailed encode logging**
-- 🖥️ **Color-aware console UI** showing source/output color format
+### CPU / SVT-AV1
 
-### 🧠 Intelligent Stream Selection
+- best compression efficiency
+- best choice for difficult or high-value encodes
+- slower
 
-- Best English audio (TrueHD / DTS-HD / E-AC3 Atmos prioritized)
-- Optional fallback audio track
-- English subtitles + optional SDH
+### Nvidia / AV1 NVENC
 
-### 🧹 Automatic Cleanup
+- much faster
+- lower compression efficiency than SVT-AV1 at similar quality
+- good for throughput-friendly files
+- supports multiple concurrent workers on supported GPUs
 
-- Removes commentary tracks
-- Removes foreign audio/subtitles
-- Removes junk metadata streams
-
-### 🌈 HDR Awareness
-
-- Preserves HDR10-style signaling
-- Detects Dolby Vision and skips by default
-- Shows source/output color information in the console UI
-
-### 🤖 Auto Mode
-
-When set to `Auto`, the script evaluates each source independently using:
-
-- ffprobe bitrate fallback logic
-- frame rate and BPP analysis
-- codec and resolution tier classification
-- FFmpeg-only grain pre-scan
-- skip detection for already-efficient sources
-
-Auto mode is recalculated **per file when that file begins encoding**, including queued jobs.
-
-### 📋 Queue System
-
-- Drag-and-drop anytime
-- Sequential processing
-- Unlimited queue size
-- Each queued title gets its own fresh Auto analysis
-
-### 🔁 Safe Processing
-
-- Temp file encoding
-- Validation before replacement
-- Interrupted-job state tracking
-
-### 📝 Logging
-
-- CSV log of all encodes and skips
-- Stores resolved Auto settings and diagnostics
+The script can run either mode directly, or choose automatically per file.
 
 ---
 
 ## 🧰 Requirements
 
 - Windows
-- PowerShell 7.0+ (tested on 7.x)
-- `ffmpeg.exe` and `ffprobe.exe` from the FFmpeg suite
+- PowerShell 7+
+- full **FFmpeg 8.1** build with `ffmpeg.exe` and `ffprobe.exe`
+
+For NVENC:
+
+- NVIDIA GPU with AV1 encode support
+- current NVIDIA driver
+- `nvidia-smi` available
 
 Recommended:
+
 - place `ffmpeg.exe` and `ffprobe.exe` in the same folder as the script
+
+Older FFmpeg 6.x / 7.x and stripped/basic builds are not supported.
 
 ---
 
@@ -95,19 +73,21 @@ Recommended:
 git clone https://github.com/emike09/media-av1-optimizer.git
 ```
 
-Place `ffmpeg.exe` and `ffprobe.exe` in the same directory as the script, or ensure both are available on `PATH`.
+Place `ffmpeg.exe` and `ffprobe.exe` next to the script, or make sure both are on `PATH`.
 
 ---
 
 ## 🖱️ Usage
 
-### Drag & Drop
+### Drag and Drop
 
-Drop files onto:
+Drop one or many files onto:
 
 ```text
 Media2AV1Queue.bat
 ```
+
+You can also run the batch file with no dropped files to resume an existing queue.
 
 ### CLI
 
@@ -115,13 +95,21 @@ Media2AV1Queue.bat
 pwsh .\Media2AV1Queue.ps1 "D:\Movies\SomeMovie.mkv"
 ```
 
+Multiple files are supported:
+
+```powershell
+pwsh .\Media2AV1Queue.ps1 "D:\Movies\A.mkv" "D:\Movies\B.mkv"
+```
+
 ---
 
-## ⚙️ Configuration
+## ⚙️ Main Settings
 
-The main user settings are near the top of [Media2AV1Queue.ps1](</G:/Movies/Scripts/Media2AV1Queue.ps1>).
+The main settings are near the top of [Media2AV1Queue.ps1](</G:/Movies/Scripts/Media2AV1Queue.ps1>).
 
-These values accept either an integer or `Auto`:
+### Auto-capable Quality Settings
+
+These accept an integer or `Auto`:
 
 ```powershell
 $CRF = Auto
@@ -130,115 +118,175 @@ $FilmGrain = Auto
 $AutoCRFOffset = Auto
 ```
 
-Other important options:
+`AutoCRFOffset` only applies when `CRF = Auto`.
+
+### Encoder Selection
+
+```powershell
+$EncoderPreference = 'Auto' # Auto | CPU | Nvidia
+```
+
+- `Auto` = choose CPU or Nvidia per file
+- `CPU` = force software `libsvtav1`
+- `Nvidia` = force `av1_nvenc`
+
+### NVENC Settings
+
+```powershell
+$NvencMaxParallel = Auto
+$NvencCQ = Auto
+$NvencPreset = Auto
+$NvencDecode = Auto
+$NvencTune = 'auto'
+$NvencAllowSplitFrame = $false
+```
+
+### Preflight Settings
+
+```powershell
+$EnablePreflightEstimate = $true
+$EnablePreflightAutoTune = $true
+$EnableSecondPreflightPass = $true
+$PreflightAutoTuneQuality = 'High' # Low | Medium | High
+```
+
+- `Low` = smaller files
+- `Medium` = balanced
+- `High` = more quality-preserving
+
+### Queue / File Handling
 
 ```powershell
 $SkipDolbyVisionSources = $true
-$KeepEnglishSDH = $false
-$KeepEnglishFallbackAudio = $true
 $KeepBackupOriginal = $false
 $ReplaceOriginal = $true
+$KeepEnglishSDH = $false
+$KeepEnglishFallbackAudio = $true
 ```
 
-`AutoCRFOffset` only applies when `CRF = Auto`.
+### Process Priority
+
+```powershell
+$SoftwareEncodePriority = 'BelowNormal'
+$HardwareEncodePriority = 'Normal'
+$ScriptProcessPriority = 'Normal'
+$ApplyProcessPriority = $true
+```
+
+By default, CPU-heavy software encodes run at a lower OS priority to keep the system responsive.
+
+---
+
+## 🤖 Auto Mode
+
+Auto mode is resolved **per file when that file begins encoding**, including queued items.
+
+It uses:
+
+- ffprobe stream/format inspection
+- bitrate fallback logic
+- frame rate parsing
+- BPP analysis
+- resolution tier classification
+- codec class classification
+- FFmpeg-only grain pre-scan
+- preflight sample encodes
+
+Auto mode can resolve:
+
+- `CRF`
+- `Preset`
+- `FilmGrain`
+- `AutoCRFOffset`
+- skip decisions
+- CPU vs Nvidia lane choice
+
+Manual values still stay manual.
+
+---
+
+## 🧪 Preflight
+
+The script can run sample-based preflight encodes before the full encode starts.
+
+Preflight is used for:
+
+- projected final size
+- projected savings
+- projected GiB/hr
+- warn / skip decisions
+- Auto retuning before the real encode starts
+
+If Auto retuning is enabled, preflight can conservatively adjust:
+
+- CRF first
+- FilmGrain second
+- Preset only in limited cases
+
+The script can also run a second preflight pass when the first pass suggests the initial Auto settings need correction.
+
+---
+
+## 🚀 NVIDIA NVENC
+
+NVENC mode uses `av1_nvenc`.
+
+The script checks:
+
+- FFmpeg encoder support
+- local `av1_nvenc` options
+- NVIDIA GPU availability
+- GPU model via `nvidia-smi`
+
+It then maps the detected GPU model to a built-in NVENC engine-count table.
 
 Examples:
 
-```powershell
-$AutoCRFOffset = -2
-```
+- `RTX 4090` -> `2`
+- `RTX 4080` -> `1`
+- `RTX 4070` -> `1`
+- `RTX 4060` -> `1`
+- `RTX 5080` -> `2`
+- `RTX 5090` -> `3`
 
-- makes Auto CRF 2 steps lower quality-number / higher quality
+If the GPU is unknown, the script falls back to `1` NVENC worker and logs a warning.
 
-```powershell
-$AutoCRFOffset = 3
-```
+NVENC notes:
 
-- makes Auto CRF 3 steps higher quality-number / more aggressive compression
+- tune is only passed if supported by the local FFmpeg build
+- split-frame is disabled by default
+- film grain synthesis may be unavailable and can be forced to `0`
+- Dolby Vision is still not preserved
 
 ---
 
-## 🤖 Auto Mode Details
+## 🧠 CPU / Nvidia Lane Selection
 
-Auto mode resolves final settings before ffmpeg starts.
+When `EncoderPreference = 'Auto'`, the script chooses a lane per file.
 
-### Auto CRF
+It evaluates:
 
-Uses:
-
-- resolution tier (`SD`, `HD`, `UHD`)
-- BPP bucket (`low`, `medium`, `high`)
+- source complexity
 - SDR vs HDR
-- codec class (`legacy`, `standard`, `modern`)
+- resolution tier
+- codec efficiency
+- grain class
+- preflight results
+- current CPU / Nvidia worker availability
 
-Then applies optional `AutoCRFOffset`.
+This lets the script:
 
-### Auto Film Grain
-
-Uses:
-
-- FFmpeg-only grain pre-scan when `FilmGrain = Auto`
-- conservative fallback logic if pre-scan fails
-
-Film grain mapping:
-
-- `none` -> `0`
-- `light` -> `4`
-- `moderate` -> `8`
-- `heavy` -> `12`
-- `extreme` -> `16`
-
-### Auto Preset
-
-Preset stays intentionally simple:
-
-- `3` for harder/high-quality cases
-- `4` as the balanced default
-- `5` for lower-risk / speed-favored cases
-
-### Auto Skip
-
-Already-efficient low-bitrate sources may be skipped automatically instead of being re-encoded with avoidable generational loss.
-
-Skipped jobs are logged as:
-
-```text
-AUTO_SKIPPED_ALREADY_EFFICIENT
-```
-
----
-
-## ⚠️ Dolby Vision
-
-Dolby Vision is **not preserved** during AV1 re-encoding.
-
-By default:
-
-- DV sources are **skipped**
-
-Optional:
-
-- Allow fallback to HDR10-style output by setting:
-
-```powershell
-$SkipDolbyVisionSources = $false
-```
-
-If DV is not skipped, the output is not Dolby Vision anymore.
+- keep CPU and Nvidia busy at the same time
+- avoid weak NVENC fallbacks for bad-fit sources
+- hold difficult files for CPU when quality/compression would suffer on NVENC
 
 ---
 
 ## 🎞️ Film Grain
 
-AV1 supports **film grain synthesis**, allowing grain to be stored efficiently and reconstructed during playback instead of encoded pixel-by-pixel.
+AV1 film grain synthesis can save a lot of space on grainy material.
 
-### Manual Configuration
-
-```powershell
-$FilmGrain = 0
-```
-
-### Recommended Manual Values
+Manual examples:
 
 | Value | Use Case |
 |------:|----------|
@@ -248,91 +296,88 @@ $FilmGrain = 0
 | 15–25 | Heavy grain |
 | 25+ | Extreme / degraded sources |
 
-### Notes
+Auto mode uses:
 
-- Too low = wasted bitrate
-- Too high = artificial noise
-- Auto mode caps its default film-grain selection at `16`
+- grain pre-scan when available
+- conservative fallback logic otherwise
 
-> A 70 GB encode at `FilmGrain=0` may drop to ~20–25 GB at `FilmGrain=12` with similar perceived quality.
-
-### Film Grain Encoding Speed
-
-- Without film grain synthesis (`FilmGrain=0`), the encoder tries to preserve every grain pixel
-- With film grain synthesis (`FilmGrain > 0`), the encoder stores a compact grain model instead
-- Encoding speed can improve significantly on grain-heavy sources
+Auto film grain is capped at `16` by default.
 
 ---
 
-## 🎛️ Manual Encoding Profiles
+## 🌈 HDR / Color Handling
 
-If you prefer manual settings over Auto mode:
+The script reports both source and output color information.
 
-### 🔥 Archival Quality
+It shows:
 
-```text
-CRF: 10
-Preset: 3
-```
+- SDR / HDR / DV profile
+- 8-bit / 10-bit
+- Rec.709 / Rec.2020
+- PQ / HLG when applicable
+- HDR10 / HDR10+ labeling where detected
 
-### ⚖️ High Quality / Compression Balance
+The live UI also highlights `HDR`, `HDR10`, and `HDR10+` with rainbow coloring.
 
-```text
-CRF: 14–15
-Preset: 3
-```
-
-### ⚡ Balanced
-
-```text
-CRF: 10–12
-Preset: 4
-```
-
-### 🚀 Faster Encoding
-
-```text
-CRF: 10–12
-Preset: 5
-```
-
-### 📦 Aggressive Compression
-
-```text
-CRF: 16–18
-Preset: 4–5
-```
+Dolby Vision is not preserved in AV1 output.
 
 ---
 
-## 🖥️ Console Output
+## 🖥️ Live Console Controls
 
-Before encoding, the script prints resolved values and reasoning such as:
+During an active queue session:
 
-- `Auto CRF: 24 (HD / SDR / AVC / medium BPP)`
-- `Auto Preset: 4 (balanced default)`
-- `Auto FilmGrain: 8 (pre-scan: moderate grain)`
-- `Auto Skip: already efficient low-bitrate SDR AVC source`
+- `1-9` select a worker
+- then `p` pause worker
+- then `r` resume worker
+- then `s` stop worker
+- `q` then `p` pause queue
+- `q` then `r` resume queue
+- `q` then `c` clear pending queue
+- `x` soft-exit after active jobs finish
+- `h` toggle help overlay
 
-The live UI also shows:
+Behavior:
 
-- resolved AV1 output filename
-- source/output color format
-- profile (`SDR`, `HDR`, `DV`)
-- CRF / preset / elapsed time
-- encoded size / speed / ETA
+- pausing a worker suspends the active `ffmpeg` process in the current session
+- resuming a paused worker resumes that same process
+- stopping a worker cancels that job and moves the worker to a held state
+- resuming a held worker restarts the same job from scratch
+- queue pause stops new assignments but leaves active workers alone
+- soft exit stops new work and exits after active jobs finish
+
+All operator actions are logged.
 
 ---
 
-## 🏷️ Output Filename Behavior
+## 📋 Queue Behavior
 
-The script now rewrites common source codec tags in the filename to `AV1` for the output.
+- drag-and-drop anytime
+- add files while another session is already running
+- queue persists on disk in `.queue`
+- interrupted working items are recovered on restart
+- active session log is written to `.queue\HH-mm-yyyy-MM-dd.log`
+
+The session log is intended to be human-readable and includes:
+
+- queue additions
+- lane decisions
+- preflight decisions
+- resolved settings
+- worker actions
+- final outcomes
+
+---
+
+## 🏷️ Output Naming
+
+Output filenames replace common source codec tags with `AV1`.
 
 Examples:
 
-- `Interstellar.2014.2160p.uhd.bluray.x265.mkv` -> `Interstellar.2014.2160p.uhd.bluray.AV1.mkv`
-- `Movie.1080p.HEVC.mkv` -> `Movie.1080p.AV1.mkv`
-- `Show.S01E01.H.264.1080p.mkv` -> `Show.S01E01.AV1.1080p.mkv`
+- `Movie.x265.mkv` -> `Movie.AV1.mkv`
+- `Movie.HEVC.mkv` -> `Movie.AV1.mkv`
+- `Show.H.264.1080p.mkv` -> `Show.AV1.1080p.mkv`
 
 Handled tokens:
 
@@ -344,13 +389,11 @@ Handled tokens:
 - `H265`
 - `HEVC`
 
-If no supported codec token exists in the filename, the basename is left unchanged.
-
 ---
 
 ## 📊 Logging
 
-Log file:
+### CSV Log
 
 ```text
 .queue/encode_log.csv
@@ -361,36 +404,62 @@ Tracks:
 - source/output path
 - size reduction
 - duration
-- HDR/DV detection
-- selected streams
+- encode mode
+- resolved lane
 - resolved CRF / preset / film grain
+- resolved NVENC CQ / preset / tune / decode path
 - Auto reason
-- effective video bitrate
-- bitrate per hour
-- BPP
-- resolution tier
-- codec class
-- grain class / score
-- Auto skip status
+- preflight estimates and retuning
+- bitrate / BPP / resolution / codec / grain diagnostics
+- GPU / NVENC capacity information
+
+### Session Log
+
+```text
+.queue\HH-mm-yyyy-MM-dd.log
+```
+
+Readable text log for the active session.
 
 ---
 
-## 🧪 Tested Scenarios
+## ⚠️ Dolby Vision
+
+Dolby Vision is not preserved during AV1 re-encoding.
+
+By default:
+
+- DV sources are skipped
+
+Optional:
+
+```powershell
+$SkipDolbyVisionSources = $false
+```
+
+If disabled, the output is no longer Dolby Vision.
+
+---
+
+## 🧪 Tested / Covered Scenarios
 
 - 4K HDR remux -> AV1
-- Dolby Vision skip logic
+- SDR and HDR web encodes
 - low-bitrate sources with Auto skip
-- grain-heavy sources with FFmpeg-only grain pre-scan
-- multi-audio / multi-subtitle cluttered files
+- grain-heavy sources with grain pre-scan
+- NVENC capability detection and worker scheduling
+- CPU + Nvidia concurrent lane scheduling
+- interrupted-job recovery
+- bulk drag-and-drop queue additions
 
 ---
 
 ## 🧠 Philosophy
 
-- Visual quality over maximum compression
-- Consistency over edge-case perfection
-- Automation over manual tuning
-- Explainable heuristics over black-box tooling
+- visual quality over maximum compression
+- quality-first automation
+- explainable heuristics over black-box tuning
+- safe queue behavior over risky shortcuts
 
 ---
 
@@ -406,10 +475,10 @@ Pull requests welcome.
 
 Ideas:
 
-- DV-safe workflows
-- Auto heuristic refinement
+- QuickSync lane
+- AMD lane
+- more encode heuristics tuning
 - Linux support
-- optional scene-aware FFmpeg sampling improvements
 
 ---
 
