@@ -25,7 +25,7 @@
 #
 # Requirements:
 #   - PowerShell 7.0+  (pwsh.exe)  — ships with .NET 5+
-#   - ffmpeg / ffprobe 6.x+        — placed next to the script or on PATH
+#   - ffmpeg / ffprobe 8.x+        — placed next to the script or on PATH
 #
 # =============================================================================
 [CmdletBinding()]
@@ -38,13 +38,25 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ErrorView = 'NormalView'
 
+# Supports bare `Auto` in the config block so users can write either:
+#   $CRF = Auto
+# or
+#   $CRF = 'Auto'
+# In expression context PowerShell otherwise tries to invoke `Auto` as a
+# command before our later config validation can normalize it.
+function Auto {
+    return 'Auto'
+}
+
 # =============================================================================
 # User-configurable settings
 # =============================================================================
 
 # Encoding quality / speed
-$CRF       = 16   # SVT-AV1 CRF. Lower = better quality, larger file. Range 0-63.
-$Preset    = 3    # SVT-AV1 preset. Lower = slower encode, higher efficiency. Range 0-13.
+# Each setting accepts either an integer, bare Auto, or the string 'Auto'.
+$CRF       = Auto   # SVT-AV1 CRF. Lower = better quality, larger file. Range 0-63, or 'Auto'.
+$Preset    = Auto    # SVT-AV1 preset. Lower = slower encode, higher efficiency. Range 0-13, or 'Auto'.
+$AutoCRFOffset = Auto  # Applies only when CRF='Auto'. Integer offset added to the resolved auto CRF, or 'Auto' for 0.
 
 # Film grain synthesis
 # AV1 supports storing a compact grain model in the bitstream instead of encoding
@@ -67,17 +79,21 @@ $Preset    = 3    # SVT-AV1 preset. Lower = slower encode, higher efficiency. Ra
 #
 # This is the single highest-impact setting for oversized encodes of grain-heavy
 # content. A title that produces 70 GiB at FilmGrain=0 may produce 20-25 GiB at
-# FilmGrain=12 with identical perceptual quality on a calibrated display.
-$FilmGrain = 0    # 0 = disabled. See notes above for guidance.
+# FilmGrain=12 with identical perceptual quality on a calibrated display. 
+# Effect on encoding speed: Without film grain synthesis (FilmGrain=0), the encoder 
+#tries to preserve every grain pixel. With film grain synthesis (FilmGrain > 0), 
+#the encoder removes grain during encoding and stores a compact grain model.
+#The decoder later reconstructs this grain. Gains on encoding speed can be up to 30%. 
+$FilmGrain = Auto    # 0 = disabled. Range 0-50, or 'Auto'. See notes above for guidance.
 
 # Source handling
 $SkipDolbyVisionSources = $true    # Skip DV sources rather than silently destroying DV metadata.
 $KeepBackupOriginal     = $false   # $true  -> move original to .queue\backup_originals\ after encode.
                                    # $false -> delete original after a verified successful encode.
-$ReplaceOriginal        = $true    # Rename the finished .mkv to the original file's base name.
+$ReplaceOriginal        = $true    # Replace the source with the finished AV1-named .mkv when enabled.
 
 # Stream selection
-$KeepEnglishSDH           = $true  # Retain an SDH subtitle track alongside the main subtitle.
+$KeepEnglishSDH           = $false  # Retain an SDH subtitle track alongside the main subtitle.
 $KeepEnglishFallbackAudio = $true  # Retain a secondary lossy English audio track (e.g. stereo AAC)
                                    # when the main track is lossless. Excluded if same codec as main.
 # =============================================================================
@@ -91,6 +107,43 @@ $QueueWorkingDir = Join-Path $QueueRoot "working"
 $BackupDir       = Join-Path $QueueRoot "backup_originals"
 $LogPath         = Join-Path $QueueRoot "encode_log.csv"
 $StatePath       = Join-Path $QueueRoot "current_job.json"
+
+$LogColumns = @(
+    'Timestamp',
+    'Status',
+    'InputPath',
+    'OutputPath',
+    'SourceSizeGiB',
+    'OutputSizeGiB',
+    'ReductionPercent',
+    'SourceDurationSec',
+    'OutputDurationSec',
+    'ElapsedSec',
+    'Profile',
+    'HasHDR',
+    'HasDV',
+    'SelectedAudio',
+    'SelectedSubtitles',
+    'CRF',
+    'Preset',
+    'FilmGrain',
+    'AutoCRFOffset',
+    'ResolvedCRF',
+    'ResolvedPreset',
+    'ResolvedFilmGrain',
+    'AutoReason',
+    'BPP',
+    'EffectiveVideoBitrate',
+    'VideoBitratePerHourGiB',
+    'ResolutionTier',
+    'CodecClass',
+    'GrainClass',
+    'GrainScore',
+    'WasAutoSkipped',
+    'FfmpegPath',
+    'FfprobePath',
+    'Notes'
+)
 
 # Named mutex used to enforce single-worker execution.
 # The "Global\" prefix makes it machine-wide so it works across all console
@@ -127,7 +180,7 @@ if (-not (Test-Path -LiteralPath $FfprobePath)) {
 $null = New-Item -ItemType Directory -Force -Path $QueueRoot, $QueuePendingDir, $QueueWorkingDir, $BackupDir
 
 if (-not (Test-Path -LiteralPath $LogPath)) {
-    "Timestamp,Status,InputPath,OutputPath,SourceSizeGiB,OutputSizeGiB,ReductionPercent,SourceDurationSec,OutputDurationSec,ElapsedSec,Profile,HasHDR,HasDV,SelectedAudio,SelectedSubtitles,CRF,Preset,FilmGrain,FfmpegPath,FfprobePath,Notes" |
+    ($LogColumns -join ",") |
         Set-Content -LiteralPath $LogPath -Encoding UTF8
 }
 
@@ -146,28 +199,9 @@ function Write-LogRow {
         [hashtable]$Row
     )
 
-    $ordered = [ordered]@{
-        Timestamp         = $Row.Timestamp
-        Status            = $Row.Status
-        InputPath         = $Row.InputPath
-        OutputPath        = $Row.OutputPath
-        SourceSizeGiB     = $Row.SourceSizeGiB
-        OutputSizeGiB     = $Row.OutputSizeGiB
-        ReductionPercent  = $Row.ReductionPercent
-        SourceDurationSec = $Row.SourceDurationSec
-        OutputDurationSec = $Row.OutputDurationSec
-        ElapsedSec        = $Row.ElapsedSec
-        Profile           = $Row.Profile
-        HasHDR            = $Row.HasHDR
-        HasDV             = $Row.HasDV
-        SelectedAudio     = $Row.SelectedAudio
-        SelectedSubtitles = $Row.SelectedSubtitles
-        CRF               = $Row.CRF
-        Preset            = $Row.Preset
-        FilmGrain         = $Row.FilmGrain
-        FfmpegPath        = $Row.FfmpegPath
-        FfprobePath       = $Row.FfprobePath
-        Notes             = $Row.Notes
+    $ordered = [ordered]@{}
+    foreach ($column in $LogColumns) {
+        $ordered[$column] = if ($Row.ContainsKey($column)) { $Row[$column] } else { "" }
     }
 
     $line = ($ordered.Values | ForEach-Object {
@@ -176,6 +210,112 @@ function Write-LogRow {
     }) -join ","
 
     Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+}
+
+function Convert-ToInvariantDouble {
+    param($Value, [double]$Default = 0.0)
+    if ($null -eq $Value) { return $Default }
+
+    $parsed = 0.0
+    if ([double]::TryParse(
+            ([string]$Value),
+            [System.Globalization.NumberStyles]::Any,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref]$parsed)) {
+        return $parsed
+    }
+
+    return $Default
+}
+
+function Convert-ToInvariantInt64 {
+    param($Value, [int64]$Default = 0)
+    if ($null -eq $Value) { return $Default }
+
+    $parsed = 0L
+    if ([int64]::TryParse(
+            ([string]$Value),
+            [System.Globalization.NumberStyles]::Any,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref]$parsed)) {
+        return $parsed
+    }
+
+    return $Default
+}
+
+function Resolve-ConfigValue {
+    param(
+        [string]$Name,
+        $Value,
+        [int]$Minimum,
+        [int]$Maximum
+    )
+
+    if ($Value -is [string] -and $Value.Trim().ToLowerInvariant() -eq 'auto') {
+        return 'Auto'
+    }
+
+    $text = [string]$Value
+    $parsed = 0
+    if (-not [int]::TryParse($text, [ref]$parsed)) {
+        throw "$Name must be an integer from $Minimum to $Maximum, or 'Auto'. Current value: $Value"
+    }
+
+    if ($parsed -lt $Minimum -or $parsed -gt $Maximum) {
+        throw "$Name must be between $Minimum and $Maximum, or 'Auto'. Current value: $Value"
+    }
+
+    return $parsed
+}
+
+function Resolve-OffsetConfigValue {
+    param(
+        [string]$Name,
+        $Value
+    )
+
+    if ($Value -is [string] -and $Value.Trim().ToLowerInvariant() -eq 'auto') {
+        return 'Auto'
+    }
+
+    $text = [string]$Value
+    $parsed = 0
+    if (-not [int]::TryParse($text, [ref]$parsed)) {
+        throw "$Name must be an integer or 'Auto'. Current value: $Value"
+    }
+
+    return $parsed
+}
+
+function Update-LogSchemaIfNeeded {
+    if (-not (Test-Path -LiteralPath $LogPath)) { return }
+
+    $expectedHeader = $LogColumns -join ","
+    $currentHeader  = Get-Content -LiteralPath $LogPath -TotalCount 1 -ErrorAction SilentlyContinue
+    if ($currentHeader -eq $expectedHeader) { return }
+
+    $existingRows = @()
+    try {
+        $existingRows = @(Import-Csv -LiteralPath $LogPath)
+    } catch {
+        Write-Warning "Could not migrate existing log schema. Appending with the new schema may misalign old rows. Error: $_"
+        return
+    }
+
+    $rewritten = [System.Collections.Generic.List[string]]::new()
+    $rewritten.Add($expectedHeader)
+
+    foreach ($row in $existingRows) {
+        $values = foreach ($column in $LogColumns) {
+            $prop = $row.PSObject.Properties[$column]
+            $s = if ($null -ne $prop) { [string]$prop.Value } else { "" }
+            '"' + ($s -replace '"', '""') + '"'
+        }
+        $rewritten.Add(($values -join ","))
+    }
+
+    Set-Content -LiteralPath $LogPath -Value $rewritten -Encoding UTF8
 }
 
 # =============================================================================
@@ -357,25 +497,46 @@ function Invoke-FfprobeJson {
 #   Test-IsForced       - True if the title contains "forced" or the
 #                         disposition.forced flag is set.
 # =============================================================================
+function Get-OptionalProperty {
+    param(
+        $InputObject,
+        [string]$PropertyName,
+        $Default = $null
+    )
+
+    if ($null -eq $InputObject) { return $Default }
+
+    $prop = $InputObject.PSObject.Properties[$PropertyName]
+    if ($null -eq $prop) { return $Default }
+    if ($null -eq $prop.Value) { return $Default }
+    return $prop.Value
+}
+
+function Get-StreamTagValue {
+    param(
+        $Stream,
+        [string]$Name,
+        [string]$Default = ''
+    )
+
+    $tags = Get-OptionalProperty -InputObject $Stream -PropertyName 'tags' -Default $null
+    if ($null -eq $tags) { return $Default }
+
+    $value = Get-OptionalProperty -InputObject $tags -PropertyName $Name -Default $Default
+    if ([string]::IsNullOrWhiteSpace([string]$value)) { return $Default }
+    return [string]$value
+}
+
 function Get-StreamLanguage {
     param($Stream)
-    # Guard against streams with no tags object, or a tags object with no
-    # language key. Set-StrictMode -Version Latest throws on missing properties
-    # rather than returning $null, so we must check for the tags object first.
-    if ($null -eq $Stream.tags) { return "" }
-    $lang = $Stream.tags.PSObject.Properties['language']?.Value
+    $lang = Get-StreamTagValue -Stream $Stream -Name 'language' -Default ''
     if ([string]::IsNullOrWhiteSpace($lang)) { return "" }
     return $lang.ToLowerInvariant()
 }
 
 function Get-StreamTitle {
     param($Stream)
-    # Same guard as Get-StreamLanguage -- tags may be absent entirely, or present
-    # but without a title key. Both cases must return an empty string silently.
-    if ($null -eq $Stream.tags) { return "" }
-    $title = $Stream.tags.PSObject.Properties['title']?.Value
-    if ([string]::IsNullOrWhiteSpace($title)) { return "" }
-    return $title
+    return (Get-StreamTagValue -Stream $Stream -Name 'title' -Default '')
 }
 
 # =============================================================================
@@ -396,11 +557,357 @@ function Get-StreamTitle {
 # =============================================================================
 function Get-StreamProp {
     param($Stream, [string]$Name, $Default = $null)
-    $prop = $Stream.PSObject.Properties[$Name]
-    if ($null -eq $prop) { return $Default }
-    $val = $prop.Value
-    if ($null -eq $val)  { return $Default }
-    return $val
+    return Get-OptionalProperty -InputObject $Stream -PropertyName $Name -Default $Default
+}
+
+function Get-StreamBitRate {
+    param(
+        $Stream,
+        [double]$DurationSec = 0.0
+    )
+
+    return (Get-StreamBitrateEstimate -Stream $Stream -DurationSec $DurationSec).Bitrate
+}
+
+function Get-StreamChannels {
+    param($Stream)
+    return [int](Convert-ToInvariantInt64 (Get-StreamProp $Stream 'channels' 0) 0)
+}
+
+function Get-StreamSideDataList {
+    param($Stream)
+    $sideData = Get-StreamProp $Stream 'side_data_list' $null
+    if ($null -eq $sideData) { return ,@() }
+    return ,@($sideData)
+}
+
+function Get-StreamBitrateEstimate {
+    param(
+        $Stream,
+        [double]$DurationSec = 0.0
+    )
+
+    $streamBitrate = Convert-ToInvariantInt64 (Get-StreamProp $Stream 'bit_rate' $null) 0
+    if ($streamBitrate -gt 0) {
+        return [ordered]@{
+            Bitrate     = $streamBitrate
+            Method      = 'stream.bit_rate'
+            Approximate = $false
+            Reason      = 'Used stream.bit_rate from ffprobe.'
+        }
+    }
+
+    foreach ($tagName in @('BPS', 'BPS-eng')) {
+        $tagBitrate = Convert-ToInvariantInt64 (Get-StreamTagValue $Stream $tagName '') 0
+        if ($tagBitrate -gt 0) {
+            return [ordered]@{
+                Bitrate     = $tagBitrate
+                Method      = "stream.tags.$tagName"
+                Approximate = $false
+                Reason      = "Used stream tag $tagName from ffprobe."
+            }
+        }
+    }
+
+    if ($DurationSec -gt 0) {
+        foreach ($tagName in @('NUMBER_OF_BYTES', 'NUMBER_OF_BYTES-eng')) {
+            $numBytes = Convert-ToInvariantInt64 (Get-StreamTagValue $Stream $tagName '') 0
+            if ($numBytes -gt 0) {
+                $tagDerivedBitrate = [int64][Math]::Round(($numBytes * 8.0) / $DurationSec)
+                if ($tagDerivedBitrate -gt 0) {
+                    return [ordered]@{
+                        Bitrate     = $tagDerivedBitrate
+                        Method      = "stream.tags.$tagName/duration"
+                        Approximate = $false
+                        Reason      = "Derived bitrate from stream tag $tagName and container duration."
+                    }
+                }
+            }
+        }
+    }
+
+    return [ordered]@{
+        Bitrate     = 0
+        Method      = 'unavailable'
+        Approximate = $true
+        Reason      = 'No stream-level bitrate metadata was available.'
+    }
+}
+
+function Get-EffectiveVideoBitrate {
+    param(
+        $Probe,
+        $VideoStream,
+        [object[]]$KeptAudioStreams = @()
+    )
+
+    $format      = Get-OptionalProperty -InputObject $Probe -PropertyName 'format' -Default ([PSCustomObject]@{})
+    $durationSec = Convert-ToInvariantDouble (Get-OptionalProperty $format 'duration' 0) 0.0
+
+    $streamEstimate = Get-StreamBitrateEstimate -Stream $VideoStream -DurationSec $durationSec
+    if ($streamEstimate.Bitrate -gt 0) {
+        return [ordered]@{
+            Bitrate     = $streamEstimate.Bitrate
+            Method      = $streamEstimate.Method
+            Approximate = $streamEstimate.Approximate
+            Reason      = $streamEstimate.Reason
+        }
+    }
+
+    $formatBitrate = Convert-ToInvariantInt64 (Get-OptionalProperty $format 'bit_rate' $null) 0
+    if ($formatBitrate -le 0) {
+        return [ordered]@{
+            Bitrate     = 0
+            Method      = 'unavailable'
+            Approximate = $true
+            Reason      = 'Could not derive a usable video bitrate from ffprobe metadata.'
+        }
+    }
+
+    $audioBitrateSum = 0L
+    $audioBitrateCount = 0
+    foreach ($audioStream in @($KeptAudioStreams | Where-Object { $_ })) {
+        $audioEstimate = Get-StreamBitrateEstimate -Stream $audioStream -DurationSec $durationSec
+        if ($audioEstimate.Bitrate -gt 0) {
+            $audioBitrateSum += [int64]$audioEstimate.Bitrate
+            $audioBitrateCount++
+        }
+    }
+
+    if ($audioBitrateCount -gt 0) {
+        return [ordered]@{
+            Bitrate     = [int64][Math]::Max(1.0, $formatBitrate - $audioBitrateSum)
+            Method      = 'format.bit_rate-minus-kept-audio'
+            Approximate = $true
+            Reason      = "Used container bit_rate minus $audioBitrateCount kept audio stream bitrate estimate(s)."
+        }
+    }
+
+    return [ordered]@{
+        Bitrate     = $formatBitrate
+        Method      = 'format.bit_rate'
+        Approximate = $true
+        Reason      = 'Used container bit_rate as an approximate video bitrate because stream-level bitrate was unavailable.'
+    }
+}
+
+function Get-FrameRateValue {
+    param([string]$FrameRateText)
+    if ([string]::IsNullOrWhiteSpace($FrameRateText)) { return 0.0 }
+
+    $parts = $FrameRateText.Split('/', 2)
+    if ($parts.Count -eq 2) {
+        $num = Convert-ToInvariantDouble $parts[0] 0.0
+        $den = Convert-ToInvariantDouble $parts[1] 0.0
+        if ($num -gt 0 -and $den -gt 0) {
+            return ($num / $den)
+        }
+    }
+
+    return Convert-ToInvariantDouble $FrameRateText 0.0
+}
+
+function Get-FrameRate {
+    param($Stream)
+
+    $avg = Get-FrameRateValue -FrameRateText ([string](Get-StreamProp $Stream 'avg_frame_rate' ''))
+    if ($avg -gt 0) { return $avg }
+
+    $raw = Get-FrameRateValue -FrameRateText ([string](Get-StreamProp $Stream 'r_frame_rate' ''))
+    if ($raw -gt 0) { return $raw }
+
+    return 0.0
+}
+
+function Get-BitsPerPixelPerFrame {
+    param(
+        [double]$VideoBitrate,
+        [int]$Width,
+        [int]$Height,
+        [double]$FrameRate
+    )
+
+    if ($VideoBitrate -le 0 -or $Width -le 0 -or $Height -le 0 -or $FrameRate -le 0) {
+        return 0.0
+    }
+
+    return ($VideoBitrate / ($Width * $Height * $FrameRate))
+}
+
+function Get-ResolutionTier {
+    param([int]$Width)
+    if ($Width -lt 1280) { return 'SD' }
+    if ($Width -lt 2560) { return 'HD' }
+    return 'UHD'
+}
+
+function Get-CodecClass {
+    param($Stream)
+
+    $codec = ([string](Get-StreamProp $Stream 'codec_name' '')).ToLowerInvariant()
+    switch ($codec) {
+        { $_ -in @('mpeg2video', 'vc1', 'mpeg4', 'msmpeg4v3', 'h263', 'rv40', 'rv30') } { return 'legacy' }
+        { $_ -in @('h264', 'avc1') }                                                   { return 'standard' }
+        { $_ -in @('hevc', 'h265', 'av1', 'vp9') }                                     { return 'modern' }
+        default                                                                        { return 'standard' }
+    }
+}
+
+function Get-VideoBitratePerHourGiB {
+    param([double]$VideoBitrate)
+    if ($VideoBitrate -le 0) { return 0.0 }
+    return (($VideoBitrate * 3600.0) / 8.0 / 1GB)
+}
+
+function Get-VideoBitDepth {
+    param($Stream)
+
+    $bitsPerRawSample = Convert-ToInvariantInt64 (Get-StreamProp $Stream 'bits_per_raw_sample' $null) 0
+    if ($bitsPerRawSample -gt 0) { return [int]$bitsPerRawSample }
+
+    $pixFmt = ([string](Get-StreamProp $Stream 'pix_fmt' '')).ToLowerInvariant()
+    if ($pixFmt -match '12') { return 12 }
+    if ($pixFmt -match '10') { return 10 }
+    if ($pixFmt -match '9')  { return 9 }
+    if ($pixFmt)             { return 8 }
+
+    return 0
+}
+
+function Get-ColorPrimariesLabel {
+    param([string]$Value)
+
+    switch (($Value ?? '').ToLowerInvariant()) {
+        'bt709'     { return 'Rec.709' }
+        'bt2020'    { return 'Rec.2020' }
+        'smpte170m' { return 'Rec.601' }
+        'bt470bg'   { return 'Rec.601' }
+        default {
+            if ([string]::IsNullOrWhiteSpace($Value)) { return 'Unknown primaries' }
+            return $Value
+        }
+    }
+}
+
+function Get-TransferLabel {
+    param([string]$Value)
+
+    switch (($Value ?? '').ToLowerInvariant()) {
+        'bt709'         { return 'BT.709' }
+        'smpte2084'     { return 'PQ' }
+        'arib-std-b67'  { return 'HLG' }
+        'bt2020-10'     { return 'BT.2020 10-bit' }
+        'linear'        { return 'Linear' }
+        default {
+            if ([string]::IsNullOrWhiteSpace($Value)) { return 'Unknown transfer' }
+            return $Value
+        }
+    }
+}
+
+function Get-MatrixLabel {
+    param([string]$Value)
+
+    switch (($Value ?? '').ToLowerInvariant()) {
+        'bt709'    { return 'Rec.709' }
+        'bt2020nc' { return 'Rec.2020 NC' }
+        'bt2020c'  { return 'Rec.2020 C' }
+        'smpte170m'{ return 'Rec.601' }
+        'bt470bg'  { return 'Rec.601' }
+        default {
+            if ([string]::IsNullOrWhiteSpace($Value)) { return 'Unknown matrix' }
+            return $Value
+        }
+    }
+}
+
+function Get-ColorSummary {
+    param(
+        [int]$BitDepth,
+        [string]$DynamicRangeLabel,
+        [string]$PrimariesLabel,
+        [string]$TransferLabel
+    )
+
+    $depthLabel = if ($BitDepth -gt 0) { "$BitDepth-bit" } else { 'Unknown bit depth' }
+    return "$depthLabel | $DynamicRangeLabel | $PrimariesLabel / $TransferLabel"
+}
+
+function Get-EncodeColorProfile {
+    param($SourceProfile)
+
+    $encodeBitDepth = 10
+    if ($SourceProfile.HasHDR) {
+        $encodeDynamicRange = 'HDR10'
+        $encodePrimaries = 'Rec.2020'
+        $encodeTransfer = 'PQ'
+        $encodeMatrix = 'Rec.2020 NC'
+        $note = if ($SourceProfile.SourceHdrFormat -eq 'HDR10+') {
+            'Source HDR10+ dynamic metadata is not preserved; encode is labeled HDR10.'
+        } elseif ($SourceProfile.SourceHdrFormat -eq 'HLG') {
+            'Current encode path tags HLG sources as PQ/HDR10 for AV1 output.'
+        } elseif ($SourceProfile.Profile -eq 'DV') {
+            'Dolby Vision metadata is not preserved by this AV1 encode path.'
+        } else {
+            ''
+        }
+    } else {
+        $encodeDynamicRange = 'SDR'
+        $encodePrimaries = if ($SourceProfile.SourcePrimariesLabel -and $SourceProfile.SourcePrimariesLabel -ne 'Unknown primaries') {
+            $SourceProfile.SourcePrimariesLabel
+        } else {
+            'Rec.709'
+        }
+        $encodeTransfer = if ($SourceProfile.SourceTransferLabel -and $SourceProfile.SourceTransferLabel -ne 'Unknown transfer') {
+            $SourceProfile.SourceTransferLabel
+        } else {
+            'BT.709'
+        }
+        $encodeMatrix = if ($SourceProfile.SourceMatrixLabel -and $SourceProfile.SourceMatrixLabel -ne 'Unknown matrix') {
+            $SourceProfile.SourceMatrixLabel
+        } else {
+            'Rec.709'
+        }
+        $note = ''
+    }
+
+    return [ordered]@{
+        BitDepth           = $encodeBitDepth
+        DynamicRangeLabel  = $encodeDynamicRange
+        PrimariesLabel     = $encodePrimaries
+        TransferLabel      = $encodeTransfer
+        MatrixLabel        = $encodeMatrix
+        Summary            = Get-ColorSummary -BitDepth $encodeBitDepth -DynamicRangeLabel $encodeDynamicRange -PrimariesLabel $encodePrimaries -TransferLabel $encodeTransfer
+        Note               = $note
+    }
+}
+
+function Get-BppTier {
+    param([double]$Bpp)
+
+    if ($Bpp -le 0)      { return 'unknown' }
+    if ($Bpp -lt 0.06)   { return 'low' }
+    if ($Bpp -le 0.15)   { return 'medium' }
+    return 'high'
+}
+
+function Get-CodecLabel {
+    param($Stream)
+
+    $codec = ([string](Get-StreamProp $Stream 'codec_name' '')).ToLowerInvariant()
+    switch ($codec) {
+        'h264'       { return 'AVC' }
+        'avc1'       { return 'AVC' }
+        'hevc'       { return 'HEVC' }
+        'h265'       { return 'HEVC' }
+        'av1'        { return 'AV1' }
+        'mpeg2video' { return 'MPEG-2' }
+        'vc1'        { return 'VC-1' }
+        default {
+            if ([string]::IsNullOrWhiteSpace($codec)) { return 'Unknown' }
+            return $codec.ToUpperInvariant()
+        }
+    }
 }
 
 function Test-IsEnglish {
@@ -460,7 +967,7 @@ function Get-AudioRank {
 
     $codec    = (Get-StreamProp $Stream 'codec_name' '').ToLowerInvariant()
     $title    = (Get-StreamTitle -Stream $Stream).ToLowerInvariant()
-    $channels = [int](Get-StreamProp $Stream 'channels' 0)
+    $channels = Get-StreamChannels -Stream $Stream
 
     if ($codec -eq 'truehd' -or $title -match 'atmos')                   { return 1000 + $channels }
     if ($codec -eq 'dts'    -and $title -match 'dts-hd ma|master audio') { return  900 + $channels }
@@ -673,9 +1180,22 @@ function Get-SourceProfile {
     }
 
     $hasHDR   = $false
+    $hasHDR10Plus = $false
     $transfer  = [string](Get-StreamProp $VideoStream 'color_transfer'  '')
     $primaries = [string](Get-StreamProp $VideoStream 'color_primaries' '')
     $matrix    = [string](Get-StreamProp $VideoStream 'color_space'     '')
+    $bitDepth  = Get-VideoBitDepth -Stream $VideoStream
+
+    $videoSideData = Get-StreamSideDataList -Stream $VideoStream
+    if ($videoSideData.Count -gt 0) {
+        foreach ($sd in $videoSideData) {
+            $sideDataType = [string](Get-StreamProp $sd 'side_data_type' '')
+            if ($sideDataType -match 'HDR10\+|SMPTE2094-40|Dynamic HDR') {
+                $hasHDR10Plus = $true
+                break
+            }
+        }
+    }
 
     if ($transfer  -match 'smpte2084|arib-std-b67|bt2020-10' -or
         $primaries -match 'bt2020' -or
@@ -683,40 +1203,478 @@ function Get-SourceProfile {
         $hasHDR = $true
     }
 
+    $sourceHdrFormat = if ($hasDV) {
+        'Dolby Vision'
+    } elseif ($transfer -match 'arib-std-b67') {
+        'HLG'
+    } elseif ($hasHDR10Plus) {
+        'HDR10+'
+    } elseif ($transfer -match 'smpte2084|bt2020-10' -or $hasHDR) {
+        'HDR10'
+    } else {
+        'SDR'
+    }
+
     $profile = if ($hasDV) { "DV" } elseif ($hasHDR) { "HDR" } else { "SDR" }
+    $sourcePrimariesLabel = Get-ColorPrimariesLabel -Value $primaries
+    $sourceTransferLabel = Get-TransferLabel -Value $transfer
+    $sourceMatrixLabel = Get-MatrixLabel -Value $matrix
 
     return [ordered]@{
-        HasDV   = $hasDV
-        HasHDR  = $hasHDR
-        Profile = $profile
+        HasDV               = $hasDV
+        HasHDR              = $hasHDR
+        HasHDR10Plus        = $hasHDR10Plus
+        Profile             = $profile
+        SourceHdrFormat     = $sourceHdrFormat
+        SourceBitDepth      = $bitDepth
+        SourcePrimaries     = $primaries
+        SourceTransfer      = $transfer
+        SourceMatrix        = $matrix
+        SourcePrimariesLabel= $sourcePrimariesLabel
+        SourceTransferLabel = $sourceTransferLabel
+        SourceMatrixLabel   = $sourceMatrixLabel
+        SourceColorSummary  = Get-ColorSummary -BitDepth $bitDepth -DynamicRangeLabel $sourceHdrFormat -PrimariesLabel $sourcePrimariesLabel -TransferLabel $sourceTransferLabel
+    }
+}
+
+function Test-ShouldRunGrainPreScan {
+    param(
+        [double]$DurationSec,
+        [double]$Bpp,
+        [double]$VideoBitratePerHourGiB,
+        [string]$ResolutionTier,
+        [string]$CodecClass
+    )
+
+    if ($DurationSec -le 0) {
+        return [ordered]@{ ShouldRun = $false; Reason = 'pre-scan skipped: source duration unavailable' }
+    }
+
+    if ($Bpp -gt 0 -and $Bpp -lt 0.03 -and $VideoBitratePerHourGiB -gt 0 -and $VideoBitratePerHourGiB -lt 3.5) {
+        return [ordered]@{ ShouldRun = $false; Reason = 'pre-scan skipped: source already looks heavily bitrate-constrained' }
+    }
+
+    if ($ResolutionTier -eq 'SD' -and $VideoBitratePerHourGiB -gt 0 -and $VideoBitratePerHourGiB -lt 3.0 -and $CodecClass -ne 'legacy') {
+        return [ordered]@{ ShouldRun = $false; Reason = 'pre-scan skipped: low-density SD source is unlikely to benefit' }
+    }
+
+    return [ordered]@{ ShouldRun = $true; Reason = 'pre-scan sampled denoise-vs-original differences across the runtime' }
+}
+
+function Get-FallbackAutoFilmGrain {
+    param(
+        [string]$ResolutionTier,
+        [string]$Profile,
+        [string]$CodecClass,
+        [string]$BppTier,
+        [double]$Bpp,
+        [double]$VideoBitratePerHourGiB,
+        [int]$BitDepth
+    )
+
+    if (($Bpp -gt 0 -and $Bpp -lt 0.05) -or ($VideoBitratePerHourGiB -gt 0 -and $VideoBitratePerHourGiB -lt 4.0)) {
+        return [ordered]@{
+            FilmGrain = 0
+            GrainClass = 'none'
+            GrainScore = 0.0
+            Reason = 'Auto fallback: bitrate-density is already low, so preserve bits for structure instead of synthesized grain.'
+        }
+    }
+
+    if ($Profile -eq 'HDR' -and $CodecClass -eq 'modern') {
+        return [ordered]@{
+            FilmGrain = $(if ($BppTier -eq 'high') { 4 } else { 0 })
+            GrainClass = $(if ($BppTier -eq 'high') { 'light' } else { 'none' })
+            GrainScore = $(if ($BppTier -eq 'high') { 10.0 } else { 0.0 })
+            Reason = 'Auto fallback: modern HDR source assumed mostly clean unless pre-scan proves otherwise.'
+        }
+    }
+
+    if ($CodecClass -eq 'legacy' -and $BppTier -eq 'high') {
+        return [ordered]@{
+            FilmGrain = 12
+            GrainClass = 'heavy'
+            GrainScore = 32.0
+            Reason = 'Auto fallback: legacy high-density source is likely preserving visible film grain.'
+        }
+    }
+
+    if ($BppTier -eq 'high') {
+        return [ordered]@{
+            FilmGrain = 8
+            GrainClass = 'moderate'
+            GrainScore = 20.0
+            Reason = 'Auto fallback: high BPP suggests enough retained texture to preserve moderate grain.'
+        }
+    }
+
+    if ($BppTier -eq 'medium') {
+        return [ordered]@{
+            FilmGrain = $(if ($ResolutionTier -eq 'UHD' -or $BitDepth -ge 10) { 4 } else { 8 })
+            GrainClass = $(if ($ResolutionTier -eq 'UHD' -or $BitDepth -ge 10) { 'light' } else { 'moderate' })
+            GrainScore = $(if ($ResolutionTier -eq 'UHD' -or $BitDepth -ge 10) { 12.0 } else { 18.0 })
+            Reason = 'Auto fallback: medium BPP keeps grain conservative without assuming a heavy film transfer.'
+        }
+    }
+
+    return [ordered]@{
+        FilmGrain = 0
+        GrainClass = 'none'
+        GrainScore = 0.0
+        Reason = 'Auto fallback: no strong signal for retained grain.'
+    }
+}
+
+function Invoke-GrainPreScan {
+    param(
+        [string]$InputPath,
+        $VideoStream,
+        [double]$DurationSec
+    )
+
+    if ($DurationSec -le 0) {
+        return [ordered]@{
+            Success    = $false
+            GrainScore = 0.0
+            GrainClass = 'unknown'
+            Reason     = 'Grain pre-scan skipped: source duration unavailable.'
+        }
+    }
+
+    $videoIndex = [int](Get-StreamProp $VideoStream 'index' 0)
+    $sampleFractions = @(0.15, 0.28, 0.41, 0.54, 0.67, 0.80)
+    $sampleDuration = 2.0
+    $positions = [System.Collections.Generic.List[double]]::new()
+
+    foreach ($fraction in $sampleFractions) {
+        $startSec = ($DurationSec * $fraction) - ($sampleDuration / 2.0)
+        $positions.Add([Math]::Max(0.0, [Math]::Min($startSec, [Math]::Max(0.0, $DurationSec - $sampleDuration))))
+    }
+
+    $ssimValues = [System.Collections.Generic.List[double]]::new()
+    foreach ($position in $positions) {
+        $scanArgs = @(
+            '-hide_banner',
+            '-nostats',
+            '-v', 'info',
+            '-ss', ('{0:F3}' -f $position),
+            '-t', ('{0:F3}' -f $sampleDuration),
+            '-i', $InputPath,
+            '-filter_complex', "[0:$videoIndex]scale=640:-2:flags=bicubic,format=gray,split=2[src][den];[den]hqdn3d=1.5:1.5:6:6[denoised];[src][denoised]ssim",
+            '-an',
+            '-sn',
+            '-dn',
+            '-f', 'null',
+            'NUL'
+        )
+
+        $scanOutput = & $FfmpegPath @scanArgs 2>&1 | Out-String
+        $matches = [System.Text.RegularExpressions.Regex]::Matches($scanOutput, 'All:([0-9]+\.[0-9]+)')
+        if ($matches.Count -gt 0) {
+            $lastValue = Convert-ToInvariantDouble $matches[$matches.Count - 1].Groups[1].Value 0.0
+            if ($lastValue -gt 0) {
+                $ssimValues.Add($lastValue)
+            }
+        }
+    }
+
+    if ($ssimValues.Count -eq 0) {
+        return [ordered]@{
+            Success    = $false
+            GrainScore = 0.0
+            GrainClass = 'unknown'
+            Reason     = 'Grain pre-scan could not extract SSIM measurements; falling back to conservative heuristics.'
+        }
+    }
+
+    $avgSsim = ($ssimValues | Measure-Object -Average).Average
+    $grainScore = [Math]::Round([Math]::Min(100.0, [Math]::Max(0.0, (1.0 - $avgSsim) * 1000.0)), 2)
+
+    $grainClass = if     ($grainScore -lt 3.0)  { 'none' }
+                  elseif ($grainScore -lt 8.0)  { 'light' }
+                  elseif ($grainScore -lt 18.0) { 'moderate' }
+                  elseif ($grainScore -lt 30.0) { 'heavy' }
+                  else                          { 'extreme' }
+
+    return [ordered]@{
+        Success    = $true
+        GrainScore = $grainScore
+        GrainClass = $grainClass
+        Reason     = "Grain pre-scan: 6 x 2s samples, average SSIM after mild denoise = $([Math]::Round($avgSsim, 5))."
+    }
+}
+
+function Get-AutoEncodeSettings {
+    param(
+        $Probe,
+        $VideoStream,
+        $SourceProfile,
+        [object[]]$KeptAudioStreams = @(),
+        [string]$InputPath,
+        $ConfiguredCRF,
+        $ConfiguredPreset,
+        $ConfiguredFilmGrain,
+        $ConfiguredAutoCRFOffset
+    )
+
+    $format = Get-OptionalProperty -InputObject $Probe -PropertyName 'format' -Default ([PSCustomObject]@{})
+    $durationSec = Convert-ToInvariantDouble (Get-OptionalProperty $format 'duration' 0) 0.0
+    $width = [int](Get-StreamProp $VideoStream 'width' 0)
+    $height = [int](Get-StreamProp $VideoStream 'height' 0)
+    $frameRate = Get-FrameRate -Stream $VideoStream
+    $bitDepth = Get-VideoBitDepth -Stream $VideoStream
+    $resolutionTier = Get-ResolutionTier -Width $width
+    $codecClass = Get-CodecClass -Stream $VideoStream
+    $codecLabel = Get-CodecLabel -Stream $VideoStream
+    $dynamicRangeClass = if ($SourceProfile.Profile -in @('HDR', 'DV')) { 'HDR' } else { 'SDR' }
+    $bitrateInfo = Get-EffectiveVideoBitrate -Probe $Probe -VideoStream $VideoStream -KeptAudioStreams $KeptAudioStreams
+    $videoBitrate = [double]$bitrateInfo.Bitrate
+    $bpp = Get-BitsPerPixelPerFrame -VideoBitrate $videoBitrate -Width $width -Height $height -FrameRate $frameRate
+    $bppTier = Get-BppTier -Bpp $bpp
+    $bitratePerHourGiB = Get-VideoBitratePerHourGiB -VideoBitrate $videoBitrate
+
+    $autoEnabled = ($ConfiguredCRF -eq 'Auto' -or $ConfiguredPreset -eq 'Auto' -or $ConfiguredFilmGrain -eq 'Auto')
+    $autoSkipAllowed = ($ConfiguredCRF -eq 'Auto')
+    $manualReason = ''
+    $configuredOffsetValue = if ($ConfiguredAutoCRFOffset -eq 'Auto') { 0 } else { [int]$ConfiguredAutoCRFOffset }
+    $appliedAutoCRFOffset = 0
+
+    $grainResult = $null
+    if ($ConfiguredFilmGrain -eq 'Auto') {
+        $preScanDecision = Test-ShouldRunGrainPreScan `
+            -DurationSec $durationSec `
+            -Bpp $bpp `
+            -VideoBitratePerHourGiB $bitratePerHourGiB `
+            -ResolutionTier $resolutionTier `
+            -CodecClass $codecClass
+
+        if ($preScanDecision.ShouldRun) {
+            try {
+                $grainResult = Invoke-GrainPreScan -InputPath $InputPath -VideoStream $VideoStream -DurationSec $durationSec
+            } catch {
+                $grainResult = [ordered]@{
+                    Success    = $false
+                    GrainScore = 0.0
+                    GrainClass = 'unknown'
+                    Reason     = "Grain pre-scan failed: $($_.Exception.Message)"
+                }
+            }
+        } else {
+            $grainResult = [ordered]@{
+                Success    = $false
+                GrainScore = 0.0
+                GrainClass = 'unknown'
+                Reason     = $preScanDecision.Reason
+            }
+        }
+    }
+
+    $fallbackGrain = Get-FallbackAutoFilmGrain `
+        -ResolutionTier $resolutionTier `
+        -Profile $dynamicRangeClass `
+        -CodecClass $codecClass `
+        -BppTier $bppTier `
+        -Bpp $bpp `
+        -VideoBitratePerHourGiB $bitratePerHourGiB `
+        -BitDepth $bitDepth
+
+    $grainClass = $fallbackGrain.GrainClass
+    $grainScore = $fallbackGrain.GrainScore
+    $filmGrainReason = $fallbackGrain.Reason
+    $resolvedFilmGrain = if ($ConfiguredFilmGrain -eq 'Auto') { 0 } else { [int]$ConfiguredFilmGrain }
+
+    if ($ConfiguredFilmGrain -eq 'Auto') {
+        if ($grainResult -and $grainResult.Success) {
+            $grainClass = $grainResult.GrainClass
+            $grainScore = $grainResult.GrainScore
+            $resolvedFilmGrain = switch ($grainClass) {
+                'none'     { 0 }
+                'light'    { 4 }
+                'moderate' { 8 }
+                'heavy'    { 12 }
+                'extreme'  { 16 }
+                default    { 0 }
+            }
+            $filmGrainReason = "$($grainResult.Reason) Class=$grainClass."
+        } else {
+            $resolvedFilmGrain = [int]$fallbackGrain.FilmGrain
+            if ($grainResult) {
+                $filmGrainReason = "$($grainResult.Reason) $($fallbackGrain.Reason)"
+            }
+        }
+    }
+
+    $shouldSkip = $false
+    $skipReason = ''
+    if ($autoEnabled -and $autoSkipAllowed) {
+        $grainHeavy = $grainClass -in @('heavy', 'extreme')
+        if (($codecClass -in @('standard', 'modern')) -and
+            $SourceProfile.Profile -eq 'SDR' -and
+            $bpp -gt 0 -and $bpp -lt 0.055 -and
+            $bitratePerHourGiB -gt 0 -and $bitratePerHourGiB -lt 8.0 -and
+            -not ($resolutionTier -eq 'UHD' -and $SourceProfile.HasHDR) -and
+            -not $grainHeavy) {
+            $shouldSkip = $true
+            $skipReason = "Auto skip: already efficient $resolutionTier $($SourceProfile.Profile) $codecLabel source (BPP $([Math]::Round($bpp, 4)), $([Math]::Round($bitratePerHourGiB, 2)) GiB/hr video)."
+        }
+    }
+
+    $resolvedCrf = if ($ConfiguredCRF -eq 'Auto') { 0 } else { [int]$ConfiguredCRF }
+    $baseAutoCrf = $resolvedCrf
+    $crfReason = "Manual: using configured CRF $ConfiguredCRF."
+    if ($ConfiguredCRF -ne 'Auto' -and $ConfiguredAutoCRFOffset -ne 'Auto') {
+        $crfReason += ' Auto CRF offset ignored because CRF is manual.'
+    }
+    if ($ConfiguredCRF -eq 'Auto') {
+        $crfMatrix = @{
+            'SD'  = @{ SDR = 28; HDR = 26 }
+            'HD'  = @{
+                SDR = @{ low = 26; medium = 24; high = 22; unknown = 24 }
+                HDR = @{ low = 22; medium = 20; high = 18; unknown = 20 }
+            }
+            'UHD' = @{
+                SDR = @{ low = 20; medium = 18; high = 16; unknown = 18 }
+                HDR = @{ low = 16; medium = 14; high = 12; unknown = 14 }
+            }
+        }
+
+        $profileKey = $dynamicRangeClass
+        if ($resolutionTier -eq 'SD') {
+            $baseCrf = $crfMatrix['SD'][$profileKey]
+        } else {
+            $baseCrf = $crfMatrix[$resolutionTier][$profileKey][$bppTier]
+        }
+
+        $codecAdjustment = switch ($codecClass) {
+            'legacy' { 2 }
+            'modern' { -1 }
+            default  { 0 }
+        }
+
+        $baseAutoCrf = [Math]::Max(0, [Math]::Min(63, ($baseCrf + $codecAdjustment)))
+        $resolvedCrf = $baseAutoCrf
+        if ($ConfiguredAutoCRFOffset -ne 'Auto') {
+            $appliedAutoCRFOffset = $configuredOffsetValue
+            $resolvedCrf = [Math]::Max(0, [Math]::Min(63, ($resolvedCrf + $appliedAutoCRFOffset)))
+        }
+
+        $crfReason = "Auto: $resolutionTier / $($SourceProfile.Profile) / $codecLabel / $bppTier BPP"
+        if ($bitrateInfo.Approximate) {
+            $crfReason += " / approximate bitrate source $($bitrateInfo.Method)"
+        } else {
+            $crfReason += " / bitrate source $($bitrateInfo.Method)"
+        }
+        if ($appliedAutoCRFOffset -ne 0) {
+            $crfReason += " / offset $(if ($appliedAutoCRFOffset -gt 0) { '+' } else { '' })$appliedAutoCRFOffset"
+        }
+        $crfReason += '.'
+    }
+
+    $resolvedPreset = if ($ConfiguredPreset -eq 'Auto') { 4 } else { [int]$ConfiguredPreset }
+    $presetReason = "Manual: using configured preset $ConfiguredPreset."
+    if ($ConfiguredPreset -eq 'Auto') {
+        if (($resolutionTier -eq 'UHD' -and $dynamicRangeClass -eq 'HDR') -or
+            ($codecClass -eq 'modern' -and $bppTier -eq 'high') -or
+            ($grainClass -in @('heavy', 'extreme'))) {
+            $resolvedPreset = 3
+            $presetReason = 'Auto: slower preset for UHD HDR, modern high-density, or heavy-grain sources.'
+        } elseif (($resolutionTier -in @('SD', 'HD')) -and ($bppTier -in @('low', 'medium', 'unknown')) -and $dynamicRangeClass -ne 'HDR') {
+            if ($grainClass -in @('none', 'light', 'unknown')) {
+                $resolvedPreset = 5
+                $presetReason = 'Auto: faster preset for SDR SD/HD sources with low-to-moderate compression difficulty and little grain.'
+            } else {
+                $resolvedPreset = 4
+                $presetReason = 'Auto: balanced preset retained because grain argues against the fast path.'
+            }
+        } else {
+            $resolvedPreset = 4
+            $presetReason = 'Auto: balanced default preset.'
+        }
+    }
+
+    if ($ConfiguredFilmGrain -ne 'Auto') {
+        $filmGrainReason = "Manual: using configured film grain $ConfiguredFilmGrain."
+    }
+
+    if (-not $autoEnabled) {
+        $manualReason = 'Manual mode: no Auto settings were enabled.'
+    }
+
+    $summaryParts = [System.Collections.Generic.List[string]]::new()
+    if ($ConfiguredCRF -eq 'Auto')       { $summaryParts.Add("CRF $resolvedCrf ($crfReason)") }
+    if ($ConfiguredPreset -eq 'Auto')    { $summaryParts.Add("Preset $resolvedPreset ($presetReason)") }
+    if ($ConfiguredFilmGrain -eq 'Auto') { $summaryParts.Add("FilmGrain $resolvedFilmGrain ($filmGrainReason)") }
+    if ($ConfiguredCRF -ne 'Auto' -and $ConfiguredAutoCRFOffset -ne 'Auto') {
+        $summaryParts.Add('Auto CRF offset ignored because CRF is manual.')
+    }
+    if ($shouldSkip)                     { $summaryParts.Add($skipReason) }
+    if (-not $autoEnabled)               { $summaryParts.Add($manualReason) }
+
+    return [ordered]@{
+        Skip                   = $shouldSkip
+        SkipReason             = $skipReason
+        CRF                    = $resolvedCrf
+        BaseAutoCRF            = $baseAutoCrf
+        AutoCRFOffset          = $appliedAutoCRFOffset
+        CRFReason              = $crfReason
+        Preset                 = $resolvedPreset
+        PresetReason           = $presetReason
+        FilmGrain              = $resolvedFilmGrain
+        FilmGrainReason        = $filmGrainReason
+        Reason                 = ($summaryParts -join ' | ')
+        ResolutionTier         = $resolutionTier
+        BPP                    = $bpp
+        BPPTier                = $bppTier
+        CodecClass             = $codecClass
+        CodecLabel             = $codecLabel
+        VideoBitrate           = [int64]$videoBitrate
+        VideoBitratePerHourGiB = $bitratePerHourGiB
+        BitrateMethod          = $bitrateInfo.Method
+        BitrateReason          = $bitrateInfo.Reason
+        GrainClass             = $grainClass
+        GrainScore             = $grainScore
+        GrainPreScan           = $grainResult
+        FrameRate              = $frameRate
+        BitDepth               = $bitDepth
     }
 }
 
 # =============================================================================
 # FUNCTION GROUP: Output path helpers
 #
+#   Convert-CodecTagToAv1Name - Rewrites common source codec tokens in the
+#                               basename to AV1 (x264/x265/H.264/H.265/H264/
+#                               H265/HEVC -> AV1). If no codec token is found,
+#                               the basename is left unchanged.
+#
 #   Get-TempOutputPath  - Returns the path for the in-progress encode output.
-#                         Named <basename>.encoding.tmp.mkv in the source
+#                         Named <av1-basename>.encoding.tmp.mkv in the source
 #                         directory. Using a distinct temp name means a partial
 #                         file is never mistaken for a complete encode.
 #
 #   Get-FinalOutputPath - Returns the intended final output path.
-#                         Named <basename>.mkv in the source directory.
-#                         When the source is already an MKV this resolves to
-#                         the same path as the source; the original is deleted
-#                         or moved before the temp file is renamed into place.
+#                         Named <av1-basename>.mkv in the source directory.
+#                         If no source codec token exists in the filename, the
+#                         basename is preserved as-is.
 # =============================================================================
+function Convert-CodecTagToAv1Name {
+    param([string]$BaseName)
+
+    $codecTokenPattern = '(?i)(?<=^|[._\-\s\[\]\(\)])(?:x264|x265|h264|h265|h\.264|h\.265|hevc)(?=$|[._\-\s\[\]\(\)])'
+    return [System.Text.RegularExpressions.Regex]::Replace($BaseName, $codecTokenPattern, 'AV1')
+}
+
 function Get-TempOutputPath {
     param([string]$InputPath)
     $dir  = Split-Path -Path $InputPath -Parent
-    $name = [System.IO.Path]::GetFileNameWithoutExtension($InputPath)
+    $name = Convert-CodecTagToAv1Name -BaseName ([System.IO.Path]::GetFileNameWithoutExtension($InputPath))
     return Join-Path $dir ($name + ".encoding.tmp.mkv")
 }
 
 function Get-FinalOutputPath {
     param([string]$InputPath)
     $dir  = Split-Path -Path $InputPath -Parent
-    $name = [System.IO.Path]::GetFileNameWithoutExtension($InputPath)
+    $name = Convert-CodecTagToAv1Name -BaseName ([System.IO.Path]::GetFileNameWithoutExtension($InputPath))
     return Join-Path $dir ($name + ".mkv")
 }
 
@@ -900,6 +1858,9 @@ function Write-ProgressUI {
     param(
         [string] $FileName,
         [string] $Profile,
+        [string] $EncodeColorLabel,
+        [string] $CRFLabel,
+        [string] $PresetLabel,
         [double] $SourceDurationSec,
         [double] $ElapsedSec,
         [double] $OutTimeSec   = 0,
@@ -944,6 +1905,11 @@ function Write-ProgressUI {
     $cTitle   = "${ESC}[1;97m"       # bold white   -- section headings
     $cFile    = "${ESC}[1;96m"       # bold cyan    -- filename
     $cMeta    = "${ESC}[38;5;250m"   # light grey   -- CRF / preset / elapsed
+    $cColor   = switch ($Profile) {
+        'DV'  { "${ESC}[1;95m" }
+        'HDR' { "${ESC}[1;93m" }
+        default { "${ESC}[38;5;117m" }
+    }
     $cBarDone = "${ESC}[38;5;76m"    # green        -- filled bar blocks
     $cBarTodo = "${ESC}[38;5;238m"   # dark grey    -- empty bar blocks
     $cPct     = "${ESC}[1;92m"       # bright green -- percentage label
@@ -992,8 +1958,8 @@ function Write-ProgressUI {
     $lines = [System.Collections.Generic.List[string]]::new()
     $lines.Add($topBorder)
     $lines.Add((Row (Limit-String $FileName $inner) $cFile))
-    $lines.Add((Row "$Profile  |  CRF $CRF  |  Preset $Preset  |  $elapsStr elapsed" $cMeta))
-    $lines.Add((BlankRow))
+    $lines.Add((Row "$Profile  |  $EncodeColorLabel" $cColor))
+    $lines.Add((Row "CRF $CRFLabel  |  Preset $PresetLabel  |  $elapsStr elapsed" $cMeta))
     $lines.Add($barRow)
     $lines.Add((Row "Encoded: $sizeStr   Speed: $speedStr   ETA: $eta" $cStats))
 
@@ -1085,6 +2051,13 @@ function Invoke-EncodeJob {
     $probe         = Invoke-FfprobeJson -InputPath $InputPath
     $selected      = Select-Streams     -Probe $probe
     $sourceProfile = Get-SourceProfile  -Probe $probe -VideoStream $selected.Video
+    $encodeColorProfile = Get-EncodeColorProfile -SourceProfile $sourceProfile
+    $sourceFormat  = Get-OptionalProperty -InputObject $probe -PropertyName 'format' -Default ([PSCustomObject]@{})
+    $sourceDuration = Convert-ToInvariantDouble (Get-OptionalProperty $sourceFormat 'duration' 0) 0.0
+    $sourceResolutionTier = Get-ResolutionTier -Width ([int](Get-StreamProp $selected.Video 'width' 0))
+    $sourceCodecClass = Get-CodecClass -Stream $selected.Video
+    $selectedAudioSummary = Format-StreamSummary -Streams @($selected.MainAudio, $selected.FallbackAudio)
+    $selectedSubtitleSummary = Format-StreamSummary -Streams @($selected.MainSub, $selected.SdhSub)
 
     if ($sourceProfile.HasDV -and $SkipDolbyVisionSources) {
         Write-Warning "Skipping Dolby Vision source (preserve manually): $InputPath"
@@ -1098,17 +2071,30 @@ function Invoke-EncodeJob {
             SourceSizeGiB     = $sourceSizeGiB
             OutputSizeGiB     = ""
             ReductionPercent  = ""
-            SourceDurationSec = [double](Get-StreamProp (Get-StreamProp $probe 'format' ([PSCustomObject]@{})) 'duration' 0)
+            SourceDurationSec = $sourceDuration
             OutputDurationSec = ""
             ElapsedSec        = [Math]::Round($stopwatch.Elapsed.TotalSeconds, 2)
             Profile           = $sourceProfile.Profile
             HasHDR            = $sourceProfile.HasHDR
             HasDV             = $sourceProfile.HasDV
-            SelectedAudio     = Format-StreamSummary -Streams @($selected.MainAudio, $selected.FallbackAudio)
-            SelectedSubtitles = Format-StreamSummary -Streams @($selected.MainSub, $selected.SdhSub)
+            SelectedAudio     = $selectedAudioSummary
+            SelectedSubtitles = $selectedSubtitleSummary
             CRF               = $CRF
             Preset            = $Preset
             FilmGrain         = $FilmGrain
+            AutoCRFOffset     = $AutoCRFOffset
+            ResolvedCRF       = ""
+            ResolvedPreset    = ""
+            ResolvedFilmGrain = ""
+            AutoReason        = ""
+            BPP               = ""
+            EffectiveVideoBitrate = ""
+            VideoBitratePerHourGiB = ""
+            ResolutionTier    = $sourceResolutionTier
+            CodecClass        = $sourceCodecClass
+            GrainClass        = ""
+            GrainScore        = ""
+            WasAutoSkipped    = "False"
             FfmpegPath        = $FfmpegPath
             FfprobePath       = $FfprobePath
             Notes             = "Dolby Vision source skipped by policy."
@@ -1116,8 +2102,72 @@ function Invoke-EncodeJob {
         return
     }
 
+    $autoSettings = Get-AutoEncodeSettings `
+        -Probe $probe `
+        -VideoStream $selected.Video `
+        -SourceProfile $sourceProfile `
+        -KeptAudioStreams @($selected.MainAudio, $selected.FallbackAudio) `
+        -InputPath $InputPath `
+        -ConfiguredCRF $CRF `
+        -ConfiguredPreset $Preset `
+        -ConfiguredFilmGrain $FilmGrain `
+        -ConfiguredAutoCRFOffset $AutoCRFOffset
+
+    $resolvedCRF = [int]$autoSettings.CRF
+    $resolvedPreset = [int]$autoSettings.Preset
+    $resolvedFilmGrain = [int]$autoSettings.FilmGrain
+    $resolvedCRFLabel = [string]$resolvedCRF
+    $resolvedPresetLabel = [string]$resolvedPreset
+    $encodeColorLabel = $encodeColorProfile.Summary
+
+    if ($autoSettings.Skip) {
+        Write-Host ""
+        Write-Host "Auto Skip: $($autoSettings.SkipReason)" -ForegroundColor Yellow
+        Write-Host ""
+
+        $stopwatch.Stop()
+        Write-LogRow @{
+            Timestamp         = (Get-Date).ToString("s")
+            Status            = "AUTO_SKIPPED_ALREADY_EFFICIENT"
+            InputPath         = $InputPath
+            OutputPath        = ""
+            SourceSizeGiB     = $sourceSizeGiB
+            OutputSizeGiB     = ""
+            ReductionPercent  = ""
+            SourceDurationSec = [Math]::Round($sourceDuration, 3)
+            OutputDurationSec = ""
+            ElapsedSec        = [Math]::Round($stopwatch.Elapsed.TotalSeconds, 2)
+            Profile           = $sourceProfile.Profile
+            HasHDR            = $sourceProfile.HasHDR
+            HasDV             = $sourceProfile.HasDV
+            SelectedAudio     = $selectedAudioSummary
+            SelectedSubtitles = $selectedSubtitleSummary
+            CRF               = $CRF
+            Preset            = $Preset
+            FilmGrain         = $FilmGrain
+            AutoCRFOffset     = $AutoCRFOffset
+            ResolvedCRF       = $resolvedCRF
+            ResolvedPreset    = $resolvedPreset
+            ResolvedFilmGrain = $resolvedFilmGrain
+            AutoReason        = $autoSettings.SkipReason
+            BPP               = [Math]::Round($autoSettings.BPP, 6)
+            EffectiveVideoBitrate = $autoSettings.VideoBitrate
+            VideoBitratePerHourGiB = [Math]::Round($autoSettings.VideoBitratePerHourGiB, 3)
+            ResolutionTier    = $autoSettings.ResolutionTier
+            CodecClass        = $autoSettings.CodecClass
+            GrainClass        = $autoSettings.GrainClass
+            GrainScore        = $autoSettings.GrainScore
+            WasAutoSkipped    = "True"
+            FfmpegPath        = $FfmpegPath
+            FfprobePath       = $FfprobePath
+            Notes             = $autoSettings.BitrateReason
+        }
+        return
+    }
+
     $tempOutput  = Get-TempOutputPath  -InputPath $InputPath
     $finalOutput = Get-FinalOutputPath -InputPath $InputPath
+    $displayOutputName = [System.IO.Path]::GetFileName($finalOutput)
 
     # Guard against silently overwriting a prior encode that has the same base
     # name as the source when the source is not itself an MKV.
@@ -1155,8 +2205,8 @@ function Invoke-EncodeJob {
         "-map_metadata",  "-1",
         "-max_muxing_queue_size", "4096",
         "-c:v",     "libsvtav1",
-        "-preset",  "$Preset",
-        "-crf",     "$CRF",
+        "-preset",  "$resolvedPreset",
+        "-crf",     "$resolvedCRF",
         "-pix_fmt", "yuv420p10le"
     ))
 
@@ -1167,8 +2217,8 @@ function Invoke-EncodeJob {
     # encoder to synthesise grain at decode time WITHOUT pre-denoising the source
     # first -- generally preferred when the source grain is already well-behaved
     # and you do not want to alter the underlying image texture.
-    if ($FilmGrain -gt 0) {
-        $ffArgs.AddRange([string[]]@("-svtav1-params", "film-grain=$FilmGrain`:film-grain-denoise=0"))
+    if ($resolvedFilmGrain -gt 0) {
+        $ffArgs.AddRange([string[]]@("-svtav1-params", "film-grain=$resolvedFilmGrain`:film-grain-denoise=0"))
     }
 
     if ($sourceProfile.HasHDR) {
@@ -1201,7 +2251,7 @@ function Invoke-EncodeJob {
     }
 
     $baseTitle  = [System.IO.Path]::GetFileNameWithoutExtension($InputPath)
-    $videoTitle = if ($sourceProfile.HasHDR) { "AV1 HDR10" } else { "AV1 SDR" }
+    $videoTitle = "AV1 $($encodeColorProfile.DynamicRangeLabel) $($encodeColorProfile.BitDepth)-bit"
 
     $ffArgs.AddRange([string[]]@(
         "-metadata",       "title=$baseTitle",
@@ -1241,6 +2291,19 @@ function Invoke-EncodeJob {
         CRF          = $CRF
         Preset       = $Preset
         FilmGrain    = $FilmGrain
+        AutoCRFOffset = $AutoCRFOffset
+        ResolvedCRF  = $resolvedCRF
+        ResolvedPreset = $resolvedPreset
+        ResolvedFilmGrain = $resolvedFilmGrain
+        AutoReason   = $autoSettings.Reason
+        BPP          = [Math]::Round($autoSettings.BPP, 6)
+        EffectiveVideoBitrate = $autoSettings.VideoBitrate
+        VideoBitratePerHourGiB = [Math]::Round($autoSettings.VideoBitratePerHourGiB, 3)
+        ResolutionTier = $autoSettings.ResolutionTier
+        CodecClass   = $autoSettings.CodecClass
+        GrainClass   = $autoSettings.GrainClass
+        GrainScore   = $autoSettings.GrainScore
+        WasAutoSkipped = $false
     } | ConvertTo-Json -Depth 8
 
     Set-Content -LiteralPath $StatePath -Value $currentState -Encoding UTF8
@@ -1248,13 +2311,30 @@ function Invoke-EncodeJob {
     # ── Print encode header ───────────────────────────────────────────────────
     Write-Host ""
     Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
-    Write-Host "Encoding: $InputPath"                                          -ForegroundColor Green
+    Write-Host "Source   : $InputPath"                                          -ForegroundColor Green
+    Write-Host "Encoding : $displayOutputName"                                  -ForegroundColor Green
     Write-Host "Profile : $($sourceProfile.Profile)"                           -ForegroundColor Green
-    if ($FilmGrain -gt 0) {
-        Write-Host "Grain   : film-grain=$FilmGrain (synthesis enabled)"       -ForegroundColor Green
+    Write-Host "Source Color: $($sourceProfile.SourceColorSummary)"            -ForegroundColor Green
+    Write-Host "Encode Color: $($encodeColorProfile.Summary)"                  -ForegroundColor Green
+    if (-not [string]::IsNullOrWhiteSpace($encodeColorProfile.Note)) {
+        Write-Host "Color Note : $($encodeColorProfile.Note)"                   -ForegroundColor Yellow
     }
-    Write-Host "Audio   : $(Format-StreamSummary @($selected.MainAudio, $selected.FallbackAudio))" -ForegroundColor Green
-    Write-Host "Subs    : $(Format-StreamSummary @($selected.MainSub, $selected.SdhSub))"          -ForegroundColor Green
+    if ($CRF -eq 'Auto') {
+        Write-Host "Auto CRF    : $resolvedCRF ($($autoSettings.CRFReason))"   -ForegroundColor Green
+    }
+    if ($Preset -eq 'Auto') {
+        Write-Host "Auto Preset : $resolvedPreset ($($autoSettings.PresetReason))" -ForegroundColor Green
+    }
+    if ($FilmGrain -eq 'Auto') {
+        Write-Host "Auto Grain  : $resolvedFilmGrain ($($autoSettings.FilmGrainReason))" -ForegroundColor Green
+    } elseif ($resolvedFilmGrain -gt 0) {
+        Write-Host "Grain       : film-grain=$resolvedFilmGrain (manual)"       -ForegroundColor Green
+    }
+    if ($autoSettings.VideoBitrate -gt 0) {
+        Write-Host "Signals     : $($autoSettings.ResolutionTier) / $($sourceProfile.Profile) / $($autoSettings.CodecLabel) / BPP $([Math]::Round($autoSettings.BPP, 4)) / $([Math]::Round($autoSettings.VideoBitratePerHourGiB, 2)) GiB/hr" -ForegroundColor Green
+    }
+    Write-Host "Audio   : $selectedAudioSummary" -ForegroundColor Green
+    Write-Host "Subs    : $selectedSubtitleSummary" -ForegroundColor Green
     Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
 
@@ -1341,14 +2421,15 @@ function Invoke-EncodeJob {
     $stderrAsync = $stderrPs.BeginInvoke()
 
     # ── Live UI loop ──────────────────────────────────────────────────────────
-    $uiFileName     = [System.IO.Path]::GetFileName($InputPath)
+    $uiFileName     = $displayOutputName
     $uiLineCount    = -1   # -1 signals first paint; no cursor-up on first call
-    $sourceDuration = [double](Get-StreamProp (Get-StreamProp $probe 'format' ([PSCustomObject]@{})) 'duration' 0)
-
     while (-not $proc.HasExited) {
         $uiLineCount = Write-ProgressUI `
             -FileName          $uiFileName `
             -Profile           $sourceProfile.Profile `
+            -EncodeColorLabel  $encodeColorLabel `
+            -CRFLabel          $resolvedCRFLabel `
+            -PresetLabel       $resolvedPresetLabel `
             -SourceDurationSec $sourceDuration `
             -ElapsedSec        $stopwatch.Elapsed.TotalSeconds `
             -OutTimeSec        $shared.OutTimeSec `
@@ -1373,6 +2454,9 @@ function Invoke-EncodeJob {
     $null = Write-ProgressUI `
         -FileName          $uiFileName `
         -Profile           $sourceProfile.Profile `
+        -EncodeColorLabel  $encodeColorLabel `
+        -CRFLabel          $resolvedCRFLabel `
+        -PresetLabel       $resolvedPresetLabel `
         -SourceDurationSec $sourceDuration `
         -ElapsedSec        $stopwatch.Elapsed.TotalSeconds `
         -OutTimeSec        $(if ($ffExit -eq 0) { $sourceDuration } else { $shared.OutTimeSec }) `
@@ -1458,14 +2542,27 @@ function Invoke-EncodeJob {
         Profile           = $sourceProfile.Profile
         HasHDR            = $sourceProfile.HasHDR
         HasDV             = $sourceProfile.HasDV
-        SelectedAudio     = Format-StreamSummary -Streams @($selected.MainAudio, $selected.FallbackAudio)
-        SelectedSubtitles = Format-StreamSummary -Streams @($selected.MainSub, $selected.SdhSub)
+        SelectedAudio     = $selectedAudioSummary
+        SelectedSubtitles = $selectedSubtitleSummary
         CRF               = $CRF
         Preset            = $Preset
         FilmGrain         = $FilmGrain
+        AutoCRFOffset     = $AutoCRFOffset
+        ResolvedCRF       = $resolvedCRF
+        ResolvedPreset    = $resolvedPreset
+        ResolvedFilmGrain = $resolvedFilmGrain
+        AutoReason        = $autoSettings.Reason
+        BPP               = [Math]::Round($autoSettings.BPP, 6)
+        EffectiveVideoBitrate = $autoSettings.VideoBitrate
+        VideoBitratePerHourGiB = [Math]::Round($autoSettings.VideoBitratePerHourGiB, 3)
+        ResolutionTier    = $autoSettings.ResolutionTier
+        CodecClass        = $autoSettings.CodecClass
+        GrainClass        = $autoSettings.GrainClass
+        GrainScore        = $autoSettings.GrainScore
+        WasAutoSkipped    = "False"
         FfmpegPath        = $FfmpegPath
         FfprobePath       = $FfprobePath
-        Notes             = ""
+        Notes             = $autoSettings.BitrateReason
     }
 
     Write-Host ""
@@ -1532,6 +2629,19 @@ function Invoke-QueueProcessing {
                 CRF               = $interrupted.CRF
                 Preset            = $interrupted.Preset
                 FilmGrain         = $interrupted.FilmGrain
+                AutoCRFOffset     = Get-OptionalProperty $interrupted 'AutoCRFOffset' ''
+                ResolvedCRF       = Get-OptionalProperty $interrupted 'ResolvedCRF' ''
+                ResolvedPreset    = Get-OptionalProperty $interrupted 'ResolvedPreset' ''
+                ResolvedFilmGrain = Get-OptionalProperty $interrupted 'ResolvedFilmGrain' ''
+                AutoReason        = Get-OptionalProperty $interrupted 'AutoReason' ''
+                BPP               = Get-OptionalProperty $interrupted 'BPP' ''
+                EffectiveVideoBitrate = Get-OptionalProperty $interrupted 'EffectiveVideoBitrate' ''
+                VideoBitratePerHourGiB = Get-OptionalProperty $interrupted 'VideoBitratePerHourGiB' ''
+                ResolutionTier    = Get-OptionalProperty $interrupted 'ResolutionTier' ''
+                CodecClass        = Get-OptionalProperty $interrupted 'CodecClass' ''
+                GrainClass        = Get-OptionalProperty $interrupted 'GrainClass' ''
+                GrainScore        = Get-OptionalProperty $interrupted 'GrainScore' ''
+                WasAutoSkipped    = Get-OptionalProperty $interrupted 'WasAutoSkipped' 'False'
                 FfmpegPath        = $FfmpegPath
                 FfprobePath       = $FfprobePath
                 Notes             = "Process was interrupted. Temp output may exist at: $tempPath"
@@ -1557,48 +2667,68 @@ function Invoke-QueueProcessing {
             $job = Get-Content -LiteralPath $workingJobPath -Raw | ConvertFrom-Json
             Invoke-EncodeJob -InputPath $job.InputPath
         }
-			catch {
-				$message = $_.Exception.Message
-				$position = $_.InvocationInfo.PositionMessage
-				$stack = $_.ScriptStackTrace
+        catch {
+            $message = $_.Exception.Message
+            $position = $_.InvocationInfo.PositionMessage
+            $stack = $_.ScriptStackTrace
+            $state = $null
 
-				Write-Host "FAILED: $message" -ForegroundColor Red
+            if (Test-Path -LiteralPath $StatePath) {
+                try {
+                    $state = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+                } catch {}
+            }
 
-				if ($position) {
-					Write-Host ""
-					Write-Host $position -ForegroundColor Yellow
-				}
+            Write-Host "FAILED: $message" -ForegroundColor Red
 
-				if ($stack) {
-					Write-Host ""
-					Write-Host "Stack trace:" -ForegroundColor DarkYellow
-					Write-Host $stack -ForegroundColor DarkYellow
-				}
+            if ($position) {
+                Write-Host ""
+                Write-Host $position -ForegroundColor Yellow
+            }
 
-				Write-LogRow @{
-					Timestamp         = (Get-Date).ToString("s")
-					Status            = "FAILED"
-					InputPath         = $job.InputPath
-					OutputPath        = ""
-					SourceSizeGiB     = ""
-					OutputSizeGiB     = ""
-					ReductionPercent  = ""
-					SourceDurationSec = ""
-					OutputDurationSec = ""
-					ElapsedSec        = ""
-					Profile           = ""
-					HasHDR            = ""
-					HasDV             = ""
-					SelectedAudio     = ""
-					SelectedSubtitles = ""
-					CRF               = $CRF
-					Preset            = $Preset
-					FilmGrain         = $FilmGrain
-					FfmpegPath        = $FfmpegPath
-					FfprobePath       = $FfprobePath
-					Notes             = ($message + " | " + $position)
-				}
-			}
+            if ($stack) {
+                Write-Host ""
+                Write-Host "Stack trace:" -ForegroundColor DarkYellow
+                Write-Host $stack -ForegroundColor DarkYellow
+            }
+
+            Write-LogRow @{
+                Timestamp         = (Get-Date).ToString("s")
+                Status            = "FAILED"
+                InputPath         = $job.InputPath
+                OutputPath        = ""
+                SourceSizeGiB     = ""
+                OutputSizeGiB     = ""
+                ReductionPercent  = ""
+                SourceDurationSec = ""
+                OutputDurationSec = ""
+                ElapsedSec        = ""
+                Profile           = if ($state) { Get-OptionalProperty $state 'Profile' '' } else { "" }
+                HasHDR            = if ($state) { Get-OptionalProperty $state 'HasHDR' '' } else { "" }
+                HasDV             = if ($state) { Get-OptionalProperty $state 'HasDV' '' } else { "" }
+                SelectedAudio     = ""
+                SelectedSubtitles = ""
+                CRF               = if ($state) { Get-OptionalProperty $state 'CRF' $CRF } else { $CRF }
+                Preset            = if ($state) { Get-OptionalProperty $state 'Preset' $Preset } else { $Preset }
+                FilmGrain         = if ($state) { Get-OptionalProperty $state 'FilmGrain' $FilmGrain } else { $FilmGrain }
+                AutoCRFOffset     = if ($state) { Get-OptionalProperty $state 'AutoCRFOffset' $AutoCRFOffset } else { $AutoCRFOffset }
+                ResolvedCRF       = if ($state) { Get-OptionalProperty $state 'ResolvedCRF' '' } else { "" }
+                ResolvedPreset    = if ($state) { Get-OptionalProperty $state 'ResolvedPreset' '' } else { "" }
+                ResolvedFilmGrain = if ($state) { Get-OptionalProperty $state 'ResolvedFilmGrain' '' } else { "" }
+                AutoReason        = if ($state) { Get-OptionalProperty $state 'AutoReason' '' } else { "" }
+                BPP               = if ($state) { Get-OptionalProperty $state 'BPP' '' } else { "" }
+                EffectiveVideoBitrate = if ($state) { Get-OptionalProperty $state 'EffectiveVideoBitrate' '' } else { "" }
+                VideoBitratePerHourGiB = if ($state) { Get-OptionalProperty $state 'VideoBitratePerHourGiB' '' } else { "" }
+                ResolutionTier    = if ($state) { Get-OptionalProperty $state 'ResolutionTier' '' } else { "" }
+                CodecClass        = if ($state) { Get-OptionalProperty $state 'CodecClass' '' } else { "" }
+                GrainClass        = if ($state) { Get-OptionalProperty $state 'GrainClass' '' } else { "" }
+                GrainScore        = if ($state) { Get-OptionalProperty $state 'GrainScore' '' } else { "" }
+                WasAutoSkipped    = if ($state) { Get-OptionalProperty $state 'WasAutoSkipped' 'False' } else { "False" }
+                FfmpegPath        = $FfmpegPath
+                FfprobePath       = $FfprobePath
+                Notes             = ($message + " | " + $position)
+            }
+        }
         finally {
             if (Test-Path -LiteralPath $workingJobPath) {
                 Remove-Item -LiteralPath $workingJobPath -Force -ErrorAction SilentlyContinue
@@ -1628,6 +2758,13 @@ function Invoke-QueueProcessing {
 #     the queue. The mutex is released in the finally block regardless of
 #     whether processing succeeds or throws.
 # =============================================================================
+$CRF       = Resolve-ConfigValue -Name 'CRF'       -Value $CRF       -Minimum 0 -Maximum 63
+$Preset    = Resolve-ConfigValue -Name 'Preset'    -Value $Preset    -Minimum 0 -Maximum 13
+$FilmGrain = Resolve-ConfigValue -Name 'FilmGrain' -Value $FilmGrain -Minimum 0 -Maximum 50
+$AutoCRFOffset = Resolve-OffsetConfigValue -Name 'AutoCRFOffset' -Value $AutoCRFOffset
+
+Update-LogSchemaIfNeeded
+
 if (-not $InputPaths -or $InputPaths.Count -eq 0) {
     Write-Host "Drag one or more files onto the .bat launcher, or call this script with file paths." -ForegroundColor Yellow
     exit 1
