@@ -2,7 +2,7 @@
 
 A queue-based, drag-and-drop AV1 encoding pipeline for video libraries.
 
-Built for high-quality archival compression using **SVT-AV1**, with intelligent stream selection, HDR handling, and safe batch processing.
+Built for high-quality archival compression using **SVT-AV1**, with intelligent stream selection, HDR handling, source-aware Auto mode, and safe batch processing.
 
 If you have large Blu-ray libraries or high-bitrate video files and want to compress them using AV1, this script is for you.
 
@@ -22,8 +22,11 @@ If you have large Blu-ray libraries or high-bitrate video files and want to comp
 ## 🚀 Features
 
 - 🎬 **AV1 (SVT-AV1) encoding**
-- ⚡ High-quality defaults (**CRF 10 / Preset 4**)
+- 🧠 **Source-aware Auto mode** for `CRF`, `Preset`, `FilmGrain`, and `AutoCRFOffset`
 - 📦 **Massive space savings** (5–10× vs H.265 typical)
+- 🌈 **HDR-aware processing**
+- 🧾 **Detailed encode logging**
+- 🖥️ **Color-aware console UI** showing source/output color format
 
 ### 🧠 Intelligent Stream Selection
 
@@ -39,32 +42,51 @@ If you have large Blu-ray libraries or high-bitrate video files and want to comp
 
 ### 🌈 HDR Awareness
 
-- Preserves HDR10 signaling
-- Detects Dolby Vision and skips (configurable)
+- Preserves HDR10-style signaling
+- Detects Dolby Vision and skips by default
+- Shows source/output color information in the console UI
+
+### 🤖 Auto Mode
+
+When set to `Auto`, the script evaluates each source independently using:
+
+- ffprobe bitrate fallback logic
+- frame rate and BPP analysis
+- codec and resolution tier classification
+- FFmpeg-only grain pre-scan
+- skip detection for already-efficient sources
+
+Auto mode is recalculated **per file when that file begins encoding**, including queued jobs.
 
 ### 📋 Queue System
 
 - Drag-and-drop anytime
 - Sequential processing
 - Unlimited queue size
+- Each queued title gets its own fresh Auto analysis
 
 ### 🔁 Safe Processing
 
 - Temp file encoding
 - Validation before replacement
+- Interrupted-job state tracking
 
 ### 📝 Logging
 
-- CSV log of all encodes
-- Size reduction, duration, profile, etc.
+- CSV log of all encodes and skips
+- Stores resolved Auto settings and diagnostics
 
 ---
 
 ## 🧰 Requirements
 
 - Windows
-- PowerShell 7.0+ (tested on 7.6)
-- `ffmpeg` and `ffprobe` version 8+ https://www.ffmpeg.org/download.html
+- PowerShell 7.0+ (tested on 7.x)
+- `ffmpeg.exe` and `ffprobe.exe` from the FFmpeg suite
+
+Recommended:
+- place `ffmpeg.exe` and `ffprobe.exe` in the same folder as the script
+
 ---
 
 ## 📦 Installation
@@ -73,7 +95,7 @@ If you have large Blu-ray libraries or high-bitrate video files and want to comp
 git clone https://github.com/emike09/media-av1-optimizer.git
 ```
 
-Place `ffmpeg.exe` and `ffprobe.exe` in the same directory (recommended).
+Place `ffmpeg.exe` and `ffprobe.exe` in the same directory as the script, or ensure both are available on `PATH`.
 
 ---
 
@@ -84,52 +106,125 @@ Place `ffmpeg.exe` and `ffprobe.exe` in the same directory (recommended).
 Drop files onto:
 
 ```text
-Drop_Encode_AV1.bat
+Media2AV1Queue.bat
 ```
 
 ### CLI
 
 ```powershell
-pwsh Media2AV1Queue.ps1 "D:\Movies\SomeMovie.mkv"
+pwsh .\Media2AV1Queue.ps1 "D:\Movies\SomeMovie.mkv"
 ```
 
 ---
 
-## ⚙️ Default Behavior
+## ⚙️ Configuration
 
-### Encoding
+The main user settings are near the top of [Media2AV1Queue.ps1](</G:/Movies/Scripts/Media2AV1Queue.ps1>).
 
-- Codec: AV1 (SVT-AV1)
-- CRF: 10
-- Preset: 4
-- Container: MKV
+These values accept either an integer or `Auto`:
 
-### Audio
+```powershell
+$CRF = Auto
+$Preset = Auto
+$FilmGrain = Auto
+$AutoCRFOffset = Auto
+```
 
-- Keeps best English track
-- Keeps optional fallback track
+Other important options:
 
-### Subtitles
+```powershell
+$SkipDolbyVisionSources = $true
+$KeepEnglishSDH = $false
+$KeepEnglishFallbackAudio = $true
+$KeepBackupOriginal = $false
+$ReplaceOriginal = $true
+```
 
-- Keeps English default
-- Optionally keeps SDH
+`AutoCRFOffset` only applies when `CRF = Auto`.
 
-### Video
+Examples:
 
-- Preserves HDR10 metadata
-- Skips Dolby Vision sources by default
+```powershell
+$AutoCRFOffset = -2
+```
+
+- makes Auto CRF 2 steps lower quality-number / higher quality
+
+```powershell
+$AutoCRFOffset = 3
+```
+
+- makes Auto CRF 3 steps higher quality-number / more aggressive compression
+
+---
+
+## 🤖 Auto Mode Details
+
+Auto mode resolves final settings before ffmpeg starts.
+
+### Auto CRF
+
+Uses:
+
+- resolution tier (`SD`, `HD`, `UHD`)
+- BPP bucket (`low`, `medium`, `high`)
+- SDR vs HDR
+- codec class (`legacy`, `standard`, `modern`)
+
+Then applies optional `AutoCRFOffset`.
+
+### Auto Film Grain
+
+Uses:
+
+- FFmpeg-only grain pre-scan when `FilmGrain = Auto`
+- conservative fallback logic if pre-scan fails
+
+Film grain mapping:
+
+- `none` -> `0`
+- `light` -> `4`
+- `moderate` -> `8`
+- `heavy` -> `12`
+- `extreme` -> `16`
+
+### Auto Preset
+
+Preset stays intentionally simple:
+
+- `3` for harder/high-quality cases
+- `4` as the balanced default
+- `5` for lower-risk / speed-favored cases
+
+### Auto Skip
+
+Already-efficient low-bitrate sources may be skipped automatically instead of being re-encoded with avoidable generational loss.
+
+Skipped jobs are logged as:
+
+```text
+AUTO_SKIPPED_ALREADY_EFFICIENT
+```
 
 ---
 
 ## ⚠️ Dolby Vision
 
-Dolby Vision is **not preserved** during AV1 re-encoding. I have not yet found a reliable, scriptable way to preserve this data for an AV1 re-encode and recommend manually re-encoding these one at a time. Please let me know if you have found a valid workflow to preserve DV with AV1. Dolby Vision can be re-encoded to HDR10 with the `$SkipDolbyVisionSources = $false` flag. 
+Dolby Vision is **not preserved** during AV1 re-encoding.
 
 By default:
+
 - DV sources are **skipped**
 
 Optional:
-- Allow fallback to HDR10
+
+- Allow fallback to HDR10-style output by setting:
+
+```powershell
+$SkipDolbyVisionSources = $false
+```
+
+If DV is not skipped, the output is not Dolby Vision anymore.
 
 ---
 
@@ -137,62 +232,41 @@ Optional:
 
 AV1 supports **film grain synthesis**, allowing grain to be stored efficiently and reconstructed during playback instead of encoded pixel-by-pixel.
 
-### Configuration
+### Manual Configuration
 
 ```powershell
-$FilmGrain = 0  # 0 = disabled
+$FilmGrain = 0
 ```
 
-### Recommended Values
+### Recommended Manual Values
 
 | Value | Use Case |
 |------:|----------|
 | 0 | Clean CGI / animation |
-| 4–8 | Light grain (modern films) |
+| 4–8 | Light grain |
 | 8–15 | Typical Blu-ray grain |
-| 15–25 | Heavy grain (e.g. *Saving Private Ryan*) |
+| 15–25 | Heavy grain |
 | 25+ | Extreme / degraded sources |
 
 ### Notes
 
 - Too low = wasted bitrate
 - Too high = artificial noise
+- Auto mode caps its default film-grain selection at `16`
 
-> A 70GB encode at `FilmGrain=0` may drop to ~20–25GB at `FilmGrain=12` with similar perceived quality.
+> A 70 GB encode at `FilmGrain=0` may drop to ~20–25 GB at `FilmGrain=12` with similar perceived quality.
 
 ### Film Grain Encoding Speed
-- Without film grain synthesis (FilmGrain=0), the encoder tries to preserve every grain pixel.
-- With film grain synthesis (FilmGrain > 0), the encoder removes grain during encoding and stores a compact grain model.
-- The decoder later reconstructs this grain.
-- Gains on encoding speed can be up to 30%. 
+
+- Without film grain synthesis (`FilmGrain=0`), the encoder tries to preserve every grain pixel
+- With film grain synthesis (`FilmGrain > 0`), the encoder stores a compact grain model instead
+- Encoding speed can improve significantly on grain-heavy sources
 
 ---
 
-## ⚠️ Grain-Heavy Films
+## 🎛️ Manual Encoding Profiles
 
-Some films contain heavy grain and complex motion.
-
-These will:
-- produce very large encodes
-- especially at CRF 10–12
-
-### Recommendation
-
-```text
-CRF: 14–16
-```
-
-or:
-
-```text
-FilmGrain: 8–12
-```
-
-> AV1 preserves grain extremely well — sometimes *too well*.
-
----
-
-## 🎛️ Recommended Encoding Profiles
+If you prefer manual settings over Auto mode:
 
 ### 🔥 Archival Quality
 
@@ -201,10 +275,6 @@ CRF: 10
 Preset: 3
 ```
 
-- Near-transparent quality
-- 4–7× reduction from remux
-- Slow but optimal
-
 ### ⚖️ High Quality / Compression Balance
 
 ```text
@@ -212,18 +282,12 @@ CRF: 14–15
 Preset: 3
 ```
 
-- ~30–50% smaller than x265
-- Minimal visible loss
-
-### ⚡ Balanced (Default Recommendation)
+### ⚡ Balanced
 
 ```text
 CRF: 10–12
 Preset: 4
 ```
-
-- Excellent quality
-- Good performance
 
 ### 🚀 Faster Encoding
 
@@ -232,9 +296,6 @@ CRF: 10–12
 Preset: 5
 ```
 
-- Faster encoding
-- Slightly larger files
-
 ### 📦 Aggressive Compression
 
 ```text
@@ -242,64 +303,85 @@ CRF: 16–18
 Preset: 4–5
 ```
 
-- Maximum savings
-- Visible artifacts possible
+---
 
-### 🧊 Skip Re-encoding
+## 🖥️ Console Output
 
-```text
-< ~8 GB/hour → Skip
-```
+Before encoding, the script prints resolved values and reasoning such as:
 
-- Minimal gains
-- Guaranteed quality loss
+- `Auto CRF: 24 (HD / SDR / AVC / medium BPP)`
+- `Auto Preset: 4 (balanced default)`
+- `Auto FilmGrain: 8 (pre-scan: moderate grain)`
+- `Auto Skip: already efficient low-bitrate SDR AVC source`
+
+The live UI also shows:
+
+- resolved AV1 output filename
+- source/output color format
+- profile (`SDR`, `HDR`, `DV`)
+- CRF / preset / elapsed time
+- encoded size / speed / ETA
 
 ---
 
-## 🧠 Preset vs CRF
+## 🏷️ Output Filename Behavior
 
-| Setting | Result |
-|--------|--------|
-| CRF 10 / Preset 5 | Higher quality, larger file |
-| CRF 14 / Preset 3 | Smaller file, more loss |
+The script now rewrites common source codec tags in the filename to `AV1` for the output.
 
-> Rule: Lower CRF first, then lower preset.
+Examples:
+
+- `Interstellar.2014.2160p.uhd.bluray.x265.mkv` -> `Interstellar.2014.2160p.uhd.bluray.AV1.mkv`
+- `Movie.1080p.HEVC.mkv` -> `Movie.1080p.AV1.mkv`
+- `Show.S01E01.H.264.1080p.mkv` -> `Show.S01E01.AV1.1080p.mkv`
+
+Handled tokens:
+
+- `x264`
+- `x265`
+- `H.264`
+- `H.265`
+- `H264`
+- `H265`
+- `HEVC`
+
+If no supported codec token exists in the filename, the basename is left unchanged.
 
 ---
 
 ## 📊 Logging
+
+Log file:
 
 ```text
 .queue/encode_log.csv
 ```
 
 Tracks:
+
+- source/output path
 - size reduction
 - duration
 - HDR/DV detection
 - selected streams
+- resolved CRF / preset / film grain
+- Auto reason
+- effective video bitrate
+- bitrate per hour
+- BPP
+- resolution tier
+- codec class
+- grain class / score
+- Auto skip status
 
 ---
 
 ## 🧪 Tested Scenarios
 
-- 4K HDR remux → AV1
-- Dolby Vision (skip logic)
-- AI-upscaled content (Topaz)
-- Multi-audio / multi-subtitle cluttered files
-
----
-
-## 🛠️ Configuration
-
-```powershell
-$CRF = 10
-$Preset = 4
-$FilmGrain = 0
-$SkipDolbyVisionSources = $true
-$KeepEnglishSDH = $true
-$KeepBackupOriginal = $false
-```
+- 4K HDR remux -> AV1
+- Dolby Vision skip logic
+- low-bitrate sources with Auto skip
+- grain-heavy sources with FFmpeg-only grain pre-scan
+- multi-audio / multi-subtitle cluttered files
 
 ---
 
@@ -308,6 +390,7 @@ $KeepBackupOriginal = $false
 - Visual quality over maximum compression
 - Consistency over edge-case perfection
 - Automation over manual tuning
+- Explainable heuristics over black-box tooling
 
 ---
 
@@ -322,16 +405,11 @@ MIT License
 Pull requests welcome.
 
 Ideas:
+
 - DV-safe workflows
-- HDR/SDR detection improvements
-- GPU encoding modes (experimental)
+- Auto heuristic refinement
 - Linux support
-
----
-
-## ⚡ Final Note
-
-If it looks good on *Prometheus*, it’ll survive anything.
+- optional scene-aware FFmpeg sampling improvements
 
 ---
 
