@@ -13,6 +13,7 @@ if errorlevel 1 (
 if "%~1"=="" (
     pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%PS1%"
 ) else (
-    pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -- %*
+    pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%PS1%" %*
 )
+pause
 exit /b %errorlevel%
