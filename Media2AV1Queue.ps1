@@ -22,26 +22,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ErrorView = 'NormalView'
-$script:ResolvedScriptProcessPriority = 'Normal'
-$script:QueueShutdownRequested = $false
-$script:QueueShutdownMessageShown = $false
-$script:QueueShutdownSentinel = '__QUEUE_SHUTDOWN__'
-$script:OriginalTreatControlCAsInput = $null
-$script:HeldForCpuAnnouncements = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-$script:SessionLogPath = $null
-$script:QueuePaused = $false
-$script:SoftExitRequested = $false
-$script:ShowHelpOverlay = $false
-$script:ConsoleCommandContext = [pscustomobject]@{ Kind = ''; Target = ''; ExpiresAt = $null }
-$script:ConsoleStatus = [pscustomobject]@{ Message = ''; Level = 'Info'; ExpiresAt = $null }
-$script:ThreadControlInteropLoaded = $false
-$script:TestAutoShutdownAt = $null
-$script:TestAutoShutdownSeconds = 0
 
-# Supports bare Auto in config, e.g.:
-#   $CRF = Auto
-# or
-#   $CRF = 'Auto'
 # Do not change this function.
 function Auto {
     return 'Auto'
@@ -60,74 +41,70 @@ function Auto {
 # ------------------------------------------------------------------------
 # Quality
 # ------------------------------------------------------------------------
-$CRF = Auto                       # 0-63, recommend 10-28, or Auto. Lower = better quality / larger file.
-$Preset = Auto                    # Software: 0-13, recommend 3-6, or Auto. Lower = slower / better compression.
-$AutoCRFOffset = Auto             # Integer or Auto. Recommended -2 to +2. Auto = 0.
-$FilmGrain = Auto                 # 0-50, recommend 0-16, or Auto. See notes below.
+$CRF = Auto            # Software quality target. 0-63, recommend 10-28, or Auto. Lower = better quality / larger files.
+$Preset = Auto         # Software speed/compression setting. 0-13, recommend 3-6, or Auto. Lower = slower / smaller files.
+$AutoCRFOffset = Auto  # Auto mode CRF adjustment. Integer or Auto, recommend -2 to +2. Positive = smaller files, negative = higher quality.
+$FilmGrain = Auto      # AV1 film grain synthesis strength. 0-50, recommend 0-16, or Auto. Higher = better grain retention / smaller files on grainy sources.
 
 # ------------------------------------------------------------------------
 # Encoder lanes
 # ------------------------------------------------------------------------
-$EncoderPreference = 'Auto'       # Auto | CPU | Nvidia
-$SoftwareEncodePriority = 'BelowNormal' # Idle | BelowNormal | Normal | AboveNormal
-$HardwareEncodePriority = 'Normal'      # Idle | BelowNormal | Normal | AboveNormal
-$ScriptProcessPriority  = 'Normal'      # Idle | BelowNormal | Normal | AboveNormal
-$ApplyProcessPriority   = $true         # $true = apply priority settings above
+$EncoderPreference = 'Auto'       # Preferred encoder path. Auto | CPU | Nvidia. Auto chooses per file.
+$SoftwareEncodePriority = 'BelowNormal' # Priority for CPU software encodes. Idle | BelowNormal | Normal | AboveNormal.
+$HardwareEncodePriority = 'Normal'      # Priority for GPU/NVENC encodes. Idle | BelowNormal | Normal | AboveNormal.
+$ScriptProcessPriority  = 'Normal'      # Priority for this PowerShell controller process. Idle | BelowNormal | Normal | AboveNormal.
+$ApplyProcessPriority   = $true         # Apply the priority settings above. $true recommended.
 
 # ------------------------------------------------------------------------
 # NVENC
 # ------------------------------------------------------------------------
-$NvencMaxParallel = Auto          # 1-8, recommend Auto, or Auto. Auto uses GPU model lookup.
-$NvencCQ = Auto                   # 0-51, recommend 18-28, or Auto. Lower = better quality / larger file.
-$NvencPreset = Auto               # p1-p7 or Auto. Recommended p5-p6 for quality-focused NVENC.
-$NvencDecode = Auto               # Auto | cpu | cuda
-$NvencTune = 'auto'               # auto | hq | ll | ull | $null
-$NvencAllowSplitFrame = $false    # $true = allow split-frame if supported. Leave off unless testing.
+$NvencMaxParallel = Auto          # Max simultaneous NVENC workers. 1-8 or Auto. Auto uses GPU model/engine lookup.
+$NvencCQ = Auto                   # NVENC quality target. 0-51, recommend 18-28, or Auto. Lower = better quality / larger files.
+$NvencPreset = Auto               # NVENC speed/compression setting. p1-p7 or Auto. Higher preset = slower / better compression.
+$NvencDecode = Auto               # Decode path for NVENC jobs. Auto | cpu | cuda. Auto prefers the safest path.
+$NvencTune = 'auto'               # NVENC tuning bias. auto | hq | ll | ull | $null. hq = quality, ll/ull = latency-focused.
+$NvencAllowSplitFrame = $false    # Allow split-frame NVENC if supported. $false recommended; $true is advanced/testing only.
 
 # ------------------------------------------------------------------------
 # Preflight estimation & auto-tuning
 # ------------------------------------------------------------------------
-$EnablePreflightEstimate = $true              # Run sample-based estimate before full encode.
-$PreflightSampleCount = 4                     # 1-12, recommend 3-6.
-$PreflightSampleDurationSec = 30              # 5-120, recommend 15-30.
-$PreflightWarnIfEstimatedPctOfSource = 95     # 1-1000, recommend 90-100.
-$PreflightAbortIfEstimatedPctOfSource = 100   # 1-1000, recommend 95-110.
-$EnablePreflightAutoTune = $true              # Allow preflight to retune Auto settings.
-$EnableSecondPreflightPass = $true            # Run one more preflight after major retuning.
-$PreflightAutoTuneQuality = 'High'            # Low | Medium | High
+$EnablePreflightEstimate = $true              # Run short sample encodes before the full job to estimate final size.
+$PreflightSampleCount = 4                     # Number of preflight samples. 1-12, recommend 3-6. More = slower but more accurate.
+$PreflightSampleDurationSec = 20              # Seconds per preflight sample. 5-120, recommend 15-30. Longer = slower but more accurate.
+$PreflightWarnIfEstimatedPctOfSource = 90     # Warn if projected output reaches this % of source size. 1-1000, recommend 90-100.
+$PreflightAbortIfEstimatedPctOfSource = 95    # Skip encode if projected output reaches this % of source size. 1-1000, recommend 95-110.
+$EnablePreflightAutoTune = $true              # Let preflight adjust Auto quality settings before the full encode starts.
+$EnableSecondPreflightPass = $true            # Run a second preflight after major auto-tuning changes to validate the new settings. 
+$PreflightAutoTuneQuality = 'High'            # Auto-tune quality profile. Low | Medium | High. High = more quality-preserving targets, larger file.
 
 # Tiny-output safety check
 # Helps catch cases where Auto mode may compress too aggressively.
-$PreflightTinyOutputPctThreshold = 35         # 1-100, recommend 25-50.
-$PreflightTinyOutputAbsoluteGiBThreshold = 1.0 # 0.1-100.0, recommend 0.5-2.0.
+$PreflightTinyOutputPctThreshold = 25         # Flag outputs smaller than this % of source size as suspicious. 1-100, recommend 25-50.
+$PreflightTinyOutputAbsoluteGiBThreshold = 1.0 # Also flag projected outputs below this size in GiB. 0.1-100.0, recommend 0.5-2.0.
 
 # Live size estimate
-$EnableLiveSizeEstimate = $true               # Show estimated final size during encode.
-$LiveEstimateStartPercent = 3                 # 1-100, recommend 3-15.
-$LiveEstimateSmoothingFactor = 0.30           # 0.01-1.00, recommend 0.20-0.40.
+$EnableLiveSizeEstimate = $true               # Show estimated final size and savings while encoding.
+$LiveEstimateStartPercent = 3                 # Start showing the estimate after this % of progress. 1-100, recommend 3-15.
+$LiveEstimateSmoothingFactor = 0.30           # Smooth live estimate fluctuations. 0.01-1.00, recommend 0.20-0.40. Lower = steadier, higher = more responsive.
 
 # Advanced preflight overrides
 # Leave these at $null unless you specifically want manual GiB/hr control.
-$PreflightAutoTuneCustomTargetGiBPerHour = $null # Decimal or $null. Recommended 1.0-20.0 depending on source.
-$PreflightAutoTuneCustomUpperGiBPerHour = $null  # Decimal or $null. Recommended target + 1 to +4.
-$PreflightAutoTuneCustomLowerGiBPerHour = $null  # Decimal or $null. Recommended target - 1 to -4.
+$PreflightAutoTuneCustomTargetGiBPerHour = $null # Override target output rate in GiB/hr. Decimal or $null. Recommend 1.0-20.0 depending on source.
+$PreflightAutoTuneCustomUpperGiBPerHour = $null  # Override upper tuning threshold in GiB/hr. Decimal or $null. Recommend target + 1 to +4.
+$PreflightAutoTuneCustomLowerGiBPerHour = $null  # Override lower tuning threshold in GiB/hr. Decimal or $null. Recommend target - 1 to -4.
 
 # ------------------------------------------------------------------------
 # Source handling
 # ------------------------------------------------------------------------
-$SkipDolbyVisionSources = $true   # $true = skip DV sources by default.
-$KeepBackupOriginal = $false      # $true = move original to backup folder after success.
-$ReplaceOriginal = $true          # $true = replace source with finished AV1 output on success.
+$SkipDolbyVisionSources = $true   # Skip Dolby Vision sources instead of converting them without DV metadata.
+$KeepBackupOriginal = $false      # Keep a backup copy of the original after a successful encode.
+$ReplaceOriginal = $true          # Replace the source file with the finished AV1 output after success.
 
 # ------------------------------------------------------------------------
 # Stream selection
 # ------------------------------------------------------------------------
-$KeepEnglishSDH = $false          # Keep an English SDH subtitle track.
-$KeepEnglishFallbackAudio = $true # Keep a secondary lossy English audio track when useful.
-
-# =============================================================================
-# End of user-configurable settings
-# =============================================================================
+$KeepEnglishSDH = $true          # Keep an English SDH subtitle track in addition to the main subtitle.
+$KeepEnglishFallbackAudio = $true # Keep a secondary lossy English audio track when the main track is lossless.
 
 # =============================================================================
 # Notes
@@ -148,6 +125,27 @@ $KeepEnglishFallbackAudio = $true # Keep a secondary lossy English audio track w
 # - Runs short sample encodes before the full encode starts
 # - Helps avoid wasting hours on files that would end up too large
 # - Auto mode may use preflight to retune CRF / FilmGrain before the main encode
+
+# =============================================================================
+# End of user-configurable settings
+# =============================================================================
+
+
+$script:ResolvedScriptProcessPriority = 'Normal'
+$script:QueueShutdownRequested = $false
+$script:QueueShutdownMessageShown = $false
+$script:QueueShutdownSentinel = '__QUEUE_SHUTDOWN__'
+$script:OriginalTreatControlCAsInput = $null
+$script:HeldForCpuAnnouncements = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$script:SessionLogPath = $null
+$script:QueuePaused = $false
+$script:SoftExitRequested = $false
+$script:ShowHelpOverlay = $false
+$script:ConsoleCommandContext = [pscustomobject]@{ Kind = ''; Target = ''; ExpiresAt = $null }
+$script:ConsoleStatus = [pscustomobject]@{ Message = ''; Level = 'Info'; ExpiresAt = $null }
+$script:ThreadControlInteropLoaded = $false
+$script:TestAutoShutdownAt = $null
+$script:TestAutoShutdownSeconds = 0
 
 # Queue / log paths  (all relative to the script's own directory)
 $QueueRoot       = Join-Path $PSScriptRoot ".queue"
