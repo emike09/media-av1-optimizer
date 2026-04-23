@@ -1,36 +1,18 @@
 #requires -Version 7.0
 # =============================================================================
-# PlexAV1Queue.ps1
+# Media2AV1Queue.ps1
 #
-# Drag-and-drop AV1 batch encoder for Plex libraries.
+# Queue-based AV1 encoder for video libraries.
 #
-# Drop one or more video files onto PlexAV1Queue.bat. Each file is added to a
-# filesystem queue under .queue\pending\. A machine-global named mutex ensures
-# only one queue manager process runs at a time — if an encoder session is
-# already active, newly dropped files are silently appended to the queue and
-# will be picked up by the active lane scheduler.
-#
-# Per-file workflow:
-#   1. ffprobe inspects the source and returns full stream/format metadata.
-#   2. Stream selection picks the best English audio, an optional lossy
-#      fallback, main English subtitles, and an optional SDH track. All other
-#      streams (commentary, foreign, junk) are discarded.
-#   3. HDR / Dolby Vision detection decides the colour-space output flags.
-#      DV sources are skipped by default to avoid destroying DV metadata.
-#   4. ffmpeg re-encodes video to AV1 (libsvtav1) and muxes into MKV. Audio
-#      and subtitles are stream-copied. Progress is read from stderr in real
-#      time and rendered as a live console UI with a queue sidebar.
-#   5. The output is verified (duration check), the original is replaced or
-#      backed up, and the result is appended to encode_log.csv.
+# Edit settings in the "User-configurable settings" section below.
 #
 # Requirements:
-#   - PowerShell 7.0+  (pwsh.exe)  — ships with .NET 5+
-#   - ffmpeg / ffprobe 8.1 full build (or newer full build) — placed next to
-#     the script or on PATH. FFmpeg 6.x / 7.x and stripped/basic builds are
-#     unsupported.
-#
+# - PowerShell 7+
+# - FFmpeg / FFprobe 8.1 full build
+# - FFmpeg 6.x / 7.x / stripped/basic builds are not supported
 # =============================================================================
-#Do not change the following lines:
+
+# Do not change the following lines.
 [CmdletBinding()]
 param(
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -56,13 +38,11 @@ $script:ThreadControlInteropLoaded = $false
 $script:TestAutoShutdownAt = $null
 $script:TestAutoShutdownSeconds = 0
 
-# Supports bare `Auto` in the config block so users can write either:
+# Supports bare Auto in config, e.g.:
 #   $CRF = Auto
 # or
 #   $CRF = 'Auto'
-# In expression context PowerShell otherwise tries to invoke `Auto` as a
-# command before our later config validation can normalize it.
-# Do not changes the following lines:
+# Do not change this function.
 function Auto {
     return 'Auto'
 }
@@ -70,115 +50,104 @@ function Auto {
 # =============================================================================
 # User-configurable settings
 # =============================================================================
+# Quick start:
+# - Best quality/compression: $EncoderPreference = 'CPU'
+# - Best speed:               $EncoderPreference = 'Nvidia'
+# - Best automation:          $EncoderPreference = 'Auto'
+# - Most users should leave CRF / Preset / FilmGrain on Auto
+# =============================================================================
 
-# Encoding quality / speed
-# Each setting accepts either an integer, bare Auto, or the string 'Auto'.
-$CRF       = Auto   # SVT-AV1 CRF. Lower = better quality, larger file. Range 0-63, or 'Auto'.
-$Preset    = Auto    # SVT-AV1 preset. Lower = slower encode, higher efficiency. Range 0-13, or 'Auto'.
-$AutoCRFOffset = Auto  # Applies only when CRF='Auto'. Integer offset added to the resolved auto CRF, or 'Auto' for 0.
+# ------------------------------------------------------------------------
+# Quality
+# ------------------------------------------------------------------------
+$CRF = Auto                       # 0-63, recommend 10-28, or Auto. Lower = better quality / larger file.
+$Preset = Auto                    # Software: 0-13, recommend 3-6, or Auto. Lower = slower / better compression.
+$AutoCRFOffset = Auto             # Integer or Auto. Recommended -2 to +2. Auto = 0.
+$FilmGrain = Auto                 # 0-50, recommend 0-16, or Auto. See notes below.
 
-# Encoder preference / lane selection
-# Auto   = choose CPU or NVIDIA per file based on source analysis, preflight,
-#          and current lane availability.
-# CPU    = software AV1 only (libsvtav1).
-# Nvidia = NVIDIA AV1 only (av1_nvenc). Fails early if NVIDIA AV1 is unavailable.
-$EncoderPreference = 'Auto' # Auto | CPU | Nvidia
-
-# Process priority
+# ------------------------------------------------------------------------
+# Encoder lanes
+# ------------------------------------------------------------------------
+$EncoderPreference = 'Auto'       # Auto | CPU | Nvidia
 $SoftwareEncodePriority = 'BelowNormal' # Idle | BelowNormal | Normal | AboveNormal
 $HardwareEncodePriority = 'Normal'      # Idle | BelowNormal | Normal | AboveNormal
-$ScriptProcessPriority  = 'Normal'      # Priority for the controlling PowerShell process
-$ApplyProcessPriority   = $true         # Master toggle for process priority handling
+$ScriptProcessPriority  = 'Normal'      # Idle | BelowNormal | Normal | AboveNormal
+$ApplyProcessPriority   = $true         # $true = apply priority settings above
 
-# NVENC mode settings
-# NVENC is much faster than software SVT-AV1, but compression efficiency and
-# grain retention behavior are generally worse at similar perceptual quality.
-# Film grain synthesis is typically not available in FFmpeg's av1_nvenc path,
-# so Auto mode may force FilmGrain=0 and log the reason when NVENC is enabled.
-$NvencMaxParallel     = Auto    # Integer or 'Auto'. Auto uses GPU model lookup / capability table.
-$NvencCQ              = Auto    # Integer or 'Auto'. CQ target for av1_nvenc; separate from software CRF.
-$NvencPreset          = Auto    # 'p1'..'p7' or 'Auto'. Auto chooses a quality-biased preset.
-$NvencDecode          = Auto    # 'Auto', 'cpu', or 'cuda'. Auto prefers the most reliable path.
+# ------------------------------------------------------------------------
+# NVENC
+# ------------------------------------------------------------------------
+$NvencMaxParallel = Auto          # 1-8, recommend Auto, or Auto. Auto uses GPU model lookup.
+$NvencCQ = Auto                   # 0-51, recommend 18-28, or Auto. Lower = better quality / larger file.
+$NvencPreset = Auto               # p1-p7 or Auto. Recommended p5-p6 for quality-focused NVENC.
+$NvencDecode = Auto               # Auto | cpu | cuda
+$NvencTune = 'auto'               # auto | hq | ll | ull | $null
+$NvencAllowSplitFrame = $false    # $true = allow split-frame if supported. Leave off unless testing.
 
-# NVENC tuning mode for av1_nvenc (FFmpeg 8.1 full build required)
-# Options:
-#   'auto' = use 'hq' if supported, otherwise disable tune
-#   'hq'   = High quality (recommended)
-#   'll'   = Low latency
-#   'ull'  = Ultra low latency
-#   $null  = disabled
-#
-# Notes:
-# - This script requires a full FFmpeg 8.1 build.
-# - Older FFmpeg versions and stripped/basic builds are not supported.
-# - Some FFmpeg builds may not expose -tune for av1_nvenc.
-# - The script only passes -tune when the local FFmpeg build supports it.
-$NvencTune            = 'auto'
-$NvencAllowSplitFrame = $false  # Leave split-frame encoding disabled by default.
-#Split-frame may be useful for single-file encoding, but comes with risks and 
-#reduced quality / compression. 
+# ------------------------------------------------------------------------
+# Preflight estimation & auto-tuning
+# ------------------------------------------------------------------------
+$EnablePreflightEstimate = $true              # Run sample-based estimate before full encode.
+$PreflightSampleCount = 4                     # 1-12, recommend 3-6.
+$PreflightSampleDurationSec = 30              # 5-120, recommend 15-30.
+$PreflightWarnIfEstimatedPctOfSource = 95     # 1-1000, recommend 90-100.
+$PreflightAbortIfEstimatedPctOfSource = 100   # 1-1000, recommend 95-110.
+$EnablePreflightAutoTune = $true              # Allow preflight to retune Auto settings.
+$EnableSecondPreflightPass = $true            # Run one more preflight after major retuning.
+$PreflightAutoTuneQuality = 'High'            # Low | Medium | High
 
-# Size estimation / preflight
-$EnablePreflightEstimate = $true
-$PreflightSampleCount = 4
-$PreflightSampleDurationSec = 30
-$PreflightWarnIfEstimatedPctOfSource = 95
-$PreflightAbortIfEstimatedPctOfSource = 100
-$EnablePreflightAutoTune = $true
-$EnableSecondPreflightPass = $true
-$PreflightAutoTuneQuality = 'High' # Low = smaller files | Medium = balanced | High = more quality-preserving
-$PreflightTinyOutputPctThreshold = 35
-$PreflightTinyOutputAbsoluteGiBThreshold = 1.0
-$EnableLiveSizeEstimate = $true
-$LiveEstimateStartPercent = 3
-$LiveEstimateSmoothingFactor = 0.30
+# Tiny-output safety check
+# Helps catch cases where Auto mode may compress too aggressively.
+$PreflightTinyOutputPctThreshold = 35         # 1-100, recommend 25-50.
+$PreflightTinyOutputAbsoluteGiBThreshold = 1.0 # 0.1-100.0, recommend 0.5-2.0.
+
+# Live size estimate
+$EnableLiveSizeEstimate = $true               # Show estimated final size during encode.
+$LiveEstimateStartPercent = 3                 # 1-100, recommend 3-15.
+$LiveEstimateSmoothingFactor = 0.30           # 0.01-1.00, recommend 0.20-0.40.
 
 # Advanced preflight overrides
-$PreflightAutoTuneCustomTargetGiBPerHour = $null
-$PreflightAutoTuneCustomUpperGiBPerHour = $null
-$PreflightAutoTuneCustomLowerGiBPerHour = $null
+# Leave these at $null unless you specifically want manual GiB/hr control.
+$PreflightAutoTuneCustomTargetGiBPerHour = $null # Decimal or $null. Recommended 1.0-20.0 depending on source.
+$PreflightAutoTuneCustomUpperGiBPerHour = $null  # Decimal or $null. Recommended target + 1 to +4.
+$PreflightAutoTuneCustomLowerGiBPerHour = $null  # Decimal or $null. Recommended target - 1 to -4.
 
-# Film grain synthesis
-# AV1 supports storing a compact grain model in the bitstream instead of encoding
-# the actual grain pixel-by-pixel. The decoder regenerates perceptually identical
-# grain at playback, which can dramatically reduce file size for noisy or grainy
-# sources (film grain, heavy ISO noise) with no visible quality loss.
-#
-# $FilmGrain sets the SVT-AV1 film-grain parameter (0-50):
-#   0       Disabled. Grain is encoded literally. Best for clean CGI/animation.
-#   4-8     Light grain. Good starting point for modern digital cinema releases.
-#   8-15    Moderate grain. Typical for Blu-ray film transfers.
-#   15-25   Heavy grain. Use for visibly grainy film sources (e.g. 70s/80s film,
-#           high-ISO documentary footage, or notoriously grainy titles like
-#           Saving Private Ryan, The Revenant, or Hereditary).
-#   25-50   Extreme grain. Rarely needed; use only for severely degraded sources.
-#
-# When in doubt, start at 8 and adjust based on the source. Setting this too high
-# on a clean source introduces artificial noise; too low on a grainy source just
-# means the encoder wastes bits trying to reproduce random noise pixel-by-pixel.
-#
-# This is the single highest-impact setting for oversized encodes of grain-heavy
-# content. A title that produces 70 GiB at FilmGrain=0 may produce 20-25 GiB at
-# FilmGrain=12 with identical perceptual quality on a calibrated display. 
-# Effect on encoding speed: Without film grain synthesis (FilmGrain=0), the encoder 
-#tries to preserve every grain pixel. With film grain synthesis (FilmGrain > 0), 
-#the encoder removes grain during encoding and stores a compact grain model.
-#The decoder later reconstructs this grain. Gains on encoding speed can be up to 30%. 
-$FilmGrain = Auto    # 0 = disabled. Range 0-50, or 'Auto'. See notes above for guidance.
-
+# ------------------------------------------------------------------------
 # Source handling
-$SkipDolbyVisionSources = $true    # Skip DV sources rather than silently destroying DV metadata.
-$KeepBackupOriginal     = $false   # $true  -> move original to .queue\backup_originals\ after encode.
-                                   # $false -> delete original after a verified successful encode.
-$ReplaceOriginal        = $true    # Replace the source with the finished AV1-named .mkv when enabled.
+# ------------------------------------------------------------------------
+$SkipDolbyVisionSources = $true   # $true = skip DV sources by default.
+$KeepBackupOriginal = $false      # $true = move original to backup folder after success.
+$ReplaceOriginal = $true          # $true = replace source with finished AV1 output on success.
 
+# ------------------------------------------------------------------------
 # Stream selection
-$KeepEnglishSDH           = $false  # Retain an SDH subtitle track alongside the main subtitle.
-$KeepEnglishFallbackAudio = $true  # Retain a secondary lossy English audio track (e.g. stereo AAC)
-                                   # when the main track is lossless. Excluded if same codec as main.
+# ------------------------------------------------------------------------
+$KeepEnglishSDH = $false          # Keep an English SDH subtitle track.
+$KeepEnglishFallbackAudio = $true # Keep a secondary lossy English audio track when useful.
+
 # =============================================================================
-# End of User-configurable settings
+# End of user-configurable settings
 # =============================================================================
+
+# =============================================================================
+# Notes
+# =============================================================================
+# FilmGrain guide:
+# - 0     = disabled / clean CGI / animation
+# - 4-8   = light grain
+# - 8-15  = typical Blu-ray film grain
+# - 15-25 = heavy grain
+# - 25+   = extreme / degraded sources
+#
+# NVENC notes:
+# - Faster than software SVT-AV1
+# - Lower compression efficiency at similar visual quality
+# - Film grain synthesis may not be available in the NVENC AV1 path
+#
+# Preflight notes:
+# - Runs short sample encodes before the full encode starts
+# - Helps avoid wasting hours on files that would end up too large
+# - Auto mode may use preflight to retune CRF / FilmGrain before the main encode
 
 # Queue / log paths  (all relative to the script's own directory)
 $QueueRoot       = Join-Path $PSScriptRoot ".queue"
@@ -5150,6 +5119,17 @@ function Write-ProgressUI {
         $null = $sb.Append("`r`n")
     }
 
+    $staleLineCount = [Math]::Max(0, $UICursorRow - $lineCount)
+    for ($i = 0; $i -lt $staleLineCount; $i++) {
+        $null = $sb.Append("`r")
+        $null = $sb.Append("${ESC}[K")
+        $null = $sb.Append("`r`n")
+    }
+    if ($staleLineCount -gt 0) {
+        $null = $sb.Append("${ESC}[${staleLineCount}A")
+        $null = $sb.Append("`r")
+    }
+
     [Console]::Write($sb.ToString())
     return $lineCount
 }
@@ -5659,6 +5639,17 @@ function Write-LaneProgressUI {
         $null = $sb.Append("`r`n")
     }
 
+    $staleLineCount = [Math]::Max(0, $UICursorRow - $lineCount)
+    for ($i = 0; $i -lt $staleLineCount; $i++) {
+        $null = $sb.Append("`r")
+        $null = $sb.Append("${ESC}[K")
+        $null = $sb.Append("`r`n")
+    }
+    if ($staleLineCount -gt 0) {
+        $null = $sb.Append("${ESC}[${staleLineCount}A")
+        $null = $sb.Append("`r")
+    }
+
     [Console]::Write($sb.ToString())
     return $lineCount
 }
@@ -6027,6 +6018,17 @@ function Write-NvencProgressUI {
         $null = $sb.Append($l)
         $null = $sb.Append("${ESC}[K")
         $null = $sb.Append("`r`n")
+    }
+
+    $staleLineCount = [Math]::Max(0, $UICursorRow - $lineCount)
+    for ($i = 0; $i -lt $staleLineCount; $i++) {
+        $null = $sb.Append("`r")
+        $null = $sb.Append("${ESC}[K")
+        $null = $sb.Append("`r`n")
+    }
+    if ($staleLineCount -gt 0) {
+        $null = $sb.Append("${ESC}[${staleLineCount}A")
+        $null = $sb.Append("`r")
     }
 
     [Console]::Write($sb.ToString())
