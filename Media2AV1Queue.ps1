@@ -8,15 +8,47 @@
 #
 # Requirements:
 # - PowerShell 7+
-# - FFmpeg / FFprobe 8.1 full build
+# - FFmpeg / FFprobe 9.0 full build (9.0.1 or newer recommended)
+# - FFmpeg 8.x runs with reduced HDR capability; see Test-RequiredFfmpegBuild
 # - FFmpeg 6.x / 7.x / stripped/basic builds are not supported
+#
+# Optional external tools, auto-detected next to this script or on PATH:
+# - hdr10plus_tool   HDR10+ (SMPTE ST 2094-40) extraction, and injection on
+#                    builds with AV1 support
+# - dovi_tool        Dolby Vision RPU inspection
+#
+# What FFmpeg 9 is used for here:
+# - -mastering_display / -content_light  per-stream static HDR10 metadata, so
+#   mastering display colour volume and MaxCLL/MaxFALL survive the re-encode
+# - dovi_split                           Dolby Vision Profile 7 base-layer
+#   extraction, so DV sources convert to correct HDR10 instead of being skipped
+# - av1_nvenc hierarchical B-frames      compression gain at equal CQ on Ada+
 # =============================================================================
 
 # Do not change the following lines.
 [CmdletBinding()]
 param(
     [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$InputPaths
+    [string[]]$InputPaths,
+
+    # Per-drop CRF bias, supplied by Media2AV1Queue-Interactive.ps1.
+    #
+    # This parameter was missing, while the interactive wrapper has always
+    # splatted it for its Aggressive / Balanced / Quality tiers. Because the
+    # param block declared only $InputPaths, PowerShell rejected the call with
+    # "A parameter cannot be found that matches parameter name
+    # 'AutoCRFOffsetOverride'" -- so tiers 2, 3 and 4 failed outright and only
+    # tier 1 (Auto, which passes no override) ever worked.
+    #
+    # The value is attached to each queued job rather than held in a global, so
+    # a drop queued as Quality still encodes as Quality even if the worker picks
+    # it up much later alongside jobs from a different drop.
+    [string]$AutoCRFOffsetOverride = '',
+
+    # Explicit output-rate target in GiB/hr for this drop, supplied by
+    # Media2AV1Queue-Interactive.ps1. Beats both the resolution ladder and the
+    # source-rate cap. Empty means "decide normally".
+    [string]$TargetGiBPerHourOverride = ''
 )
 
 Set-StrictMode -Version Latest
@@ -50,6 +82,8 @@ $FilmGrain = Auto      # AV1 film grain synthesis strength. 0-50, recommend 0-16
 # Encoder lanes
 # ------------------------------------------------------------------------
 $EncoderPreference = 'Auto'       # Preferred encoder path. Auto | CPU | Nvidia. Auto chooses per file.
+$CpuMaxParallel = 1              # Simultaneous CPU (SVT-AV1) encodes. 1-4. Read the CPU parallelism note below first.
+$SoftwarePinCores = 0            # Cores per CPU encode, via svtav1-params pin. 0 = no pinning. Only meaningful when $CpuMaxParallel > 1.
 $SoftwareEncodePriority = 'BelowNormal' # Priority for CPU software encodes. Idle | BelowNormal | Normal | AboveNormal.
 $HardwareEncodePriority = 'Normal'      # Priority for GPU/NVENC encodes. Idle | BelowNormal | Normal | AboveNormal.
 $ScriptProcessPriority  = 'Normal'      # Priority for this PowerShell controller process. Idle | BelowNormal | Normal | AboveNormal.
@@ -79,7 +113,7 @@ $PreflightAutoTuneQuality = 'High'            # Auto-tune quality profile. Low |
 
 # Tiny-output safety check
 # Helps catch cases where Auto mode may compress too aggressively.
-$PreflightTinyOutputPctThreshold = 25         # Flag outputs smaller than this % of source size as suspicious. 1-100, recommend 25-50.
+$PreflightTinyOutputPctThreshold = 35         # Flag outputs smaller than this % of source size as suspicious. 1-100, recommend 25-50.
 $PreflightTinyOutputAbsoluteGiBThreshold = 1.0 # Also flag projected outputs below this size in GiB. 0.1-100.0, recommend 0.5-2.0.
 
 # Live size estimate
@@ -89,21 +123,85 @@ $LiveEstimateSmoothingFactor = 0.30           # Smooth live estimate fluctuation
 
 # Advanced preflight overrides
 # Leave these at $null unless you specifically want manual GiB/hr control.
+$PreflightMaxFractionOfSourceRate = 0.65      # Cap the target at this fraction of the SOURCE's own GiB/hr. 0.1-1.0, or $null to disable. See the note below.
 $PreflightAutoTuneCustomTargetGiBPerHour = $null # Override target output rate in GiB/hr. Decimal or $null. Recommend 1.0-20.0 depending on source.
 $PreflightAutoTuneCustomUpperGiBPerHour = $null  # Override upper tuning threshold in GiB/hr. Decimal or $null. Recommend target + 1 to +4.
 $PreflightAutoTuneCustomLowerGiBPerHour = $null  # Override lower tuning threshold in GiB/hr. Decimal or $null. Recommend target - 1 to -4.
 
 # ------------------------------------------------------------------------
+# Perceptual quality targeting                          (requires FFmpeg 7.1+)
+# ------------------------------------------------------------------------
+# This is what turns "make the file smaller" into "make the file smaller
+# without losing anything you can see". Read the quality notes below before
+# changing the thresholds.
+$EnableQualityTargeting = $true    # Measure sample encodes and search for the highest CRF that still looks the same. $true recommended.
+$QualityMetric = Auto              # Metric to use. Auto | VMAF | XPSNR | Off. Auto = VMAF for SDR, XPSNR for HDR.
+$QualityMode = Auto                # Auto | Absolute | Anchor. Auto = Absolute for VMAF, Anchor for XPSNR.
+$QualitySampleCount = 2            # Sample positions measured per CRF probe. 1-6, recommend 2-3. More = slower but steadier.
+$QualitySampleDurationSec = 15     # Seconds per quality sample. 5-60, recommend 10-20.
+$QualityMaxSearchPasses = 3        # CRF probes after the first. 1-6, recommend 2-4. Each pass is one more round of sample encodes.
+$QualityMaxCrfStep = 6             # Largest CRF jump the search may take in one pass. 1-16.
+$QualityMaxCrfAboveAuto = 12       # Never raise CRF more than this above what Auto picked. 0-30.
+$QualityMaxCrfBelowAuto = 8        # Never lower CRF more than this below what Auto picked. 0-30.
+$QualityCrfCeiling = Auto          # Absolute CRF cap, or Auto to use Auto CRF + $QualityMaxCrfAboveAuto.
+$QualitySkipIfFloorUnreachable = $true # Leave a file alone when no CRF in range is visually transparent. $true recommended.
+$QualityReportSecondMetric = $true # Also report the other metric at the chosen CRF, for the log. Costs one extra measurement per file.
+
+# VMAF (SDR): absolute, human-calibrated scale where 100 is the reference.
+$QualityVmafTarget = 95.0          # Minimum VMAF for the output. 88-98, recommend 93-96. Higher = better quality / larger files.
+$QualityVmafAnchorDrop = 0.5       # VMAF points allowed below the anchor, when $QualityMode = Anchor. 0.2-3.0.
+$QualityVmafConvergenceBand = 0.5  # Stop searching once VMAF is within this much above target. 0.1-2.0.
+$QualityVmafThreads = 8            # Threads for the VMAF calculation. 1-16.
+
+# XPSNR (HDR, and the fallback when libvmaf is missing): anchored, because the
+# absolute dB number means almost nothing across different content.
+$QualityAnchorCRF = 22             # REFERENCE quality level, not a ceiling. The search finds the cheapest CRF that looks this good.
+$QualityXpsnrAnchorDropDb = 0.25   # dB allowed below the anchor. 0.1-1.0, recommend 0.2-0.4. Larger = smaller files.
+$QualityXpsnrConvergenceBand = 0.15 # Stop searching once within this many dB above threshold. 0.05-0.50.
+$QualityXpsnrAbsoluteTarget = 42.0 # Only used if $QualityMode = Absolute. See the warning in the quality notes.
+$QualityXpsnrAggregation = 'Weighted' # How to combine the y/u/v scores. Weighted | Min | Luma.
+
+# ------------------------------------------------------------------------
+# SVT-AV1 compression efficiency
+# ------------------------------------------------------------------------
+# Every one of these is verified against the encoder before it is used, so an
+# unsupported setting is reported rather than silently discarded.
+$SoftwareTune = Auto               # SVT-AV1 tune. 0 = VQ, 1 = PSNR, 2 = SSIM, or Auto (2). Library default is 1.
+$SoftwareKeyintSeconds = 10        # Keyframe interval in seconds. 0 = leave at the library default (161 frames). 5-15 recommended.
+$SoftwareVarianceBoost = Auto      # Protect flat and dark areas at higher CRF. Auto | $true | $false. Auto = on.
+$SoftwareVarianceBoostStrength = 2 # Variance boost strength. 1-4, recommend 2.
+$SoftwareFilmGrainDenoise = $false # Let film-grain synthesis replace real grain instead of adding to it. See the film grain note.
+$SoftwareSceneChangeDetection = $false # svtav1-params scd=1. Off by default; measure it before enabling.
+$SoftwareEnableOverlays = $false   # svtav1-params enable-overlays=1. Off by default; measure it before enabling.
+$SoftwareQpScaleCompressStrength = $null # svtav1-params qp-scale-compress-strength, 0-3, or $null to leave at the library default.
+
+# ------------------------------------------------------------------------
+# HDR handling                                            (requires FFmpeg 9+)
+# ------------------------------------------------------------------------
+$PreserveHdrStaticMetadata = $true   # Carry mastering-display colour volume + MaxCLL/MaxFALL into the output. $true strongly recommended.
+$PreserveHDR10Plus = 'Auto'          # HDR10+ dynamic metadata. Auto | $true | $false. Auto preserves it when the required tools are present.
+$PreserveHLG = $true                 # Keep HLG sources tagged HLG. $false reverts to the old behaviour of mislabelling them as PQ.
+$HdrToolsDir = $null                 # Folder containing hdr10plus_tool / dovi_tool. $null = look next to this script, then on PATH.
+$ClampMaxCllToMasteringPeak = $false # Fix sources that declare MaxCLL brighter than their own mastering peak. See the MaxCLL note.
+$ClampMaxCllMinPeakNits = 400        # Only clamp when the mastering peak is at least this bright. 100-4000.
+$ClampMaxCllMinOvershoot = 1.5       # Only clamp when MaxCLL exceeds the peak by at least this factor. 1.1-10.0.
+
+# ------------------------------------------------------------------------
 # Source handling
 # ------------------------------------------------------------------------
-$SkipDolbyVisionSources = $true   # Skip Dolby Vision sources instead of converting them without DV metadata.
+$DolbyVisionMode = 'HDR10'        # Dolby Vision sources. Skip | HDR10 | Passthrough. HDR10 converts the base layer; Skip is the old behaviour.
+$SkipDolbyVisionSources = $false  # Legacy switch, kept for compatibility. $true forces $DolbyVisionMode to 'Skip'.
 $KeepBackupOriginal = $false      # Keep a backup copy of the original after a successful encode.
 $ReplaceOriginal = $true          # Replace the source file with the finished AV1 output after success.
+
+# Legacy override: if the old switch is explicitly on, honour it so existing
+# deployments do not change behaviour on upgrade without the user asking.
+if ($SkipDolbyVisionSources) { $DolbyVisionMode = 'Skip' }
 
 # ------------------------------------------------------------------------
 # Stream selection
 # ------------------------------------------------------------------------
-$KeepEnglishSDH = $true          # Keep an English SDH subtitle track in addition to the main subtitle.
+$KeepEnglishSDH = $false          # Keep an English SDH subtitle track in addition to the main subtitle.
 $KeepEnglishFallbackAudio = $true # Keep a secondary lossy English audio track when the main track is lossless.
 
 # =============================================================================
@@ -125,6 +223,119 @@ $KeepEnglishFallbackAudio = $true # Keep a secondary lossy English audio track w
 # - Runs short sample encodes before the full encode starts
 # - Helps avoid wasting hours on files that would end up too large
 # - Auto mode may use preflight to retune CRF / FilmGrain before the main encode
+#
+# Preflight target notes:
+# - The resolution/HDR ladder below sets a target output rate, but a ladder
+#   cannot know how well the SOURCE was already encoded. A 2160p AMZN WEB-DL can
+#   sit at 6.4 GiB/hr while the UHD SDR "High" ladder aims for 10 GiB/hr -- and
+#   a target above the source's own rate can only INFLATE the file. Auto then
+#   picks a very low CRF to reach that target, preflight projects an output
+#   larger than the source, and the job is refused. Nothing is wrong with the
+#   encoder; the target was impossible to satisfy usefully.
+# - $PreflightMaxFractionOfSourceRate caps the target at a fraction of the
+#   measured source rate, so the target is always a saving. 0.65 aims for
+#   roughly a third off. Lower it for smaller files, raise it toward 1.0 to
+#   preserve more, or set $null to restore the old ladder-only behaviour.
+# - For one-off control, the interactive drop menu can set an explicit target
+#   for a single drop, which overrides both the ladder and this cap.
+#
+# CPU parallelism notes:
+# - A single SVT-AV1 instance does not scale perfectly to very high core counts:
+#   synchronisation and serial phases leave capacity unused. Two concurrent
+#   encodes can therefore beat one wide encode on TOTAL throughput, which is what
+#   matters when converting a whole library.
+# - It is hardware- and content-dependent, so measure rather than guess.
+#   Media2AV1Queue-Bench.ps1 reports both, establishes a noise floor from repeat
+#   runs, and only calls a winner when the margin exceeds it.
+# - Raising $CpuMaxParallel costs memory (each 4K SVT-AV1 instance wants several
+#   GB) and raises per-file latency: each file takes proportionally longer even
+#   though more of them finish per hour.
+# - $SoftwarePinCores maps to svtav1-params pin=N, restricting an encode to N
+#   cores so concurrent encodes contend less. Leave at 0 for a single encode --
+#   pinning a lone encode only starves it.
+#
+# Quality notes:
+# - The goal of this script is a smaller file with no visible quality loss. The
+#   preflight machinery above only ever measured SIZE, which cannot answer the
+#   second half of that. Quality targeting closes the gap: it encodes short
+#   samples at several CRFs, MEASURES each one against the source, and picks the
+#   highest CRF that is still visually transparent. Higher CRF means a smaller
+#   file, so "highest that still looks the same" is exactly the objective.
+# - This moves CRF in both directions. The Auto ladder is driven by resolution,
+#   codec and bits-per-pixel, none of which knows how hard the picture actually
+#   is to encode. Easy content is routinely given far more bitrate than it needs;
+#   difficult content is occasionally given too little.
+# - Two metrics, each used only where it is valid:
+#     VMAF  (SDR) Netflix's perceptual model. Its scale is calibrated against
+#           human scores, so an absolute target such as 95 means something. Its
+#           models are trained on SDR, so it is not used on HDR.
+#     XPSNR (HDR) Fraunhofer HHI's perceptually weighted PSNR, developed on
+#           UHD/HDR material. Stock FFmpeg 7.1+, no model files needed.
+# - XPSNR is used against an ANCHOR, not against a fixed dB number, and the
+#   reason is worth knowing before changing $QualityXpsnrAbsoluteTarget. Measured
+#   while building this, on one build, same encoder settings:
+#       flat, low-detail source   CRF 18 -> 64.5 dB   CRF 50 -> 49.9 dB
+#       heavily grained source    CRF 18 -> 35.1 dB   CRF 46 -> 32.0 dB
+#   The widely quoted "above 42 dB is visually lossless" would refuse to
+#   compress the grained source at any CRF at all, and would wave the flat
+#   source through at CRF 50. The absolute number carries almost no information
+#   across content. $QualityAnchorCRF instead names a reference quality level:
+#   the search asks "how good would CRF 22 have looked on THIS content?" and
+#   then finds the cheapest CRF that still looks that good.
+# - $QualityAnchorCRF is the setting to change if output is consistently bigger
+#   or smaller than wanted. Raise it for smaller files, lower it for higher
+#   quality. It costs one extra sample encode per file.
+# - When no CRF in the permitted range is transparent, the file is LEFT ALONE
+#   rather than encoded at reduced quality. Some files genuinely cannot be
+#   shrunk without visible loss, and re-encoding those is the one outcome this
+#   script should never produce. $QualitySkipIfFloorUnreachable controls it.
+# - The defaults are starting points, not settled constants. Run
+#   Media2AV1Queue-Quality.ps1 against a few real files from your own library:
+#   it prints the size-versus-quality curve so the thresholds can be set from
+#   your own content and your own eyes rather than from someone's defaults.
+#
+# Film grain note:
+# - Film-grain synthesis is emitted as film-grain=N:film-grain-denoise=0. With
+#   denoise off the encoder adds synthetic grain on top of the grain it already
+#   coded, which preserves the look but saves almost nothing: measured here,
+#   film-grain 0 -> 16 at fixed CRF changed the file by under 1%.
+# - The size win comes from $SoftwareFilmGrainDenoise = $true, where the encoder
+#   denoises first (cheap to code) and re-synthesises grain afterwards. That is
+#   a real trade: it replaces the original grain rather than reproducing it, so
+#   reference-based metrics score it lower even when it looks fine. Measure it
+#   on grainy content of your own before turning it on library-wide.
+#
+# MaxCLL note:
+# - Some masters declare a MaxCLL brighter than their own mastering-display
+#   peak, which is self-contradictory: the content cannot be brighter than the
+#   display it was graded on. A library census here found 15 such files, and
+#   they split into genuinely different cases -- placeholders near 10,000 nits,
+#   overshoots of two to six times, mild overshoots under twice, and at least
+#   one file where the PEAK is the wrong field rather than MaxCLL.
+# - $ClampMaxCllToMasteringPeak is therefore off by default and deliberately
+#   conservative when on: it clamps only when the peak is credible
+#   ($ClampMaxCllMinPeakNits or brighter) AND the overshoot is large
+#   ($ClampMaxCllMinOvershoot or more). A file with a 200-nit peak and a
+#   574-nit MaxCLL is left untouched, because there the peak is what looks
+#   wrong. Every clamp is written to the log.
+#
+# HDR notes:
+# - $PreserveHdrStaticMetadata is the single most important setting for HDR
+#   output quality. Without it the encode carries PQ/BT.2020 signalling but no
+#   mastering-display colour volume and no MaxCLL/MaxFALL, so the display has
+#   to fall back to generic tone-mapping assumptions. That is the usual cause
+#   of an AV1 re-encode looking flatter than its source on an HDR10+ TV.
+# - HDR10+ (SMPTE ST 2094-40) cannot be carried into AV1 by stock FFmpeg and
+#   mainline SVT-AV1. Preserving it needs either:
+#     a) an SVT-AV1 built from svt-av1-hdr / SVT-AV1-PSY with enable-hdr10plus,
+#        which accepts hdr10plus-json during the encode, or
+#     b) an hdr10plus_tool build with AV1 support, used to re-inject the
+#        metadata OBUs after encoding.
+#   The script probes for both and reports which route it took. With neither,
+#   output is still correct static HDR10 -- it just has no dynamic metadata.
+# - Dolby Vision Profile 5 is deliberately never converted. Its base layer has
+#   no HDR10-compatible representation, so re-tagging it as HDR10 produces
+#   visibly wrong colour. Profiles 7 and 8 convert cleanly.
 
 # =============================================================================
 # End of user-configurable settings
@@ -226,6 +437,35 @@ $LogColumns = @(
     'NvencCapacitySource',
     'DetectedGpuName',
     'FilmGrainDisabledReason',
+    # --- HDR / dynamic metadata -------------------------------------------
+    # These make it possible to answer "did this file actually keep its HDR
+    # metadata?" from the log alone, without re-probing the output.
+    'SourceHdrFormat',
+    'HdrTargetFormat',
+    'HdrStaticMetadata',
+    'HdrMaxCLL',
+    'HdrMaxFALL',
+    'HdrHDR10PlusSource',
+    'HdrHDR10PlusOutput',
+    'DolbyVisionProfile',
+    'DolbyVisionStrategy',
+    'HdrPlanSummary',
+    'MaxCllClamped',
+    # --- Measured perceptual quality --------------------------------------
+    # These are the columns that make "did this stay transparent?" answerable
+    # from the log alone, per file, months later.
+    'QualityMetric',
+    'QualityMode',
+    'QualityThreshold',
+    'QualityMeasured',
+    'QualityAnchorCRF',
+    'QualityAnchorMetric',
+    'QualityTransparencyMet',
+    'QualityProbeCount',
+    'QualityCrfDelta',
+    'QualitySecondMetric',
+    'QualitySecondMetricValue',
+    'SvtEfficiencyParams',
     'FfmpegPath',
     'FfprobePath',
     'Notes'
@@ -236,6 +476,11 @@ $LogColumns = @(
 # sessions and UAC boundaries. Each script directory keeps its own .queue
 # folder, so two separate copies of this script queue independently but will
 # never drive the same queue at the same time.
+# Clamped rather than trusted: an accidental large value would spawn enough
+# concurrent 4K encodes to exhaust memory.
+$CpuMaxParallel   = [Math]::Max(1, [Math]::Min(4, [int]$CpuMaxParallel))
+$SoftwarePinCores = [Math]::Max(0, [Math]::Min([Environment]::ProcessorCount, [int]$SoftwarePinCores))
+
 $MutexName = "Global\PlexAV1QueueMutex"
 
 # =============================================================================
@@ -679,26 +924,69 @@ function Test-RequiredFfmpegBuild {
 
     $versionText = (& $ExecutablePath -hide_banner -version | Out-String)
     if ([string]::IsNullOrWhiteSpace($versionText)) {
-        throw "Unable to inspect FFmpeg version information. This script requires a full FFmpeg 8.1 build."
+        throw "Unable to inspect FFmpeg version information. This script requires a full FFmpeg 9.0 or newer build."
     }
 
     $versionLine = (($versionText -split "\r?\n")[0]).Trim()
 
+    # 6.x / 7.x lack too much of what this script relies on to be worth
+    # supporting, and 7.x additionally predates the Dolby Vision work.
     if ($versionText -match '(?im)^ffmpeg version [^\r\n]*\b(?:n?6(?:\.\d+)?|n?7(?:\.\d+)?)\b') {
-        throw "This script requires a full FFmpeg 8.1 build. FFmpeg 6.x / 7.x builds are unsupported. Detected: $versionLine"
+        throw "This script requires a full FFmpeg 9.0 or newer build. FFmpeg 6.x / 7.x builds are unsupported. Detected: $versionLine"
     }
 
     if ($versionText -match '(?i)\b(?:essentials|basic|minimal|lite)(?:[_ -]?build)?\b') {
-        throw "This script requires a full FFmpeg 8.1 build. Stripped/basic FFmpeg builds are unsupported. Detected: $versionLine"
+        throw "This script requires a full FFmpeg build. Stripped/basic FFmpeg builds are unsupported. Detected: $versionLine"
     }
 
-    if ($versionText -notmatch '(?i)\b(?:n?8\.1|8\.1)\b' -and $versionText -notmatch '(?i)full_build') {
-        Write-Warning "This script is designed for a full FFmpeg 8.1 build. Older FFmpeg 6.x / 7.x and stripped/basic builds are unsupported. Detected: $versionLine. NVENC tune support will still be checked against the local build."
+    # Parse the major version so the HDR feature gate can be reported precisely
+    # rather than pattern-matched against one expected release string.
+    #
+    # Git snapshot builds carry no version number at all -- gyan.dev, for
+    # instance, reports "ffmpeg version 2026-08-17-git-426841da9d-full_build".
+    # Those are typically *ahead* of the numbered releases, so treating an
+    # unparseable version as suspect would be exactly backwards. A dated git
+    # build is recognised and dated instead, and the capability probes below
+    # decide what it can actually do.
+    $majorVersion = 0
+    $isGitBuild   = $false
+    $buildDate    = $null
+
+    if ($versionText -match '(?im)^ffmpeg version \D*(\d+)\.\d') {
+        $majorVersion = [int]$Matches[1]
+    } elseif ($versionText -match '(?im)^ffmpeg version\s+(\d{4})-(\d{2})-(\d{2})\S*git') {
+        $isGitBuild = $true
+        $buildDate  = [datetime]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
+        # The 9.0 branch was cut from master on 2026-06-26, so any git build
+        # from that date onward contains the 9.0 feature set.
+        if ($buildDate -ge [datetime]::new(2026, 6, 26)) { $majorVersion = 9 }
+    } elseif ($versionText -match '(?im)^ffmpeg version \S*git') {
+        $isGitBuild = $true
+    }
+
+    # 8.x still runs, but without -mastering_display / -content_light the static
+    # HDR10 payload can only reach the output through svtav1-params, which means
+    # the NVENC lane cannot carry it at all. Say so plainly instead of letting
+    # HDR jobs quietly lose their colour volume.
+    if ($majorVersion -gt 0 -and $majorVersion -lt 9) {
+        Write-Warning "FFmpeg $majorVersion.x detected: $versionLine"
+        Write-Warning "  This script is built for FFmpeg 9.0+. On 8.x the following are unavailable:"
+        Write-Warning "    - -mastering_display / -content_light  (static HDR10 metadata on the NVENC lane)"
+        Write-Warning "    - dovi_split                           (Dolby Vision Profile 7 base-layer extraction)"
+        Write-Warning "  HDR encodes will be steered to the CPU lane where possible, and Dolby Vision"
+        Write-Warning "  sources may be skipped. Upgrading to FFmpeg 9.0.1 or newer is recommended."
+    } elseif ($isGitBuild -and $majorVersion -ge 9) {
+        Write-Host ("FFmpeg git build dated {0:yyyy-MM-dd} (post-9.0 branch point): {1}" -f $buildDate, $versionLine) -ForegroundColor DarkGray
+    } elseif ($majorVersion -eq 0) {
+        Write-Warning "Could not determine the FFmpeg version from: $versionLine. Relying on capability probing."
     }
 
     return [ordered]@{
-        VersionLine = $versionLine
-        VersionText = $versionText
+        VersionLine  = $versionLine
+        VersionText  = $versionText
+        MajorVersion = $majorVersion
+        IsGitBuild   = $isGitBuild
+        BuildDate    = $buildDate
     }
 }
 
@@ -739,6 +1027,185 @@ function Test-TextContainsOption {
     )
 
     return ($Text -match "(?m)^\s+-$([Regex]::Escape($OptionName))\b")
+}
+
+# ffmpeg prints its two kinds of options with different indentation, and
+# conflating them silently breaks capability detection:
+#
+#   AVOptions (from -h encoder=X) are INDENTED:
+#       "  -preset            <int>   E..V....... Encoding preset"
+#   CLI options (from -h full) start at COLUMN 0:
+#       "-map_metadata outfile[,metadata]:infile[,metadata]  set metadata"
+#
+# Test-TextContainsOption requires leading whitespace, so it finds the former
+# and can NEVER find the latter. -mastering_display and -content_light are CLI
+# options, which is why a perfectly capable FFmpeg 9 build reported them as
+# missing. This variant tolerates either indentation.
+function Test-TextContainsCliOption {
+    param(
+        [string]$Text,
+        [string]$OptionName
+    )
+
+    return ($Text -match "(?m)^\s*-$([Regex]::Escape($OptionName))\b")
+}
+
+# The definitive capability check: hand the option to ffmpeg and see whether it
+# is rejected. Help-text parsing is a heuristic that depends on formatting that
+# changes between releases; this depends only on ffmpeg's own parser.
+#
+# Encodes a single 64x64 frame to the null muxer, so it costs milliseconds and
+# writes nothing. Only argument-parsing errors are treated as "unsupported" --
+# an option that parses but then fails for an unrelated reason (no GPU, say) is
+# reported through $Accepted separately so callers can tell the two apart.
+function Test-FfmpegOptionSupported {
+    param(
+        [string[]]$OptionArguments,
+        [string]$Encoder = 'libsvtav1',
+        [string[]]$ExtraEncoderArguments = @()
+    )
+
+    $probeArgs = New-Object System.Collections.Generic.List[string]
+    $probeArgs.AddRange([string[]]@(
+        '-hide_banner', '-nostdin',
+        '-f', 'lavfi', '-i', 'color=c=black:s=64x64:r=1:d=1',
+        '-c:v', $Encoder, '-frames:v', '1'
+    ))
+    if ($ExtraEncoderArguments.Count -gt 0) { $probeArgs.AddRange([string[]]$ExtraEncoderArguments) }
+    $probeArgs.AddRange([string[]]$OptionArguments)
+    $probeArgs.AddRange([string[]]@('-f', 'null', '-'))
+
+    $stdErrText = ''
+    $exitCode = -1
+    try {
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = $FfmpegPath
+        foreach ($a in $probeArgs) { $psi.ArgumentList.Add($a) }
+        $psi.RedirectStandardError  = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.UseShellExecute = $false
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $stdErrText = $proc.StandardError.ReadToEnd()
+        $null = $proc.StandardOutput.ReadToEnd()
+        if (-not $proc.WaitForExit(30000)) {
+            try { $proc.Kill($true) } catch { }
+            return [ordered]@{ Supported = $false; Accepted = $false; ExitCode = -1; Detail = 'probe timed out' }
+        }
+        $exitCode = $proc.ExitCode
+    } catch {
+        return [ordered]@{ Supported = $false; Accepted = $false; ExitCode = -1; Detail = "probe could not run: $($_.Exception.Message)" }
+    }
+
+    # ffmpeg's own wording for an option it does not know.
+    # Covers both "ffmpeg does not know this option" and "ffmpeg knows it but
+    # not in this position/form" -- the latter is how a stream specifier that
+    # the option does not accept actually reports itself.
+    $rejected = $stdErrText -match '(?im)Unrecognized option|Option not found|Error splitting the argument list|No such option|Unable to find a suitable output format|cannot be applied to|Error parsing options'
+    $lastLine = (($stdErrText -split "\r?\n" | Where-Object { $_.Trim() }) | Select-Object -Last 1)
+
+    return [ordered]@{
+        Supported = (-not $rejected)
+        Accepted  = ((-not $rejected) -and $exitCode -eq 0)
+        ExitCode  = $exitCode
+        Detail    = if ($rejected) { 'option rejected by ffmpeg' } else { [string]$lastLine }
+    }
+}
+
+# Determines whether av1_nvenc can actually encode with B-frames.
+#
+# This is a DIFFERENTIAL probe: it runs the same encode twice, once without
+# B-frames and once with, and only concludes "unsupported" when the control
+# succeeds and the B-frame run fails. That distinction matters because a naive
+# single probe blames B-frames for any failure at all -- and the first version
+# of this check did exactly that, on two counts:
+#
+#   * It used a 64x64 source. NVENC enforces a driver-side minimum frame size
+#     that is larger than that for AV1, so the probe failed on dimensions and
+#     reported "B-frames disabled" on a GPU that supports them perfectly well.
+#   * It encoded a single frame. One frame cannot exercise a B-frame GOP, since
+#     there is nothing for a B-frame to sit between.
+#
+# 1280x720 is comfortably above any NVENC minimum, and 16 frames is enough for
+# a real pyramid. On an Ada-class GPU the whole probe is well under a second,
+# and it runs once per session.
+#
+# ffmpeg reports an unsupported B-frame count as a *warning*
+# ("Max B-frames %d exceed %d") and then fails the session, so the last line of
+# stderr is the generic "Conversion failed!". The informative lines are
+# extracted here rather than just the final one.
+function Test-Av1NvencBFrameSupport {
+    param([int]$BFrames = 2)
+
+    function Invoke-NvencProbe {
+        param([string[]]$ExtraArgs)
+
+        $probeArgs = New-Object System.Collections.Generic.List[string]
+        $probeArgs.AddRange([string[]]@(
+            '-hide_banner', '-nostdin',
+            '-f', 'lavfi', '-i', 'color=c=black:s=1280x720:r=24:d=1',
+            '-c:v', 'av1_nvenc', '-preset', 'p1', '-frames:v', '16'
+        ))
+        if ($ExtraArgs.Count -gt 0) { $probeArgs.AddRange([string[]]$ExtraArgs) }
+        $probeArgs.AddRange([string[]]@('-f', 'null', '-'))
+
+        try {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = $FfmpegPath
+            foreach ($a in $probeArgs) { $psi.ArgumentList.Add($a) }
+            $psi.RedirectStandardError  = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.UseShellExecute = $false
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $errText = $proc.StandardError.ReadToEnd()
+            $null = $proc.StandardOutput.ReadToEnd()
+            if (-not $proc.WaitForExit(60000)) {
+                try { $proc.Kill($true) } catch { }
+                return [ordered]@{ Ok = $false; Diagnostic = 'probe timed out' }
+            }
+
+            # Keep the lines that actually say something, not the generic tail.
+            $interesting = @($errText -split "\r?\n" | Where-Object {
+                $_ -match '(?i)b-?frames|exceed|not supported|invalid|no capable|cannot|failed to|error'
+            } | Where-Object { $_ -notmatch '(?i)^\s*Conversion failed' } | Select-Object -First 3)
+
+            $diag = if ($interesting.Count -gt 0) { ($interesting -join ' || ').Trim() }
+                    elseif ($proc.ExitCode -ne 0) { 'no diagnostic message; exit code ' + $proc.ExitCode }
+                    else { '' }
+
+            return [ordered]@{ Ok = ($proc.ExitCode -eq 0); Diagnostic = $diag }
+        } catch {
+            return [ordered]@{ Ok = $false; Diagnostic = "probe could not run: $($_.Exception.Message)" }
+        }
+    }
+
+    $control = Invoke-NvencProbe -ExtraArgs @()
+
+    if (-not $control.Ok) {
+        # NVENC itself is not usable in this environment, so nothing can be
+        # concluded about B-frames. Reported as inconclusive, and B-frames are
+        # left off rather than guessed at.
+        return [ordered]@{
+            Supported    = $false
+            Inconclusive = $true
+            Detail       = "av1_nvenc could not complete even a plain test encode, so B-frame support is undetermined. $($control.Diagnostic)".Trim()
+        }
+    }
+
+    $withB = Invoke-NvencProbe -ExtraArgs @('-bf', "$BFrames", '-b_ref_mode', 'middle')
+
+    if ($withB.Ok) {
+        return [ordered]@{
+            Supported    = $true
+            Inconclusive = $false
+            Detail       = "av1_nvenc accepted bf=$BFrames with b_ref_mode=middle."
+        }
+    }
+
+    return [ordered]@{
+        Supported    = $false
+        Inconclusive = $false
+        Detail       = "av1_nvenc encodes fine without B-frames but rejected bf=$BFrames. $($withB.Diagnostic)".Trim()
+    }
 }
 
 function Test-TextContainsValue {
@@ -841,6 +1308,23 @@ function Get-NvencEnvironment {
         throw "NVENC mode requested, but FFmpeg could not describe encoder=av1_nvenc."
     }
 
+    # Whether av1_nvenc can actually use B-frames has to be tested, not read.
+    #
+    # FFmpeg 9 added hierarchical B-frame support to the AV1 NVENC encoder. There
+    # is no dedicated option for it -- it is driven by the existing generic -bf
+    # (max_b_frames) together with -b_ref_mode. Earlier builds and older drivers
+    # refuse B-frames for AV1, and the refusal shows up at encoder init, not at
+    # argument parsing, so only a real one-frame encode distinguishes them.
+    #
+    # Runs once per session and is cached with the rest of the NVENC environment.
+    $nvencBFrameProbe = Test-Av1NvencBFrameSupport -BFrames 2
+
+    if ($nvencBFrameProbe.Inconclusive) {
+        Write-Warning "av1_nvenc B-frame probe was inconclusive: $($nvencBFrameProbe.Detail)"
+    } elseif (-not $nvencBFrameProbe.Supported) {
+        Write-Warning "av1_nvenc will encode without B-frames: $($nvencBFrameProbe.Detail)"
+    }
+
     $nvidiaSmiPath = Get-NvidiaSmiPath
     if (-not $nvidiaSmiPath) {
         throw "NVENC mode requested, but nvidia-smi was not found."
@@ -875,6 +1359,14 @@ function Get-NvencEnvironment {
         SupportsTemporalAQ    = Test-TextContainsOption -Text $encoderHelpText -OptionName 'temporal-aq'
         SupportsAQStrength    = Test-TextContainsOption -Text $encoderHelpText -OptionName 'aq-strength'
         SupportsBRefMode      = Test-TextContainsOption -Text $encoderHelpText -OptionName 'b_ref_mode'
+        # -bf is a GENERIC AVCodecContext option (max_b_frames), not an encoder
+        # private option, so it never appears in -h encoder=av1_nvenc output.
+        # Probing the help text for it always returns false, which would leave
+        # every NVENC encode at bf=0 -- exactly the compression the hierarchical
+        # B-frame work is supposed to gain. It is resolved functionally instead,
+        # by $nvencBFrameProbe below.
+        SupportsBFrames       = $nvencBFrameProbe.Supported
+        SupportsBFrameReason  = $nvencBFrameProbe.Detail
         SupportsMultipass     = Test-TextContainsOption -Text $encoderHelpText -OptionName 'multipass'
         SupportsHighBitDepth  = Test-TextContainsOption -Text $encoderHelpText -OptionName 'highbitdepth'
         SupportsSplitEncode   = Test-TextContainsOption -Text $encoderHelpText -OptionName 'split_encode_mode'
@@ -1010,19 +1502,48 @@ function Convert-SoftwareQualityToNvencSettings {
     $pixFmt = if ($SourceProfile.HasHDR -or $AutoSettings.BitDepth -ge 10) { 'p010le' } else { 'yuv420p' }
     $bitDepth = if ($pixFmt -eq 'p010le') { 10 } else { 8 }
 
+    # B-frame depth. AV1 NVENC on Ada and newer handles a pyramid reference
+    # structure in dedicated silicon, so a deeper GOP is close to free in encode
+    # time while measurably improving compression. Animation and low-motion
+    # content benefit most, so the depth follows the same difficulty signal the
+    # preset selection already computes.
+    #
+    # 4 is the practical ceiling for AV1 NVENC; going deeper stops paying for
+    # itself and increases decode complexity on playback devices.
+    $bFrames = if ($AutoSettings.GrainClass -in @('heavy', 'extreme')) {
+        2   # Heavy grain: long reference chains smear grain detail.
+    } elseif ($AutoSettings.ResolutionTier -eq 'UHD') {
+        3
+    } else {
+        4
+    }
+
+    # Hierarchical structure is implied by bf >= 2 with b_ref_mode middle; there
+    # is no separate flag to set. Recorded for the log only.
+    $useHierarchicalB = $NvencEnvironment.SupportsBFrames -and $NvencEnvironment.SupportsBRefMode -and $bFrames -ge 2
+
     return [ordered]@{
-        CQ             = $cq
-        Preset         = $preset
-        PresetReason   = $presetReason
-        Tune           = $tune
-        TuneReason     = $tuneReason
-        TuneWarning    = $tuneResolution.Warning
-        TuneDisplay    = if ([string]::IsNullOrWhiteSpace([string]$tune)) { 'disabled' } else { $tune }
-        DecodePath     = $decodePath
-        DecodeReason   = $decodeReason
-        PixFmt         = $pixFmt
-        BitDepth       = $bitDepth
-        Reason         = "Mapped software-style Auto CRF $softwareCrf to NVENC CQ $cq."
+        CQ               = $cq
+        Preset           = $preset
+        PresetReason     = $presetReason
+        Tune             = $tune
+        TuneReason       = $tuneReason
+        TuneWarning      = $tuneResolution.Warning
+        TuneDisplay      = if ([string]::IsNullOrWhiteSpace([string]$tune)) { 'disabled' } else { $tune }
+        DecodePath       = $decodePath
+        DecodeReason     = $decodeReason
+        PixFmt           = $pixFmt
+        BitDepth         = $bitDepth
+        BFrames          = $bFrames
+        UseHierarchicalB = $useHierarchicalB
+        BFrameReason     = if ($useHierarchicalB) {
+            "Hierarchical B-frames: bf=$bFrames with b_ref_mode=middle (FFmpeg 9 AV1 NVENC)."
+        } elseif ($NvencEnvironment.SupportsBFrames) {
+            "bf=$bFrames without a pyramid reference structure (b_ref_mode unavailable)."
+        } else {
+            "B-frames unavailable on this build/driver: $($NvencEnvironment.SupportsBFrameReason)"
+        }
+        Reason           = "Mapped software-style Auto CRF $softwareCrf to NVENC CQ $cq."
     }
 }
 
@@ -1039,7 +1560,19 @@ function Get-AutoLaneHint {
         $AutoSettings
     )
 
-    $preflightTargets = Resolve-PreflightAutoTuneTargets -QualityProfile $PreflightAutoTuneQuality -ResolutionTier $AutoSettings.ResolutionTier -SourceProfile $SourceProfile
+    $preflightTargets = Resolve-PreflightAutoTuneTargets -QualityProfile $PreflightAutoTuneQuality -ResolutionTier $AutoSettings.ResolutionTier -SourceProfile $SourceProfile `
+        -SourceGiBPerHour ([double](Get-OptionalProperty -InputObject $AutoSettings -PropertyName 'VideoBitratePerHourGiB' -Default 0.0))
+
+    # HDR10+ can only be carried inline by SVT-AV1, and the CPU lane is also
+    # where the static colour volume is guaranteed to survive on any build. A
+    # dynamic-metadata source is therefore steered to the CPU lane before any
+    # throughput consideration applies.
+    if ($SourceProfile.HasHDR10Plus) {
+        return [pscustomobject][ordered]@{
+            Lane   = 'CPU'
+            Reason = 'HDR10+ dynamic metadata source; software lane required to preserve it'
+        }
+    }
 
     if ($SourceProfile.HasHDR -and $AutoSettings.ResolutionTier -eq 'UHD') {
         return [pscustomobject][ordered]@{
@@ -1082,7 +1615,8 @@ function Get-EncoderLaneSuitability {
     $cpuReasons = [System.Collections.Generic.List[string]]::new()
     $nvidiaPreferredScore = 0
     $nvidiaReasons = [System.Collections.Generic.List[string]]::new()
-    $preflightTargets = Resolve-PreflightAutoTuneTargets -QualityProfile $PreflightAutoTuneQuality -ResolutionTier $AutoSettings.ResolutionTier -SourceProfile $SourceProfile
+    $preflightTargets = Resolve-PreflightAutoTuneTargets -QualityProfile $PreflightAutoTuneQuality -ResolutionTier $AutoSettings.ResolutionTier -SourceProfile $SourceProfile `
+        -SourceGiBPerHour ([double](Get-OptionalProperty -InputObject $AutoSettings -PropertyName 'VideoBitratePerHourGiB' -Default 0.0))
 
     if ($AutoSettings.ResolutionTier -eq 'UHD' -and $SourceProfile.HasHDR) {
         $cpuOnlyScore += 1
@@ -1219,7 +1753,29 @@ function Test-NvencFallbackSuitable {
         }
     }
 
-    if ($Init.ResolvedEncodeLane -ne 'Nvidia') {
+    # This can be handed an EARLY-EXIT init -- @{ EarlyExit; Row } -- when the
+    # alternate lane's preflight declined the job. That object has none of the
+    # fields below, and under Set-StrictMode -Version Latest reading a missing
+    # key throws, so the whole queue entry died with:
+    #
+    #   The property 'ResolvedEncodeLane' cannot be found on this object.
+    #
+    # which is what turned "both lanes declined this file" into FAILED. There is
+    # nothing to judge for NVENC suitability when there is no resolved encode:
+    # return neutral and let the caller's own EarlyExit branch decide.
+    $earlyExit = [string](Get-OptionalProperty -InputObject $Init -PropertyName 'EarlyExit' -Default '')
+    if (-not [string]::IsNullOrWhiteSpace($earlyExit)) {
+        return [pscustomobject][ordered]@{
+            Allowed = $true
+            Reason  = "No resolved encode to assess (early exit: $earlyExit)."
+        }
+    }
+
+    $initSourceProfile = Get-OptionalProperty -InputObject $Init -PropertyName 'SourceProfile' -Default $null
+    $initAutoSettings  = Get-OptionalProperty -InputObject $Init -PropertyName 'AutoSettings'  -Default $null
+    $initLane          = [string](Get-OptionalProperty -InputObject $Init -PropertyName 'ResolvedEncodeLane' -Default '')
+
+    if ($initLane -ne 'Nvidia') {
         return [pscustomobject][ordered]@{
             Allowed = $true
             Reason  = ''
@@ -1227,11 +1783,12 @@ function Test-NvencFallbackSuitable {
     }
 
     $preflight = Get-OptionalProperty -InputObject $Init -PropertyName 'PreflightEstimate' -Default $null
-    $isHdr = [bool](Get-OptionalProperty -InputObject $Init.SourceProfile -PropertyName 'HasHDR' -Default $false)
-    $resolutionTier = [string](Get-OptionalProperty -InputObject $Init.AutoSettings -PropertyName 'ResolutionTier' -Default '')
-    $codecClass = [string](Get-OptionalProperty -InputObject $Init.AutoSettings -PropertyName 'CodecClass' -Default '')
-    $grainClass = [string](Get-OptionalProperty -InputObject $Init.AutoSettings -PropertyName 'GrainClass' -Default '')
-    $preflightTargets = Resolve-PreflightAutoTuneTargets -QualityProfile $PreflightAutoTuneQuality -ResolutionTier $resolutionTier -SourceProfile $Init.SourceProfile
+    $isHdr = [bool](Get-OptionalProperty -InputObject $initSourceProfile -PropertyName 'HasHDR' -Default $false)
+    $resolutionTier = [string](Get-OptionalProperty -InputObject $initAutoSettings -PropertyName 'ResolutionTier' -Default '')
+    $codecClass = [string](Get-OptionalProperty -InputObject $initAutoSettings -PropertyName 'CodecClass' -Default '')
+    $grainClass = [string](Get-OptionalProperty -InputObject $initAutoSettings -PropertyName 'GrainClass' -Default '')
+    $preflightTargets = Resolve-PreflightAutoTuneTargets -QualityProfile $PreflightAutoTuneQuality -ResolutionTier $resolutionTier -SourceProfile $initSourceProfile `
+        -SourceGiBPerHour ([double](Get-OptionalProperty -InputObject $initAutoSettings -PropertyName 'VideoBitratePerHourGiB' -Default 0.0))
 
     if ($preflight -and $preflight.Ran) {
         $pctOfSource = Convert-ToInvariantDouble (Get-OptionalProperty -InputObject $preflight -PropertyName 'EstimatedPctOfSource' -Default 0.0) 0.0
@@ -2088,7 +2645,11 @@ function Get-ExistingQueuedPaths {
 #     and the SHA-256 queue key embedded for deduplication.
 # =============================================================================
 function Add-QueueInputs {
-    param([string[]]$Paths)
+    param(
+        [string[]]$Paths,
+        [string]$AutoCRFOffsetOverrideValue = '',
+        [string]$TargetGiBPerHourOverrideValue = ''
+    )
 
     $existing = Get-ExistingQueuedPaths
 	if ($null -eq $existing) {
@@ -2125,6 +2686,8 @@ function Add-QueueInputs {
             InputPath   = $full
             EnqueuedUtc = [DateTime]::UtcNow.ToString("o")
             QueueKey    = $key
+            AutoCRFOffsetOverride = $AutoCRFOffsetOverrideValue
+            TargetGiBPerHourOverride = $TargetGiBPerHourOverrideValue
         } | ConvertTo-Json -Depth 4
 
         Set-Content -LiteralPath $jobPath -Value $job -Encoding UTF8
@@ -2702,6 +3265,1136 @@ function Invoke-FfmpegSync {
     }
 }
 
+# =============================================================================
+# Perceptual quality measurement and quality-targeted CRF search
+#
+# Everything else in this script decides file size from bitrate heuristics.
+# A heuristic can answer "how big will it be"; it can never answer "does it
+# still look the same". The second question is the actual goal -- convert to
+# AV1 and shrink the file WITHOUT losing perceptible quality -- and it cannot
+# be optimised for without being measured.
+#
+# Two metrics are used, each only where it is valid:
+#
+#   VMAF   Netflix's perceptual model. Its scale is absolute and calibrated
+#          against human scores (100 = reference), which is what makes a fixed
+#          target meaningful. Its models are trained on SDR BT.1886 material,
+#          so it is used for SDR sources only.
+#   XPSNR  Fraunhofer HHI's perceptually weighted PSNR, developed and
+#          validated on UHD/HDR. Present in stock FFmpeg 7.1+, needs no model
+#          files, and is meaningful on PQ and HLG signals.
+#
+# Why XPSNR is used RELATIVE TO AN ANCHOR instead of against a fixed dB
+# threshold. Measured on a current FFmpeg/SVT-AV1 build while building this:
+#
+#   flat, low-detail source     CRF 18 -> 64.5 dB      CRF 50 -> 49.9 dB
+#   heavily grained source      CRF 18 -> 35.1 dB      CRF 46 -> 32.0 dB
+#
+# The commonly quoted "above 42 dB is visually lossless" would therefore
+# refuse to compress the grained source at ANY CRF, and would wave through the
+# flat source at CRF 50. The absolute number carries almost no information
+# across content. Anchoring to a near-lossless encode of the SAME content
+# removes that dependence. It has a second benefit: the anchor is encoded with
+# the same film-grain synthesis settings as the candidate, so the pixel-
+# fidelity penalty that grain synthesis inflicts on ANY reference metric is
+# common to both sides and cancels out of the difference.
+#
+# Absolute VMAF has its own version of the same problem in the other
+# direction: measured here, a lossless comparison of a grained source against
+# itself scored 99.32, not 100, while an easy source hit exactly 100.000 well
+# before the CRF ceiling. That is why the VMAF path also supports anchor mode,
+# and why the shipped defaults are treated as starting points to be checked
+# with Media2AV1Queue-Quality.ps1 on real library content rather than as
+# settled constants.
+# =============================================================================
+
+# XPSNR prints "inf" when the two inputs are bit-identical. Arithmetic on the
+# parsed value still has to work, so "inf" is mapped to a finite sentinel that
+# is far above any real measurement and flagged separately.
+
+# -----------------------------------------------------------------------------
+# Determines whether libsvtav1 actually accepts an -svtav1-params key.
+#
+# This CANNOT be done by exit code, and it cannot be done from help text.
+# Verified against SVT-AV1 4.2 in a current FFmpeg build:
+#
+#   * ffmpeg -h encoder=libsvtav1 lists "-svtav1-params <dictionary>" and
+#     nothing about the keys inside it, because the keys are the library's,
+#     not ffmpeg's. Help-text probing can therefore never find one. The old
+#     HDR10+ check looked for "hdr10plus-json" in that text, which means it
+#     was guaranteed to report "unsupported" even on a fork that supports it.
+#   * An unknown key is reported as
+#         [libsvtav1 @ ...] Error parsing option totally-bogus-key: 1.
+#     and the encode then CONTINUES AND SUCCEEDS, exit code 0. So a probe that
+#     trusts the exit code reports every key as supported, including keys that
+#     were silently discarded. That failure mode is the dangerous one: it would
+#     have the script announce "HDR10+ preserved via SVT-AV1" on a build that
+#     threw the metadata away.
+#
+# The log line is the only reliable signal, and it is emitted below error
+# level, so the probe has to capture stderr at warning verbosity.
+# -----------------------------------------------------------------------------
+function Test-SvtAv1ParamSupported {
+    param([Parameter(Mandatory = $true)][string]$ParamPair)
+
+    $key = ($ParamPair -split '=', 2)[0]
+    if ([string]::IsNullOrWhiteSpace($key)) { return $false }
+    if ($script:SvtParamSupportCache.ContainsKey($key)) { return [bool]$script:SvtParamSupportCache[$key] }
+
+    $supported = $false
+    try {
+        $probeArgs = @(
+            '-hide_banner', '-nostdin', '-nostats', '-loglevel', 'warning', '-y',
+            '-f', 'lavfi', '-i', 'color=c=black:s=256x144:r=24:d=1',
+            '-frames:v', '4', '-c:v', 'libsvtav1', '-preset', '12',
+            '-svtav1-params', $ParamPair,
+            '-f', 'null', '-'
+        )
+
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = $FfmpegPath
+        foreach ($a in $probeArgs) { $psi.ArgumentList.Add($a) }
+        $psi.RedirectStandardError  = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.UseShellExecute = $false
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $stdErrText = $proc.StandardError.ReadToEnd()
+        $null = $proc.StandardOutput.ReadToEnd()
+        if (-not $proc.WaitForExit(30000)) {
+            try { $proc.Kill($true) } catch { }
+            $script:SvtParamSupportCache[$key] = $false
+            return $false
+        }
+
+        $pattern = '(?im)Error\s+parsing\s+option\s+' + [Regex]::Escape($key) + '\s*:'
+        $supported = -not ($stdErrText -match $pattern)
+    } catch {
+        $supported = $false
+    }
+
+    $script:SvtParamSupportCache[$key] = [bool]$supported
+    return [bool]$supported
+}
+
+# -----------------------------------------------------------------------------
+# Parses the xpsnr filter's summary line.
+#
+# Verified output format:
+#   [Parsed_xpsnr_2 @ 0x...] XPSNR  y: 37.2171  u: 31.9970  v: 32.5697  (minimum: 31.9970)
+# and, for bit-identical inputs:
+#   [Parsed_xpsnr_0 @ 0x...] XPSNR  y: inf  u: inf  v: inf  (minimum: inf)
+#
+# The last match in the text is the summary; per-frame lines, if stats are
+# enabled, come earlier.
+# -----------------------------------------------------------------------------
+function ConvertFrom-XpsnrOutput {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+
+    $num = 'inf|-?[0-9]+(?:\.[0-9]+)?'
+    $pattern = "(?im)XPSNR\s+y:\s*(?<y>$num)\s+u:\s*(?<u>$num)\s+v:\s*(?<v>$num)"
+    $matches = [Regex]::Matches($Text, $pattern)
+    if ($matches.Count -eq 0) { return $null }
+
+    $m = $matches[$matches.Count - 1]
+    $isLossless = $false
+    $parsed = @{}
+    foreach ($component in @('y', 'u', 'v')) {
+        $raw = $m.Groups[$component].Value
+        if ($raw -match '(?i)^inf$') {
+            $parsed[$component] = $script:QualityLosslessDbSentinel
+            $isLossless = $true
+        } else {
+            $value = 0.0
+            if (-not [double]::TryParse($raw, [System.Globalization.NumberStyles]::Float,
+                                        [System.Globalization.CultureInfo]::InvariantCulture, [ref]$value)) {
+                return $null
+            }
+            $parsed[$component] = $value
+        }
+    }
+
+    $y = [double]$parsed['y']
+    $u = [double]$parsed['u']
+    $v = [double]$parsed['v']
+
+    # Weighted is the default because the filter authors' recommended
+    # "minimum of the three" is dominated by chroma on 4:2:0 material, where
+    # chroma is already subsampled and scores several dB lower than luma
+    # regardless of encoder settings. That makes the minimum track chroma
+    # subsampling rather than encode quality.
+    $aggregate = switch ($QualityXpsnrAggregation) {
+        'Min'  { [Math]::Min($y, [Math]::Min($u, $v)) }
+        'Luma' { $y }
+        default { ((4.0 * $y) + $u + $v) / 6.0 }
+    }
+
+    return [pscustomobject][ordered]@{
+        Y          = $y
+        U          = $u
+        V          = $v
+        Minimum    = [Math]::Min($y, [Math]::Min($u, $v))
+        Weighted   = ((4.0 * $y) + $u + $v) / 6.0
+        Value      = $aggregate
+        IsLossless = $isLossless
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Parses the libvmaf filter's summary line: "VMAF score: 95.735583".
+# -----------------------------------------------------------------------------
+function ConvertFrom-VmafOutput {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+
+    $matches = [Regex]::Matches($Text, '(?im)VMAF\s+score:\s*(?<v>-?[0-9]+(?:\.[0-9]+)?)')
+    if ($matches.Count -eq 0) { return $null }
+
+    $raw = $matches[$matches.Count - 1].Groups['v'].Value
+    $value = 0.0
+    if (-not [double]::TryParse($raw, [System.Globalization.NumberStyles]::Float,
+                                [System.Globalization.CultureInfo]::InvariantCulture, [ref]$value)) {
+        return $null
+    }
+
+    return [pscustomobject][ordered]@{
+        Value      = $value
+        IsLossless = ($value -ge 99.999)
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Runs a two-input measurement filtergraph and returns its stderr.
+# -----------------------------------------------------------------------------
+function Invoke-QualityMeasurementFilter {
+    param(
+        [string]$DistortedPath,
+        [string]$SourcePath,
+        [double]$StartSec,
+        [int]$DurationSec,
+        [int]$SourceVideoStreamIndex,
+        [string]$InputBitstreamFilter = '',
+        [Parameter(Mandatory = $true)][string]$FilterSpec
+    )
+
+    $ffArgs = New-Object System.Collections.Generic.List[string]
+    $ffArgs.AddRange([string[]]@('-hide_banner', '-nostdin', '-nostats', '-loglevel', 'info'))
+
+    # Input 0: the encoded sample, exactly as it will exist in the output.
+    $ffArgs.AddRange([string[]]@('-i', $DistortedPath))
+
+    # Input 1: the same source segment, decoded the same way the sample encode
+    # decoded it. Identical -ss / -t / -bsf:v flags mean identical frames --
+    # -ss before -i is a keyframe-relative fast seek, so the two legs only line
+    # up if the flags match exactly. They must also match the sample encode's
+    # flags, which is why both come from one builder.
+    $ffArgs.AddRange([string[]]@('-ss', ("{0:0.###}" -f $StartSec), '-t', "$DurationSec"))
+    if (-not [string]::IsNullOrWhiteSpace($InputBitstreamFilter)) {
+        $ffArgs.AddRange([string[]]@('-bsf:v', $InputBitstreamFilter))
+    }
+    $ffArgs.AddRange([string[]]@('-i', $SourcePath))
+
+    # The reference is addressed by absolute stream index, not by [1:v]. A
+    # container with cover art or a thumbnail stream has more than one video
+    # stream, and [1:v] would silently pick the wrong one.
+    $refLabel = "1:$SourceVideoStreamIndex"
+    $graph = "[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[qdist];" +
+             "[$refLabel]setpts=PTS-STARTPTS,format=yuv420p10le[qref];" +
+             "[qdist][qref]$FilterSpec"
+
+    $ffArgs.AddRange([string[]]@('-lavfi', $graph, '-an', '-sn', '-dn', '-f', 'null', '-'))
+
+    return (Invoke-FfmpegSync -Arguments $ffArgs.ToArray())
+}
+
+# -----------------------------------------------------------------------------
+# Picks the VMAF model for the source resolution. The 4K model is trained for
+# UHD viewing distances; using the 1080p model on UHD material overstates
+# quality, and vice versa.
+# -----------------------------------------------------------------------------
+function Get-VmafModelName {
+    param([string]$ResolutionTier)
+
+    if ($ResolutionTier -eq 'UHD') { return 'vmaf_4k_v0.6.1' }
+    return 'vmaf_v0.6.1'
+}
+
+# -----------------------------------------------------------------------------
+# Probes what this ffmpeg build can actually measure.
+#
+# Both filters are checked functionally rather than by name, because a filter
+# can be listed and still be unusable -- libvmaf in particular needs its model
+# files, and a build can carry the filter without them.
+# -----------------------------------------------------------------------------
+function Get-QualityToolchainEnvironment {
+    if ($null -ne $script:QualityToolchainCache) { return $script:QualityToolchainCache }
+
+    $filterText = ''
+    try { $filterText = (& $FfmpegPath -hide_banner -filters 2>&1 | Out-String) } catch { $filterText = '' }
+
+    $xpsnrListed = ($filterText -match '(?im)^\s*\S+\s+xpsnr\s')
+    $vmafListed  = ($filterText -match '(?im)^\s*\S+\s+libvmaf\s')
+
+    $probe = {
+        param([string]$Spec)
+        try {
+            $probeArgs = @(
+                '-hide_banner', '-nostdin', '-nostats', '-loglevel', 'info', '-y',
+                '-f', 'lavfi', '-i', 'testsrc2=size=256x144:rate=24:duration=1',
+                '-f', 'lavfi', '-i', 'testsrc2=size=256x144:rate=24:duration=1',
+                '-lavfi', ("[0:v]format=yuv420p10le[a];[1:v]format=yuv420p10le[b];[a][b]{0}" -f $Spec),
+                '-frames:v', '4', '-f', 'null', '-'
+            )
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = $FfmpegPath
+            foreach ($a in $probeArgs) { $psi.ArgumentList.Add($a) }
+            $psi.RedirectStandardError  = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.UseShellExecute = $false
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $err = $p.StandardError.ReadToEnd()
+            $null = $p.StandardOutput.ReadToEnd()
+            if (-not $p.WaitForExit(60000)) {
+                try { $p.Kill($true) } catch { }
+                return [pscustomobject]@{ Usable = $false; Detail = 'probe timed out' }
+            }
+            $ok = ($p.ExitCode -eq 0)
+            $lastLine = (($err -split "\r?\n" | Where-Object { $_.Trim() }) | Select-Object -Last 1)
+            return [pscustomobject]@{ Usable = $ok; Detail = [string]$lastLine; Stderr = $err }
+        } catch {
+            return [pscustomobject]@{ Usable = $false; Detail = $_.Exception.Message; Stderr = '' }
+        }
+    }
+
+    $xpsnrUsable = $false
+    $xpsnrDetail = 'xpsnr filter not present (requires FFmpeg 7.1 or newer)'
+    if ($xpsnrListed) {
+        $r = & $probe 'xpsnr'
+        $xpsnrUsable = [bool]$r.Usable
+        $xpsnrDetail = [string]$r.Detail
+    }
+
+    $vmafUsable = $false
+    $vmafDetail = 'libvmaf filter not present (build lacks --enable-libvmaf)'
+    $vmaf4kUsable = $false
+    if ($vmafListed) {
+        $r = & $probe 'libvmaf=n_threads=2'
+        $vmafUsable = [bool]$r.Usable
+        $vmafDetail = [string]$r.Detail
+        if ($vmafUsable) {
+            $r4k = & $probe "libvmaf=model='version=vmaf_4k_v0.6.1':n_threads=2"
+            $vmaf4kUsable = [bool]$r4k.Usable
+        }
+    }
+
+    # libsvtav1 gained a -dolbyvision AVOption that defaults to "auto". On a
+    # source whose RPU survived into frame side data, auto can re-emit Dolby
+    # Vision into the AV1 stream -- which is the opposite of what the HDR10
+    # conversion path is trying to produce. Detecting the option lets the
+    # encoder be told explicitly not to.
+    $encoderHelpText = ''
+    try { $encoderHelpText = (& $FfmpegPath -hide_banner -h encoder=libsvtav1 2>&1 | Out-String) } catch { $encoderHelpText = '' }
+    $supportsDolbyVisionOption = Test-TextContainsOption -Text $encoderHelpText -OptionName 'dolbyvision'
+
+    $script:QualityToolchainCache = [ordered]@{
+        SupportsXpsnr              = [bool]$xpsnrUsable
+        XpsnrDetail                = $xpsnrDetail
+        SupportsVmaf               = [bool]$vmafUsable
+        VmafDetail                 = $vmafDetail
+        SupportsVmaf4kModel        = [bool]$vmaf4kUsable
+        SupportsDolbyVisionOption  = [bool]$supportsDolbyVisionOption
+    }
+
+    return $script:QualityToolchainCache
+}
+
+# -----------------------------------------------------------------------------
+# Decides which metric to use for this source, in which mode, and against what
+# threshold.
+#
+# The split is deliberate and is about validity, not preference:
+#   SDR -> VMAF absolute. VMAF's scale is human-calibrated, so a fixed target
+#          means something, and its models fit SDR material.
+#   HDR -> XPSNR anchored. VMAF's models are not trained on PQ or HLG, so an
+#          absolute VMAF number on HDR is not interpretable. XPSNR is, and
+#          anchoring removes its content dependence.
+# -----------------------------------------------------------------------------
+function Resolve-QualityMetricPlan {
+    param(
+        $SourceProfile,
+        $AutoSettings,
+        [string]$EncodeMode
+    )
+
+    $disabled = {
+        param([string]$Why)
+        [pscustomobject][ordered]@{
+            Enabled = $false; Metric = 'None'; Mode = 'None'; FilterSpec = ''
+            Threshold = 0.0; AbsoluteTarget = 0.0; AnchorDrop = 0.0
+            AnchorCRF = 0; ConvergenceBand = 0.0; InitialSlope = 0.0
+            VmafModel = ''; Reason = $Why
+        }
+    }
+
+    if (-not $EnableQualityTargeting) { return & $disabled 'Quality targeting disabled by configuration.' }
+    if ($QualityMetric -eq 'Off')     { return & $disabled 'Quality targeting disabled ($QualityMetric = Off).' }
+
+    $tc = Get-QualityToolchainEnvironment
+    $isHdr = [bool](Get-OptionalProperty -InputObject $SourceProfile -PropertyName 'HasHDR' -Default $false)
+    $tier  = [string](Get-OptionalProperty -InputObject $AutoSettings -PropertyName 'ResolutionTier' -Default 'HD')
+
+    $requested = if ([string]::IsNullOrWhiteSpace([string]$QualityMetric)) { 'Auto' } else { [string]$QualityMetric }
+    $metric = ''
+    $reasonParts = New-Object System.Collections.Generic.List[string]
+
+    switch ($requested) {
+        'VMAF' {
+            if (-not $tc.SupportsVmaf) { return & $disabled "VMAF requested but this ffmpeg build cannot run libvmaf ($($tc.VmafDetail))." }
+            $metric = 'VMAF'
+            if ($isHdr) { $reasonParts.Add('VMAF forced on an HDR source; its models are SDR-trained, so treat the number as indicative only') }
+        }
+        'XPSNR' {
+            if (-not $tc.SupportsXpsnr) { return & $disabled "XPSNR requested but this ffmpeg build cannot run the xpsnr filter ($($tc.XpsnrDetail))." }
+            $metric = 'XPSNR'
+        }
+        default {
+            if ($isHdr) {
+                if ($tc.SupportsXpsnr)   { $metric = 'XPSNR'; $reasonParts.Add('HDR source: XPSNR (VMAF models are SDR-trained)') }
+                elseif ($tc.SupportsVmaf) { $metric = 'VMAF'; $reasonParts.Add('HDR source and no xpsnr filter: falling back to VMAF, treat as indicative') }
+            } else {
+                if ($tc.SupportsVmaf)     { $metric = 'VMAF'; $reasonParts.Add('SDR source: VMAF absolute target') }
+                elseif ($tc.SupportsXpsnr) { $metric = 'XPSNR'; $reasonParts.Add('SDR source and no libvmaf: XPSNR anchored') }
+            }
+            if ([string]::IsNullOrWhiteSpace($metric)) {
+                return & $disabled "No usable quality metric in this ffmpeg build (xpsnr: $($tc.XpsnrDetail); libvmaf: $($tc.VmafDetail))."
+            }
+        }
+    }
+
+    $mode = if ([string]::IsNullOrWhiteSpace([string]$QualityMode) -or $QualityMode -eq 'Auto') {
+        if ($metric -eq 'VMAF') { 'Absolute' } else { 'Anchor' }
+    } else {
+        [string]$QualityMode
+    }
+
+    $vmafModel = ''
+    $filterSpec = ''
+    $absoluteTarget = 0.0
+    $anchorDrop = 0.0
+    $band = 0.0
+    $slope = 0.0
+
+    if ($metric -eq 'VMAF') {
+        $vmafModel = Get-VmafModelName -ResolutionTier $tier
+        if ($vmafModel -eq 'vmaf_4k_v0.6.1' -and -not $tc.SupportsVmaf4kModel) {
+            $vmafModel = 'vmaf_v0.6.1'
+            $reasonParts.Add('4K VMAF model unavailable in this build; using the 1080p model, which reads optimistic on UHD')
+        }
+        $threads = [Math]::Max(1, [Math]::Min(16, [int]$QualityVmafThreads))
+        $filterSpec = "libvmaf=model='version=$vmafModel':n_threads=$threads"
+        $absoluteTarget = [double]$QualityVmafTarget
+        $anchorDrop = [double]$QualityVmafAnchorDrop
+        $band = [double]$QualityVmafConvergenceBand
+        $slope = 0.55   # VMAF points per CRF step, measured mid-range; refined from real points as soon as two exist
+    } else {
+        $filterSpec = 'xpsnr'
+        $absoluteTarget = [double]$QualityXpsnrAbsoluteTarget
+        $anchorDrop = [double]$QualityXpsnrAnchorDropDb
+        $band = [double]$QualityXpsnrConvergenceBand
+        $slope = 0.25   # dB per CRF step; measured range across content was 0.11 (grain) to 0.46 (flat)
+    }
+
+    $threshold = if ($mode -eq 'Absolute') { $absoluteTarget } else { 0.0 }  # anchored threshold is set once the anchor is measured
+
+    if ($mode -eq 'Absolute') {
+        $reasonParts.Add(("absolute target {0:F2}" -f $absoluteTarget))
+    } else {
+        $reasonParts.Add(("anchored at CRF {0}, budget {1:F2} below it" -f $QualityAnchorCRF, $anchorDrop))
+    }
+
+    return [pscustomobject][ordered]@{
+        Enabled         = $true
+        Metric          = $metric
+        Mode            = $mode
+        FilterSpec      = $filterSpec
+        Threshold       = $threshold
+        AbsoluteTarget  = $absoluteTarget
+        AnchorDrop      = $anchorDrop
+        AnchorCRF       = [int]$QualityAnchorCRF
+        ConvergenceBand = $band
+        InitialSlope    = $slope
+        VmafModel       = $vmafModel
+        Reason          = ($reasonParts -join '; ')
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Measures one already-encoded sample against its source segment.
+# -----------------------------------------------------------------------------
+function Measure-SampleQuality {
+    param(
+        [string]$SamplePath,
+        [string]$SourcePath,
+        [double]$StartSec,
+        [int]$DurationSec,
+        [int]$SourceVideoStreamIndex,
+        [string]$InputBitstreamFilter = '',
+        $MetricPlan
+    )
+
+    $result = Invoke-QualityMeasurementFilter `
+        -DistortedPath $SamplePath `
+        -SourcePath $SourcePath `
+        -StartSec $StartSec `
+        -DurationSec $DurationSec `
+        -SourceVideoStreamIndex $SourceVideoStreamIndex `
+        -InputBitstreamFilter $InputBitstreamFilter `
+        -FilterSpec $MetricPlan.FilterSpec
+
+    if ($result.ExitCode -ne 0) {
+        return [pscustomobject][ordered]@{
+            Measured = $false
+            Value = 0.0
+            Detail = ("measurement failed: " + (($result.LogLines | Select-Object -Last 2) -join ' || '))
+        }
+    }
+
+    $parsed = if ($MetricPlan.Metric -eq 'VMAF') {
+        ConvertFrom-VmafOutput -Text $result.Stderr
+    } else {
+        ConvertFrom-XpsnrOutput -Text $result.Stderr
+    }
+
+    if ($null -eq $parsed) {
+        return [pscustomobject][ordered]@{
+            Measured = $false
+            Value = 0.0
+            Detail = 'measurement produced no parseable score'
+        }
+    }
+
+    $detail = if ($MetricPlan.Metric -eq 'VMAF') {
+        ("VMAF {0:F3}" -f $parsed.Value)
+    } else {
+        ("XPSNR {0:F3} dB (y {1:F2} / u {2:F2} / v {3:F2})" -f $parsed.Value, $parsed.Y, $parsed.U, $parsed.V)
+    }
+
+    return [pscustomobject][ordered]@{
+        Measured   = $true
+        Value      = [double]$parsed.Value
+        IsLossless = [bool]$parsed.IsLossless
+        Detail     = $detail
+        Raw        = $parsed
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Encodes the designated sample positions at one CRF and measures each.
+#
+# Returns the median metric and the median bytes/sec, so a single unusual
+# sample cannot drag the decision. Samples are deleted as soon as they have
+# been measured.
+# -----------------------------------------------------------------------------
+function Invoke-QualityProbe {
+    param(
+        [string]$InputPath,
+        $Selected,
+        $SourceProfile,
+        [string]$EncodeMode,
+        [int]$CRF,
+        [int]$ResolvedPreset,
+        [int]$ResolvedFilmGrain,
+        [double[]]$SamplePositions,
+        [int]$SampleDurationSec,
+        $MetricPlan,
+        $NvencSettings = $null,
+        $NvencEnvironment = $null,
+        $HdrPlan = $null,
+        [string]$Label = ''
+    )
+
+    $metricValues = [System.Collections.Generic.List[double]]::new()
+    $rateValues   = [System.Collections.Generic.List[double]]::new()
+    $failures     = [System.Collections.Generic.List[string]]::new()
+    $anyLossless  = $false
+    $bsf = if ($null -ne $HdrPlan) { [string](Get-OptionalProperty -InputObject $HdrPlan -PropertyName 'InputBitstreamFilter' -Default '') } else { '' }
+    $videoIndex = [int]$Selected.Video.index
+
+    for ($i = 0; $i -lt $SamplePositions.Count; $i++) {
+        $startSec = [double]$SamplePositions[$i]
+        $samplePath = Join-Path $PreflightDir ("q{0}_{1}_{2}.mkv" -f $CRF, [Guid]::NewGuid().ToString('N'), $i)
+
+        try {
+            $ffArgs = Build-PreflightSampleArgs `
+                -InputPath $InputPath `
+                -Selected $Selected `
+                -SourceProfile $SourceProfile `
+                -EncodeMode $EncodeMode `
+                -StartSec $startSec `
+                -DurationSec $SampleDurationSec `
+                -ResolvedCRF $CRF `
+                -ResolvedPreset $ResolvedPreset `
+                -ResolvedFilmGrain $ResolvedFilmGrain `
+                -NvencSettings $NvencSettings `
+                -NvencEnvironment $NvencEnvironment `
+                -HdrPlan $HdrPlan `
+                -OutputPath $samplePath
+
+            $encodeResult = Invoke-FfmpegSync -Arguments $ffArgs
+            if ($encodeResult.ExitCode -ne 0) {
+                $failures.Add(("sample {0} encode failed: {1}" -f ($i + 1), (($encodeResult.LogLines | Select-Object -Last 2) -join ' || ')))
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $samplePath)) {
+                $failures.Add(("sample {0} produced no file" -f ($i + 1)))
+                continue
+            }
+
+            $item = Get-Item -LiteralPath $samplePath
+            if ($item.Length -le 0) {
+                $failures.Add(("sample {0} produced an empty file" -f ($i + 1)))
+                continue
+            }
+
+            $measurement = Measure-SampleQuality `
+                -SamplePath $samplePath `
+                -SourcePath $InputPath `
+                -StartSec $startSec `
+                -DurationSec $SampleDurationSec `
+                -SourceVideoStreamIndex $videoIndex `
+                -InputBitstreamFilter $bsf `
+                -MetricPlan $MetricPlan
+
+            if (-not $measurement.Measured) {
+                $failures.Add(("sample {0}: {1}" -f ($i + 1), $measurement.Detail))
+                continue
+            }
+
+            $metricValues.Add([double]$measurement.Value)
+            $rateValues.Add($item.Length / [double]$SampleDurationSec)
+            if ($measurement.IsLossless) { $anyLossless = $true }
+        } finally {
+            if (Test-Path -LiteralPath $samplePath) {
+                Remove-Item -LiteralPath $samplePath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    if ($metricValues.Count -eq 0) {
+        return [pscustomobject][ordered]@{
+            Ran = $false; CRF = $CRF; Metric = 0.0; BytesPerSec = 0.0; SampleCount = 0
+            IsLossless = $false
+            Reason = if ($failures.Count -gt 0) { ($failures | Select-Object -First 2) -join ' | ' } else { 'no samples measured' }
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Ran         = $true
+        CRF         = $CRF
+        Metric      = (Get-MedianValue -Values $metricValues)
+        BytesPerSec = (Get-MedianValue -Values $rateValues)
+        SampleCount = $metricValues.Count
+        IsLossless  = $anyLossless
+        Reason      = if ($failures.Count -gt 0) { ("partial: " + (($failures | Select-Object -First 1) -join '')) } else { '' }
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Median of a numeric collection. Used everywhere a mean would let one outlier
+# sample decide a CRF.
+# -----------------------------------------------------------------------------
+function Get-MedianValue {
+    param($Values)
+
+    $sorted = @($Values | Sort-Object)
+    if ($sorted.Count -eq 0) { return 0.0 }
+    if ($sorted.Count % 2 -eq 1) { return [double]$sorted[[int][Math]::Floor($sorted.Count / 2)] }
+    return ([double]$sorted[($sorted.Count / 2) - 1] + [double]$sorted[$sorted.Count / 2]) / 2.0
+}
+
+# -----------------------------------------------------------------------------
+# Chooses the sample positions used for quality measurement.
+#
+# The same positions are used for every probe in a search, including the
+# anchor. Comparing an anchor measured on one scene against a candidate
+# measured on another would compare content, not settings.
+# -----------------------------------------------------------------------------
+function Get-QualitySamplePositions {
+    param(
+        [double]$SourceDurationSec,
+        [int]$SampleDurationSec,
+        [int]$RequestedCount
+    )
+
+    $positions = New-Object System.Collections.Generic.List[double]
+    $maxBySpan = [int][Math]::Floor(($SourceDurationSec * 0.80) / [Math]::Max(1, $SampleDurationSec))
+    $count = [Math]::Min([Math]::Max(1, $RequestedCount), [Math]::Max(0, $maxBySpan))
+
+    for ($i = 0; $i -lt $count; $i++) {
+        $fraction = 0.10 + (0.80 * (($i + 0.5) / $count))
+        $centerSec = $SourceDurationSec * $fraction
+        $startSec = [Math]::Max(0.0, [Math]::Min($SourceDurationSec - $SampleDurationSec, $centerSec - ($SampleDurationSec / 2.0)))
+        $positions.Add($startSec)
+    }
+
+    # Returned through the comma operator as a single typed object. A bare
+    # "return @()" unrolls to nothing, so the caller gets $null instead of an
+    # empty array, and reading .Count on it throws under StrictMode -- which is
+    # exactly what a too-short source would hit.
+    $result = [double[]]$positions.ToArray()
+    return ,$result
+}
+
+# -----------------------------------------------------------------------------
+# Finds the highest CRF that still meets the transparency criterion.
+#
+# The search is a secant method over (CRF, metric) points rather than a
+# bisection, because the metric-versus-CRF slope varies about fourfold across
+# content -- roughly 0.11 dB per CRF on heavy grain against 0.46 dB per CRF on
+# flat material -- so a fixed step size either crawls or overshoots. Every
+# probe is a real measurement, so the slope is re-estimated from the two
+# nearest measured points and converges in two or three passes.
+#
+# Direction matters: the goal is the HIGHEST CRF that is still transparent, so
+# a metric comfortably above the threshold is not success, it is wasted
+# bitrate, and CRF is raised until the headroom is used up.
+# -----------------------------------------------------------------------------
+function Invoke-QualityTargetedCrfSearch {
+    param(
+        [string]$InputPath,
+        $Selected,
+        $SourceProfile,
+        [string]$EncodeMode,
+        [double]$SourceDurationSec,
+        [int]$StartCRF,
+        [int]$ResolvedPreset,
+        [int]$ResolvedFilmGrain,
+        $MetricPlan,
+        $NvencSettings = $null,
+        $NvencEnvironment = $null,
+        $HdrPlan = $null
+    )
+
+    $notRun = {
+        param([string]$Why)
+        [pscustomobject][ordered]@{
+            Ran = $false; ChosenCRF = $StartCRF; StartCRF = $StartCRF
+            Metric = 0.0; MetricName = 'None'; Mode = 'None'; Threshold = 0.0
+            AnchorCRF = 0; AnchorMetric = 0.0; TransparencyMet = $true
+            ProbeCount = 0; Passes = @(); Reason = $Why
+            BytesPerSecAtChosen = 0.0
+        }
+    }
+
+    if (-not $MetricPlan.Enabled) { return & $notRun $MetricPlan.Reason }
+
+    $sampleDuration = [Math]::Max(4, [Math]::Min(120, [int]$QualitySampleDurationSec))
+    $positions = Get-QualitySamplePositions -SourceDurationSec $SourceDurationSec -SampleDurationSec $sampleDuration -RequestedCount ([int]$QualitySampleCount)
+    if ($positions.Count -lt 1) {
+        return & $notRun 'Source is too short for the configured quality sample spacing.'
+    }
+
+    $ceiling = if ($QualityCrfCeiling -eq 'Auto') {
+        [Math]::Min(63, $StartCRF + [int]$QualityMaxCrfAboveAuto)
+    } else {
+        [Math]::Max(0, [Math]::Min(63, [int]$QualityCrfCeiling))
+    }
+    $floor = [Math]::Max(0, $StartCRF - [int]$QualityMaxCrfBelowAuto)
+    if ($ceiling -lt $StartCRF) { $ceiling = $StartCRF }
+
+    $probes = @{}
+    $passLog = New-Object System.Collections.Generic.List[string]
+    $probeCount = 0
+
+    $runProbe = {
+        param([int]$Crf, [string]$Label)
+        if ($probes.ContainsKey($Crf)) { return $probes[$Crf] }
+        $p = Invoke-QualityProbe `
+            -InputPath $InputPath -Selected $Selected -SourceProfile $SourceProfile `
+            -EncodeMode $EncodeMode -CRF $Crf -ResolvedPreset $ResolvedPreset `
+            -ResolvedFilmGrain $ResolvedFilmGrain -SamplePositions $positions `
+            -SampleDurationSec $sampleDuration -MetricPlan $MetricPlan `
+            -NvencSettings $NvencSettings -NvencEnvironment $NvencEnvironment `
+            -HdrPlan $HdrPlan -Label $Label
+        $probes[$Crf] = $p
+        return $p
+    }
+
+    # ---- Threshold -------------------------------------------------------
+    $anchorCrf = 0
+    $anchorMetric = 0.0
+    $threshold = 0.0
+
+    if ($MetricPlan.Mode -eq 'Anchor') {
+        # The anchor is a REFERENCE QUALITY LEVEL, not a near-lossless ceiling.
+        # It answers "how good would CRF N have looked on this content?", and
+        # the search then finds the cheapest CRF that still looks that good.
+        # It is deliberately NOT constrained to sit below the Auto CRF: on easy
+        # content the answer is a much higher CRF than Auto would have picked,
+        # and on hard content it is a lower one. That two-way movement is the
+        # whole point -- the Auto ladder is driven by resolution, codec and BPP,
+        # none of which knows how hard the picture actually is to encode.
+        $anchorCrf = [Math]::Max(0, [Math]::Min(63, [int]$MetricPlan.AnchorCRF))
+
+        Write-Host ("Quality anchor: encoding reference samples at CRF {0}" -f $anchorCrf) -ForegroundColor DarkCyan
+        $anchor = & $runProbe $anchorCrf 'anchor'
+        $probeCount++
+        if (-not $anchor.Ran) {
+            return & $notRun ("Quality anchor probe failed: {0}" -f $anchor.Reason)
+        }
+        $anchorMetric = [double]$anchor.Metric
+        $threshold = $anchorMetric - [double]$MetricPlan.AnchorDrop
+        $passLog.Add(("anchor CRF {0}: {1} {2:F3}" -f $anchorCrf, $MetricPlan.Metric, $anchorMetric))
+    } else {
+        $threshold = [double]$MetricPlan.AbsoluteTarget
+        $passLog.Add(("absolute threshold: {0} {1:F2}" -f $MetricPlan.Metric, $threshold))
+    }
+
+    # ---- First real point ------------------------------------------------
+    $current = & $runProbe $StartCRF 'start'
+    $probeCount++
+    if (-not $current.Ran) {
+        return & $notRun ("Quality probe at CRF {0} failed: {1}" -f $StartCRF, $current.Reason)
+    }
+    $passLog.Add(("CRF {0}: {1} {2:F3}" -f $StartCRF, $MetricPlan.Metric, $current.Metric))
+
+    # ---- Slope -----------------------------------------------------------
+    # An anchor gives a second real point for free, so the very first step is
+    # already content-aware instead of using the generic default.
+    $slope = [double]$MetricPlan.InitialSlope
+    $slopeMin = if ($MetricPlan.Metric -eq 'VMAF') { 0.10 } else { 0.04 }
+    $slopeMax = if ($MetricPlan.Metric -eq 'VMAF') { 3.00 } else { 1.20 }
+    if ($MetricPlan.Mode -eq 'Anchor' -and [Math]::Abs($StartCRF - $anchorCrf) -ge 2) {
+        $measured = ($anchorMetric - [double]$current.Metric) / [double]($StartCRF - $anchorCrf)
+        if ($measured -gt 0) { $slope = [Math]::Max($slopeMin, [Math]::Min($slopeMax, $measured)) }
+    }
+
+    $band = [double]$MetricPlan.ConvergenceBand
+    $maxPasses = [Math]::Max(0, [Math]::Min(6, [int]$QualityMaxSearchPasses))
+    $maxStep = [Math]::Max(1, [Math]::Min(16, [int]$QualityMaxCrfStep))
+
+    for ($pass = 1; $pass -le $maxPasses; $pass++) {
+        $err = [double]$current.Metric - $threshold
+
+        if ($err -ge 0 -and $err -le $band) {
+            $passLog.Add(("converged at CRF {0} (headroom {1:F3} within band {2:F2})" -f $current.CRF, $err, $band))
+            break
+        }
+
+        $step = [int][Math]::Round($err / $slope)
+        if ($step -eq 0) { $step = if ($err -gt 0) { 1 } else { -1 } }
+        if ($step -gt $maxStep)  { $step = $maxStep }
+        if ($step -lt -$maxStep) { $step = -$maxStep }
+
+        $next = $current.CRF + $step
+        if ($next -gt $ceiling) { $next = $ceiling }
+        if ($next -lt $floor)   { $next = $floor }
+
+        if ($next -eq $current.CRF) {
+            $boundName = if ($step -gt 0) { 'ceiling' } else { 'floor' }
+            $passLog.Add(("stopped at CRF {0}: bounded by the CRF {1}" -f $current.CRF, $boundName))
+            break
+        }
+        if ($probes.ContainsKey($next)) {
+            $passLog.Add(("stopped at CRF {0}: CRF {1} already measured" -f $current.CRF, $next))
+            break
+        }
+
+        $previous = $current
+        $probe = & $runProbe $next ("pass$pass")
+        $probeCount++
+        if (-not $probe.Ran) {
+            $passLog.Add(("CRF {0} probe failed: {1}" -f $next, $probe.Reason))
+            break
+        }
+        $passLog.Add(("CRF {0}: {1} {2:F3}" -f $next, $MetricPlan.Metric, $probe.Metric))
+
+        if ($probe.CRF -ne $previous.CRF) {
+            $secant = ([double]$previous.Metric - [double]$probe.Metric) / [double]($probe.CRF - $previous.CRF)
+            if ($secant -gt 0) { $slope = [Math]::Max($slopeMin, [Math]::Min($slopeMax, $secant)) }
+        }
+
+        $current = $probe
+    }
+
+    # ---- Pick the winner -------------------------------------------------
+    # The highest measured CRF that meets the threshold. The anchor is eligible
+    # like any other measured point, but only if it clears the CRF floor -- an
+    # anchor set well below the Auto CRF would otherwise be chosen whenever
+    # nothing else passed, inflating the file in the name of quality nobody
+    # asked for.
+    $candidates = @($probes.Values | Where-Object { $_.Ran -and $_.CRF -ge $floor })
+    $passing = @($candidates | Where-Object { [double]$_.Metric -ge $threshold } | Sort-Object -Property CRF -Descending)
+
+    if ($candidates.Count -eq 0) {
+        # Possible when every probe that ran sits below the CRF floor, which
+        # only happens if the anchor was the sole successful probe. Nothing was
+        # learned about the operating range, so report no result rather than
+        # indexing into an empty set.
+        return & $notRun 'No quality probe inside the permitted CRF range produced a measurement.'
+    }
+
+    $transparencyMet = ($passing.Count -gt 0)
+    $chosen = if ($transparencyMet) {
+        $passing[0]
+    } else {
+        # Nothing measured met the threshold. Return the lowest CRF that was
+        # tried, which is the closest approach, and let the caller's policy
+        # decide whether to encode it or leave the file alone.
+        @($candidates | Sort-Object -Property CRF)[0]
+    }
+
+    $reasonParts = New-Object System.Collections.Generic.List[string]
+    $reasonParts.Add(("{0} {1} / {2}" -f $MetricPlan.Metric, $MetricPlan.Mode, $MetricPlan.Reason))
+    $reasonParts.Add(("threshold {0:F3}" -f $threshold))
+    foreach ($line in $passLog) { $reasonParts.Add($line) }
+    if ($transparencyMet) {
+        $reasonParts.Add(("chose CRF {0} ({1} {2:F3}, {3:F3} above threshold)" -f $chosen.CRF, $MetricPlan.Metric, $chosen.Metric, ([double]$chosen.Metric - $threshold)))
+    } else {
+        $reasonParts.Add(("transparency NOT met at any measured CRF down to {0}; closest was CRF {1} at {2:F3}" -f $floor, $chosen.CRF, $chosen.Metric))
+    }
+    if ($chosen.CRF -ne $StartCRF) {
+        $reasonParts.Add(("CRF {0} -> {1} by quality search" -f $StartCRF, $chosen.CRF))
+    }
+
+    return [pscustomobject][ordered]@{
+        Ran                 = $true
+        ChosenCRF           = [int]$chosen.CRF
+        StartCRF            = $StartCRF
+        Metric              = [double]$chosen.Metric
+        MetricName          = [string]$MetricPlan.Metric
+        Mode                = [string]$MetricPlan.Mode
+        Threshold           = $threshold
+        AnchorCRF           = $anchorCrf
+        AnchorMetric        = $anchorMetric
+        TransparencyMet     = $transparencyMet
+        ProbeCount          = $probeCount
+        BytesPerSecAtChosen = [double]$chosen.BytesPerSec
+        Passes              = @($passLog)
+        Reason              = ($reasonParts -join ' | ')
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Compression-efficiency parameters for SVT-AV1.
+#
+# Every pair is functionally probed before it is emitted, because -svtav1-params
+# silently discards keys the library does not know: an unsupported key is logged
+# below error level and the encode still succeeds. Emitting a key blind means
+# believing a setting is active when it was thrown away.
+#
+# Only settings with broad agreement are on by default. The rest are exposed
+# and off, with a note to measure them on real content using
+# Media2AV1Queue-Quality.ps1 rather than to trust a forum post -- including
+# this one.
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Tells libsvtav1 not to code a Dolby Vision RPU when the target is HDR10.
+#
+# libsvtav1 exposes -dolbyvision and it defaults to "auto". On a source whose
+# RPU reached frame side data, auto can re-emit Dolby Vision into the AV1
+# stream -- the exact opposite of what the HDR10 conversion path is for, and
+# invisible until a player prefers the DV layer over the HDR10 base. The option
+# is probed rather than assumed, because it is recent.
+# -----------------------------------------------------------------------------
+function Add-SvtAv1DolbyVisionSuppression {
+    param(
+        [System.Collections.Generic.List[string]]$ArgumentList,
+        $HdrPlan
+    )
+
+    $qtc = Get-QualityToolchainEnvironment
+    if (-not $qtc.SupportsDolbyVisionOption) { return }
+
+    $target = [string](Get-OptionalProperty -InputObject $HdrPlan -PropertyName 'TargetDynamicRange' -Default '')
+    if ($target -match '(?i)dolby|dovi') { return }
+
+    $ArgumentList.AddRange([string[]]@('-dolbyvision', '0'))
+}
+
+function Get-SvtAv1EfficiencyParamPairs {
+    param(
+        $AutoSettings = $null,
+        $SourceProfile = $null,
+        [double]$FrameRate = 0.0
+    )
+
+    $pairs = New-Object System.Collections.Generic.List[string]
+
+    # --tune: 0 = VQ, 1 = PSNR, 2 = SSIM. The library default is PSNR.
+    #
+    # PSNR is deliberately NOT the default here even though the quality search
+    # can measure XPSNR, which is a PSNR-family metric. Tuning the encoder for
+    # the same thing the acceptance test measures optimises the score rather
+    # than the picture. SSIM is the setting with the broadest agreement for
+    # visual fidelity on live-action material.
+    $tuneValue = if ($SoftwareTune -eq 'Auto') { 2 } else { [int]$SoftwareTune }
+    if ($tuneValue -ge 0 -and $tuneValue -le 3) {
+        if (Test-SvtAv1ParamSupported -ParamPair "tune=$tuneValue") { $pairs.Add("tune=$tuneValue") }
+    }
+
+    # --keyint: the library default is 161 frames regardless of frame rate,
+    # which is roughly 5.4s at 30fps. Longer GOPs code fewer keyframes and cost
+    # less; 10s is standard VOD practice and still seeks acceptably.
+    if ([double]$SoftwareKeyintSeconds -gt 0) {
+        $fps = if ($FrameRate -gt 0.1) { $FrameRate } else { 24.0 }
+        $keyint = [int][Math]::Round($fps * [double]$SoftwareKeyintSeconds)
+        if ($keyint -gt 0) {
+            if (Test-SvtAv1ParamSupported -ParamPair "keyint=$keyint") { $pairs.Add("keyint=$keyint") }
+        }
+    }
+
+    # --enable-variance-boost: raises quality in low-variance regions, which is
+    # exactly where a higher CRF shows first as banding and blocking in flat
+    # skies and dark scenes. Since the point of the quality search is to push
+    # CRF as high as transparency allows, this guards the failure mode the
+    # search is walking towards.
+    $varianceOn = if ($SoftwareVarianceBoost -eq 'Auto') { $true } else { [bool]$SoftwareVarianceBoost }
+    if ($varianceOn) {
+        if (Test-SvtAv1ParamSupported -ParamPair 'enable-variance-boost=1') {
+            $pairs.Add('enable-variance-boost=1')
+            $strength = [Math]::Max(1, [Math]::Min(4, [int]$SoftwareVarianceBoostStrength))
+            if (Test-SvtAv1ParamSupported -ParamPair "variance-boost-strength=$strength") {
+                $pairs.Add("variance-boost-strength=$strength")
+            }
+        }
+    }
+
+    # Off by default. Each of these is plausible and none is settled, so they
+    # are switches rather than assumptions.
+    if ($SoftwareSceneChangeDetection) {
+        if (Test-SvtAv1ParamSupported -ParamPair 'scd=1') { $pairs.Add('scd=1') }
+    }
+    if ($SoftwareEnableOverlays) {
+        if (Test-SvtAv1ParamSupported -ParamPair 'enable-overlays=1') { $pairs.Add('enable-overlays=1') }
+    }
+    if ($null -ne $SoftwareQpScaleCompressStrength) {
+        $qpsc = [Math]::Max(0, [Math]::Min(3, [int]$SoftwareQpScaleCompressStrength))
+        if (Test-SvtAv1ParamSupported -ParamPair "qp-scale-compress-strength=$qpsc") {
+            $pairs.Add("qp-scale-compress-strength=$qpsc")
+        }
+    }
+
+    # Comma-returned for the same reason as Get-QualitySamplePositions: an
+    # empty array must arrive as an empty array, not as $null.
+    $result = [string[]]$pairs.ToArray()
+    return ,$result
+}
+
+# -----------------------------------------------------------------------------
+# Builds the ffmpeg argument list for ONE preflight / quality sample encode.
+#
+# Extracted into its own function because two callers need byte-identical
+# encodes: the size-projection preflight and the quality search. If they built
+# their arguments separately they would drift, and the earlier version of this
+# script already demonstrated what that costs -- the HDR static-metadata probe
+# tested one option form while the argument builder emitted another, so a
+# capability the build had was reported as missing.
+#
+# For the quality search the requirement is stronger than "similar": the
+# measurement compares the sample against the same source segment decoded with
+# the same seek and the same input bitstream filter. Any difference between the
+# encode leg and the measurement leg shows up as quality loss that the encoder
+# never caused.
+# -----------------------------------------------------------------------------
+function Build-PreflightSampleArgs {
+    param(
+        [string]$InputPath,
+        $Selected,
+        $SourceProfile,
+        [string]$EncodeMode,
+        [double]$StartSec,
+        [int]$DurationSec,
+        [int]$ResolvedCRF,
+        [int]$ResolvedPreset,
+        [int]$ResolvedFilmGrain,
+        $NvencSettings = $null,
+        $NvencEnvironment = $null,
+        $HdrPlan = $null,
+        [string]$OutputPath
+    )
+
+    $ffArgs = New-Object System.Collections.Generic.List[string]
+    $ffArgs.AddRange([string[]]@('-hide_banner', '-nostdin', '-y',
+                                 '-ss', ("{0:0.###}" -f $StartSec), '-t', "$DurationSec"))
+
+    if ($EncodeMode -eq 'nvenc' -and $NvencSettings -and $NvencSettings.DecodePath -eq 'cuda') {
+        $ffArgs.AddRange([string[]]@('-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'))
+    }
+
+    # The Dolby Vision base-layer filter changes what the encoder sees, so a
+    # sample taken without it measures a stream the real encode never touches.
+    if ($null -ne $HdrPlan) {
+        $bsf = [string](Get-OptionalProperty -InputObject $HdrPlan -PropertyName 'InputBitstreamFilter' -Default '')
+        if (-not [string]::IsNullOrWhiteSpace($bsf)) {
+            $ffArgs.AddRange([string[]]@('-bsf:v', $bsf))
+        }
+    }
+
+    $ffArgs.AddRange([string[]]@('-i', $InputPath, '-map', "0:$($Selected.Video.index)", '-an', '-sn', '-dn'))
+
+    if ($EncodeMode -eq 'nvenc') {
+        $ffArgs.AddRange([string[]]@('-c:v', 'av1_nvenc'))
+        if ($NvencEnvironment.SupportsPreset -and -not [string]::IsNullOrWhiteSpace($NvencSettings.Preset)) {
+            $ffArgs.AddRange([string[]]@('-preset', $NvencSettings.Preset))
+        }
+        if ($NvencEnvironment.SupportsTune -and -not [string]::IsNullOrWhiteSpace($NvencSettings.Tune)) {
+            $ffArgs.AddRange([string[]]@('-tune', $NvencSettings.Tune))
+        }
+        if ($NvencEnvironment.SupportsRc) { $ffArgs.AddRange([string[]]@('-rc', 'vbr')) }
+        if ($NvencEnvironment.SupportsCQ) { $ffArgs.AddRange([string[]]@('-cq', "$($NvencSettings.CQ)")) }
+        if ($NvencEnvironment.SupportsLookahead) { $ffArgs.AddRange([string[]]@('-rc-lookahead', '32')) }
+        if ($NvencEnvironment.SupportsSpatialAQ)  { $ffArgs.AddRange([string[]]@('-spatial-aq', '1')) }
+        if ($NvencEnvironment.SupportsTemporalAQ) { $ffArgs.AddRange([string[]]@('-temporal-aq', '1')) }
+        if ($NvencEnvironment.SupportsAQStrength) { $ffArgs.AddRange([string[]]@('-aq-strength', '8')) }
+        if ($NvencEnvironment.SupportsBRefMode)   { $ffArgs.AddRange([string[]]@('-b_ref_mode', 'middle')) }
+        if ($NvencEnvironment.SupportsBFrames -and $NvencSettings.BFrames -gt 0) {
+            $ffArgs.AddRange([string[]]@('-bf', "$($NvencSettings.BFrames)"))
+        }
+        if ($NvencEnvironment.SupportsMultipass)  { $ffArgs.AddRange([string[]]@('-multipass', 'fullres')) }
+        if ($NvencEnvironment.SupportsSplitEncode -and -not $NvencAllowSplitFrame) {
+            $ffArgs.AddRange([string[]]@('-split_encode_mode', 'disabled'))
+        }
+        $ffArgs.AddRange([string[]]@('-pix_fmt', $NvencSettings.PixFmt))
+        if ($NvencEnvironment.SupportsHighBitDepth -and $NvencSettings.BitDepth -ge 10) {
+            $ffArgs.AddRange([string[]]@('-highbitdepth', '1'))
+        }
+    } else {
+        $ffArgs.AddRange([string[]]@('-c:v', 'libsvtav1', '-preset', "$ResolvedPreset", '-crf', "$ResolvedCRF", '-pix_fmt', 'yuv420p10le'))
+
+        # One -svtav1-params occurrence only. A second occurrence replaces the
+        # first outright rather than merging, so splitting these across several
+        # options silently discards everything but the last group.
+        $svtParams = New-Object System.Collections.Generic.List[string]
+        if ($ResolvedFilmGrain -gt 0) {
+            $svtParams.Add("film-grain=$ResolvedFilmGrain")
+            $denoise = if ($SoftwareFilmGrainDenoise) { 1 } else { 0 }
+            $svtParams.Add("film-grain-denoise=$denoise")
+        }
+        if ($SoftwarePinCores -gt 0 -and $CpuMaxParallel -gt 1) {
+            $svtParams.Add("pin=$SoftwarePinCores")
+        }
+        foreach ($pair in (Get-SvtAv1EfficiencyParamPairs -SourceProfile $SourceProfile -FrameRate ([double](Get-OptionalProperty -InputObject $SourceProfile -PropertyName 'FrameRate' -Default 0.0)))) {
+            $svtParams.Add($pair)
+        }
+        foreach ($pair in (Get-HdrSvtAv1ParamPairs -HdrPlan $HdrPlan)) { $svtParams.Add($pair) }
+        if ($svtParams.Count -gt 0) {
+            $ffArgs.AddRange([string[]]@('-svtav1-params', ($svtParams -join ':')))
+        }
+    }
+
+    if ($EncodeMode -ne 'nvenc') {
+        Add-SvtAv1DolbyVisionSuppression -ArgumentList $ffArgs -HdrPlan $HdrPlan
+    }
+    Add-HdrOutputArguments -ArgumentList $ffArgs -HdrPlan $HdrPlan -SourceProfile $SourceProfile
+    $ffArgs.Add($OutputPath)
+
+    $result = [string[]]$ffArgs.ToArray()
+    return ,$result
+}
+
 function Invoke-PreflightEstimate {
     param(
         [string]$InputPath,
@@ -2716,7 +4409,8 @@ function Invoke-PreflightEstimate {
         [int]$PassNumber = 1,
         [string]$SettingsLabel = '',
         $NvencSettings = $null,
-        $NvencEnvironment = $null
+        $NvencEnvironment = $null,
+        $HdrPlan = $null
     )
 
     if (-not $EnablePreflightEstimate) {
@@ -2765,52 +4459,27 @@ function Invoke-PreflightEstimate {
         $sampleOutput = Join-Path $PreflightDir ("{0}_{1}_{2}.mkv" -f ([System.IO.Path]::GetFileNameWithoutExtension($InputPath)), [Guid]::NewGuid().ToString('N'), $i)
 
         try {
-            $ffArgs = New-Object System.Collections.Generic.List[string]
-            $ffArgs.AddRange([string[]]@('-hide_banner', '-y', '-ss', ("{0:0.###}" -f $startSec), '-t', "$PreflightSampleDurationSec"))
+            # Built by the shared sample-argument builder, so the projection
+            # measures exactly what the quality search and the real encode
+            # produce. Two separate builders drift, and a drift between the
+            # probe and the emitter is what previously made a supported HDR
+            # option look unsupported.
+            $ffArgs = Build-PreflightSampleArgs `
+                -InputPath $InputPath `
+                -Selected $Selected `
+                -SourceProfile $SourceProfile `
+                -EncodeMode $EncodeMode `
+                -StartSec $startSec `
+                -DurationSec $PreflightSampleDurationSec `
+                -ResolvedCRF $ResolvedCRF `
+                -ResolvedPreset $ResolvedPreset `
+                -ResolvedFilmGrain $ResolvedFilmGrain `
+                -NvencSettings $NvencSettings `
+                -NvencEnvironment $NvencEnvironment `
+                -HdrPlan $HdrPlan `
+                -OutputPath $sampleOutput
 
-            if ($EncodeMode -eq 'nvenc' -and $NvencSettings -and $NvencSettings.DecodePath -eq 'cuda') {
-                $ffArgs.AddRange([string[]]@('-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'))
-            }
-
-            $ffArgs.AddRange([string[]]@('-i', $InputPath, '-map', "0:$($Selected.Video.index)", '-an', '-sn', '-dn'))
-
-            if ($EncodeMode -eq 'nvenc') {
-                $ffArgs.AddRange([string[]]@('-c:v', 'av1_nvenc'))
-                if ($NvencEnvironment.SupportsPreset -and -not [string]::IsNullOrWhiteSpace($NvencSettings.Preset)) {
-                    $ffArgs.AddRange([string[]]@('-preset', $NvencSettings.Preset))
-                }
-                if ($NvencEnvironment.SupportsTune -and -not [string]::IsNullOrWhiteSpace($NvencSettings.Tune)) {
-                    $ffArgs.AddRange([string[]]@('-tune', $NvencSettings.Tune))
-                }
-                if ($NvencEnvironment.SupportsRc) { $ffArgs.AddRange([string[]]@('-rc', 'vbr')) }
-                if ($NvencEnvironment.SupportsCQ) { $ffArgs.AddRange([string[]]@('-cq', "$($NvencSettings.CQ)")) }
-                if ($NvencEnvironment.SupportsLookahead) { $ffArgs.AddRange([string[]]@('-rc-lookahead', '32')) }
-                if ($NvencEnvironment.SupportsSpatialAQ)  { $ffArgs.AddRange([string[]]@('-spatial-aq', '1')) }
-                if ($NvencEnvironment.SupportsTemporalAQ) { $ffArgs.AddRange([string[]]@('-temporal-aq', '1')) }
-                if ($NvencEnvironment.SupportsAQStrength) { $ffArgs.AddRange([string[]]@('-aq-strength', '8')) }
-                if ($NvencEnvironment.SupportsBRefMode)   { $ffArgs.AddRange([string[]]@('-b_ref_mode', 'middle')) }
-                if ($NvencEnvironment.SupportsMultipass)  { $ffArgs.AddRange([string[]]@('-multipass', 'fullres')) }
-                if ($NvencEnvironment.SupportsSplitEncode -and -not $NvencAllowSplitFrame) {
-                    $ffArgs.AddRange([string[]]@('-split_encode_mode', 'disabled'))
-                }
-                $ffArgs.AddRange([string[]]@('-pix_fmt', $NvencSettings.PixFmt))
-                if ($NvencEnvironment.SupportsHighBitDepth -and $NvencSettings.BitDepth -ge 10) {
-                    $ffArgs.AddRange([string[]]@('-highbitdepth', '1'))
-                }
-            } else {
-                $ffArgs.AddRange([string[]]@('-c:v', 'libsvtav1', '-preset', "$ResolvedPreset", '-crf', "$ResolvedCRF", '-pix_fmt', 'yuv420p10le'))
-                if ($ResolvedFilmGrain -gt 0) {
-                    $ffArgs.AddRange([string[]]@('-svtav1-params', "film-grain=$ResolvedFilmGrain`:film-grain-denoise=0"))
-                }
-            }
-
-            if ($SourceProfile.HasHDR) {
-                $ffArgs.AddRange([string[]]@('-color_primaries', 'bt2020', '-color_trc', 'smpte2084', '-colorspace', 'bt2020nc'))
-            }
-
-            $ffArgs.Add($sampleOutput)
-
-            $sampleResult = Invoke-FfmpegSync -Arguments $ffArgs.ToArray()
+            $sampleResult = Invoke-FfmpegSync -Arguments $ffArgs
             if ($sampleResult.ExitCode -ne 0) {
                 $sampleFailures.Add(("sample {0} failed: {1}" -f ($i + 1), (($sampleResult.LogLines | Select-Object -Last 3) -join ' || ')))
                 continue
@@ -2900,7 +4569,9 @@ function Resolve-PreflightAutoTuneTargets {
     param(
         [string]$QualityProfile,
         [string]$ResolutionTier,
-        $SourceProfile
+        $SourceProfile,
+        [double]$SourceGiBPerHour = 0.0,
+        [string]$TargetOverrideGiBPerHour = ''
     )
 
     $target = 4.0
@@ -2948,9 +4619,47 @@ function Resolve-PreflightAutoTuneTargets {
         }
     }
 
+    $ladderTarget = $target
+    $capNote = ''
+
     if ($null -ne $PreflightAutoTuneCustomTargetGiBPerHour) { $target = [double]$PreflightAutoTuneCustomTargetGiBPerHour }
     if ($null -ne $PreflightAutoTuneCustomUpperGiBPerHour)  { $upper  = [double]$PreflightAutoTuneCustomUpperGiBPerHour }
     if ($null -ne $PreflightAutoTuneCustomLowerGiBPerHour)  { $lower  = [double]$PreflightAutoTuneCustomLowerGiBPerHour }
+
+    # ---- Cap the target against the source's own rate ---------------------
+    # The ladder is resolution- and HDR-based; it has no idea how efficiently
+    # the source was encoded. Targeting a rate at or above the source's own
+    # rate cannot save space -- it inflates the file, Auto picks an extremely
+    # low CRF chasing the target, and preflight then refuses the job for being
+    # oversized. Capping to a fraction of the measured source rate keeps the
+    # target achievable AND a genuine saving.
+    if ($SourceGiBPerHour -gt 0 -and $null -ne $PreflightMaxFractionOfSourceRate) {
+        $fraction = [double]$PreflightMaxFractionOfSourceRate
+        if ($fraction -gt 0) {
+            $cap = $SourceGiBPerHour * $fraction
+            if ($cap -lt $target) {
+                $spread = ($upper - $lower)
+                if ($spread -le 0) { $spread = [Math]::Max(0.5, $target * 0.3) }
+                $target = [Math]::Round($cap, 2)
+                $lower  = [Math]::Round([Math]::Max(0.1, $target - ($spread / 2.0)), 2)
+                $upper  = [Math]::Round($target + ($spread / 2.0), 2)
+                $capNote = ("capped to {0:P0} of the {1:F2} GiB/hr source rate; ladder wanted {2:F1}" -f $fraction, $SourceGiBPerHour, $ladderTarget)
+            }
+        }
+    }
+
+    # ---- Explicit per-drop target beats everything ------------------------
+    if (-not [string]::IsNullOrWhiteSpace($TargetOverrideGiBPerHour)) {
+        $parsed = 0.0
+        if ([double]::TryParse($TargetOverrideGiBPerHour, [System.Globalization.NumberStyles]::Float,
+                               [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed) -and $parsed -gt 0) {
+            $spread = [Math]::Max(0.5, $parsed * 0.25)
+            $target = [Math]::Round($parsed, 2)
+            $lower  = [Math]::Round([Math]::Max(0.1, $target - $spread), 2)
+            $upper  = [Math]::Round($target + $spread, 2)
+            $capNote = 'explicit target requested for this drop'
+        }
+    }
 
     $sourceLabel = switch ($tier) {
         'UHD' { if ($isHdr) { 'UHD HDR' } else { 'UHD SDR' } }
@@ -2963,7 +4672,13 @@ function Resolve-PreflightAutoTuneTargets {
         TargetGiBPerHour = $target
         LowerGiBPerHour = $lower
         UpperGiBPerHour = $upper
-        TargetReason = "{0} {1}, range {2}-{3}" -f $sourceLabel, $profileLabel, $lower, $upper
+        TargetReason = if ($capNote) {
+            "{0} {1}, range {2}-{3}; {4}" -f $sourceLabel, $profileLabel, $lower, $upper, $capNote
+        } else {
+            "{0} {1}, range {2}-{3}" -f $sourceLabel, $profileLabel, $lower, $upper
+        }
+        SourceGiBPerHour = $SourceGiBPerHour
+        LadderTargetGiBPerHour = $ladderTarget
     }
 }
 
@@ -3067,7 +4782,9 @@ function Invoke-PreflightAutoTuneWorkflow {
         [int]$InitialResolvedCRF,
         [int]$InitialResolvedPreset,
         [int]$InitialResolvedFilmGrain,
-        $NvencEnvironment = $null
+        $NvencEnvironment = $null,
+        $HdrPlan = $null,
+        [string]$TargetGiBPerHourOverrideValue = ''
     )
 
     $workflow = [pscustomobject][ordered]@{
@@ -3086,6 +4803,9 @@ function Invoke-PreflightAutoTuneWorkflow {
         WasPreflightRetuned = $false
         WasSkippedByPreflight = $false
         SkipStatus = ''
+        QualitySearch = $null
+        QualitySecondMetricName = ''
+        QualitySecondMetricValue = 0.0
     }
 
     if ($EncodeMode -eq 'nvenc') {
@@ -3110,7 +4830,9 @@ function Invoke-PreflightAutoTuneWorkflow {
     $allowCrfTune = ($CRF -eq 'Auto')
     $allowPresetTune = ($Preset -eq 'Auto' -and $EncodeMode -eq 'software')
     $allowFilmGrainTune = ($FilmGrain -eq 'Auto' -and $EncodeMode -eq 'software')
-    $preflightTargets = Resolve-PreflightAutoTuneTargets -QualityProfile $PreflightAutoTuneQuality -ResolutionTier $AutoSettings.ResolutionTier -SourceProfile $SourceProfile
+    $preflightTargets = Resolve-PreflightAutoTuneTargets -QualityProfile $PreflightAutoTuneQuality -ResolutionTier $AutoSettings.ResolutionTier -SourceProfile $SourceProfile `
+        -SourceGiBPerHour ([double](Get-OptionalProperty -InputObject $AutoSettings -PropertyName 'VideoBitratePerHourGiB' -Default 0.0)) `
+        -TargetOverrideGiBPerHour $TargetGiBPerHourOverrideValue
     $reasons = [System.Collections.Generic.List[string]]::new()
     $reasons.Add("Initial Auto: CRF $InitialResolvedCRF / Preset $InitialResolvedPreset / FilmGrain $InitialResolvedFilmGrain ($($AutoSettings.ResolutionTier) / $($SourceProfile.Profile) / $($AutoSettings.CodecLabel) / $($AutoSettings.BPPTier) BPP)")
     $reasons.Add(("Preflight target: {0} GiB/hr ({1})" -f $preflightTargets.TargetGiBPerHour, $preflightTargets.TargetReason))
@@ -3120,6 +4842,85 @@ function Invoke-PreflightAutoTuneWorkflow {
     $currentFilmGrain = $InitialResolvedFilmGrain
 
     $currentNvencSettings = $workflow.FinalNvencSettings
+
+    # ---- Quality-targeted CRF search ------------------------------------
+    # Runs BEFORE the size projection, because it decides which CRF the
+    # projection should be measuring. Only when CRF is on Auto: a CRF the user
+    # pinned by hand is an instruction, not a starting guess.
+    if ($allowCrfTune) {
+        $metricPlan = Resolve-QualityMetricPlan -SourceProfile $SourceProfile -AutoSettings $AutoSettings -EncodeMode $EncodeMode
+        if ($metricPlan.Enabled) {
+            Write-Host ("Quality target: {0} ({1})" -f $metricPlan.Metric, $metricPlan.Reason) -ForegroundColor DarkCyan
+            Write-SessionTextLogMessage -Level Info -Message ("Quality target | {0} {1} | {2}" -f $metricPlan.Metric, $metricPlan.Mode, $metricPlan.Reason)
+
+            $search = Invoke-QualityTargetedCrfSearch `
+                -InputPath $InputPath `
+                -Selected $Selected `
+                -SourceProfile $SourceProfile `
+                -EncodeMode $EncodeMode `
+                -SourceDurationSec $SourceDurationSec `
+                -StartCRF $currentCrf `
+                -ResolvedPreset $currentPreset `
+                -ResolvedFilmGrain $currentFilmGrain `
+                -MetricPlan $metricPlan `
+                -NvencSettings $currentNvencSettings `
+                -NvencEnvironment $NvencEnvironment `
+                -HdrPlan $HdrPlan
+
+            $workflow.QualitySearch = $search
+
+            if ($search.Ran) {
+                $reasons.Add(("Quality search: " + $search.Reason))
+                Write-Host ("Quality search: CRF {0} -> {1} ({2} {3:F3}, threshold {4:F3})" -f `
+                    $search.StartCRF, $search.ChosenCRF, $search.MetricName, $search.Metric, $search.Threshold) -ForegroundColor DarkCyan
+                Write-SessionTextLogMessage -Level Info -Message ("Quality search | CRF {0} -> {1} | {2} {3:F3} vs threshold {4:F3} | transparent={5} | {6} probes" -f `
+                    $search.StartCRF, $search.ChosenCRF, $search.MetricName, $search.Metric, $search.Threshold, $search.TransparencyMet, $search.ProbeCount)
+
+                # A file where nothing in the permitted CRF range is
+                # transparent is a file that cannot be shrunk without visible
+                # loss. Encoding it anyway would produce exactly the outcome
+                # this whole feature exists to prevent, so by default it is
+                # left alone.
+                if (-not $search.TransparencyMet -and $QualitySkipIfFloorUnreachable) {
+                    $workflow.WasSkippedByPreflight = $true
+                    $workflow.SkipStatus = 'PRECHECK_SKIPPED_QUALITY_FLOOR'
+                    $reasons.Add(('Decision: skipped (no CRF down to {0} reached the quality threshold; source left untouched)' -f ($currentCrf - [int]$QualityMaxCrfBelowAuto)))
+                    $workflow.PreflightAutoTuneReason = ($reasons -join ' | ')
+                    $workflow | Add-Member -NotePropertyName PreflightTargets -NotePropertyValue $preflightTargets -Force
+                    Write-Host 'Quality floor unreachable: leaving this file as it is.' -ForegroundColor Yellow
+                    return $workflow
+                }
+
+                if ($search.ChosenCRF -ne $currentCrf) {
+                    $workflow.WasPreflightRetuned = $true
+                    $currentCrf = [int]$search.ChosenCRF
+                    $workflow.FinalResolvedCRF = $currentCrf
+                    if ($EncodeMode -eq 'nvenc') {
+                        $qualityNvencAuto = [ordered]@{}
+                        foreach ($prop in $AutoSettings.Keys) { $qualityNvencAuto[$prop] = $AutoSettings[$prop] }
+                        $qualityNvencAuto.CRF = $currentCrf
+                        $workflow.FinalNvencSettings = Convert-SoftwareQualityToNvencSettings `
+                            -AutoSettings $qualityNvencAuto `
+                            -SourceProfile $SourceProfile `
+                            -ConfiguredNvencPreset $NvencPreset `
+                            -ConfiguredNvencCQ $NvencCQ `
+                            -ConfiguredNvencTune $NvencTune `
+                            -ConfiguredNvencDecode $NvencDecode `
+                            -NvencEnvironment $NvencEnvironment
+                        $currentNvencSettings = $workflow.FinalNvencSettings
+                    }
+                }
+            } else {
+                $reasons.Add(("Quality search not run: " + $search.Reason))
+                Write-SessionTextLogMessage -Level Warn -Message ("Quality search not run | " + $search.Reason)
+            }
+        } else {
+            $reasons.Add(("Quality targeting off: " + $metricPlan.Reason))
+        }
+    } else {
+        $reasons.Add('Quality targeting skipped: CRF is pinned by configuration, not Auto.')
+    }
+
     Write-Host ("Preflight target profile: {0}" -f $preflightTargets.QualityProfile) -ForegroundColor DarkCyan
     Write-Host ("Resolved target: {0} GiB/hr ({1})" -f $preflightTargets.TargetGiBPerHour, $preflightTargets.TargetReason) -ForegroundColor DarkCyan
     Write-SessionTextLogMessage -Level Info -Message ("Preflight target | profile {0} | {1} GiB/hr ({2})" -f $preflightTargets.QualityProfile, $preflightTargets.TargetGiBPerHour, $preflightTargets.TargetReason)
@@ -3136,7 +4937,8 @@ function Invoke-PreflightAutoTuneWorkflow {
         -PassNumber 1 `
         -SettingsLabel (Format-PreflightSettingsLabel -EncodeMode $EncodeMode -CRF $currentCrf -Preset $currentPreset -FilmGrain $currentFilmGrain -NvencSettings $currentNvencSettings) `
         -NvencSettings $currentNvencSettings `
-        -NvencEnvironment $NvencEnvironment
+        -NvencEnvironment $NvencEnvironment `
+        -HdrPlan $HdrPlan
 
     if ($workflow.Preflight1.Ran) {
         $workflow.PreflightPassCount = 1
@@ -3147,7 +4949,20 @@ function Invoke-PreflightAutoTuneWorkflow {
         return $workflow
     }
 
-    if ($EnablePreflightAutoTune -and ($allowCrfTune -or $allowPresetTune -or $allowFilmGrainTune)) {
+    # The size-based nudge must not undo the quality search. Its oversize rule
+    # raises CRF by 2 to hit a GiB/hr target -- which, applied on top of a CRF
+    # that was measured to sit right at the transparency threshold, spends the
+    # quality budget the search just finished allocating. When a search
+    # succeeded, CRF is left where the measurement put it; the oversize REFUSAL
+    # further down still applies, so a file that cannot be shrunk is still
+    # skipped rather than encoded larger than its source.
+    $qualitySearchDecidedCrf = ($null -ne $workflow.QualitySearch -and $workflow.QualitySearch.Ran)
+    $allowSizeCrfTune = ($allowCrfTune -and -not $qualitySearchDecidedCrf)
+    if ($qualitySearchDecidedCrf) {
+        $reasons.Add('Size-based CRF nudge suppressed: CRF was set by measured quality, not by the GiB/hr ladder.')
+    }
+
+    if ($EnablePreflightAutoTune -and ($allowSizeCrfTune -or $allowPresetTune -or $allowFilmGrainTune)) {
         $adjustment = Get-PreflightAutoTuneAdjustment `
             -PreflightResult $workflow.Preflight1 `
             -PreflightTargets $preflightTargets `
@@ -3156,7 +4971,7 @@ function Invoke-PreflightAutoTuneWorkflow {
             -CurrentCRF $currentCrf `
             -CurrentPreset $currentPreset `
             -CurrentFilmGrain $currentFilmGrain `
-            -AllowCrfTune $allowCrfTune `
+            -AllowCrfTune $allowSizeCrfTune `
             -AllowPresetTune $allowPresetTune `
             -AllowFilmGrainTune $allowFilmGrainTune
 
@@ -3203,7 +5018,8 @@ function Invoke-PreflightAutoTuneWorkflow {
                     -PassNumber 2 `
                     -SettingsLabel (Format-PreflightSettingsLabel -EncodeMode $EncodeMode -CRF $currentCrf -Preset $currentPreset -FilmGrain $currentFilmGrain -NvencSettings $currentNvencSettings) `
                     -NvencSettings $currentNvencSettings `
-                    -NvencEnvironment $NvencEnvironment
+                    -NvencEnvironment $NvencEnvironment `
+                    -HdrPlan $HdrPlan
 
                 if ($workflow.Preflight2.Ran) {
                     $workflow.PreflightPassCount = 2
@@ -3221,6 +5037,39 @@ function Invoke-PreflightAutoTuneWorkflow {
         $reasons.Add('Decision: skipped (estimated output exceeds threshold)')
     } elseif ($workflow.FinalPreflight -and $workflow.FinalPreflight.Ran) {
         $reasons.Add('Proceeding with tuned settings')
+    }
+
+    # ---- Corroborating second metric ------------------------------------
+    # One number is a decision; two are a sanity check. The metric that did NOT
+    # drive the decision is measured once at the chosen CRF, so the log can be
+    # read later to see whether VMAF and XPSNR agree about a given file. Where
+    # they disagree sharply, that file is worth looking at with actual eyes.
+    if ($QualityReportSecondMetric -and $null -ne $workflow.QualitySearch -and $workflow.QualitySearch.Ran -and -not $workflow.WasSkippedByPreflight) {
+        $secondMetricName = if ($workflow.QualitySearch.MetricName -eq 'VMAF') { 'XPSNR' } else { 'VMAF' }
+        $qtc = Get-QualityToolchainEnvironment
+        $secondAvailable = if ($secondMetricName -eq 'VMAF') { $qtc.SupportsVmaf } else { $qtc.SupportsXpsnr }
+        if ($secondAvailable) {
+            $secondPlan = [pscustomobject][ordered]@{
+                Enabled = $true
+                Metric  = $secondMetricName
+                FilterSpec = if ($secondMetricName -eq 'VMAF') {
+                    ("libvmaf=model='version={0}':n_threads={1}" -f (Get-VmafModelName -ResolutionTier ([string](Get-OptionalProperty -InputObject $AutoSettings -PropertyName 'ResolutionTier' -Default 'HD'))), ([Math]::Max(1, [Math]::Min(16, [int]$QualityVmafThreads))))
+                } else { 'xpsnr' }
+            }
+            $secondProbe = Invoke-QualityProbe `
+                -InputPath $InputPath -Selected $Selected -SourceProfile $SourceProfile `
+                -EncodeMode $EncodeMode -CRF ([int]$workflow.FinalResolvedCRF) `
+                -ResolvedPreset $currentPreset -ResolvedFilmGrain $currentFilmGrain `
+                -SamplePositions (Get-QualitySamplePositions -SourceDurationSec $SourceDurationSec -SampleDurationSec ([Math]::Max(4, [Math]::Min(120, [int]$QualitySampleDurationSec))) -RequestedCount 1) `
+                -SampleDurationSec ([Math]::Max(4, [Math]::Min(120, [int]$QualitySampleDurationSec))) `
+                -MetricPlan $secondPlan -NvencSettings $currentNvencSettings `
+                -NvencEnvironment $NvencEnvironment -HdrPlan $HdrPlan -Label 'second-metric'
+            if ($secondProbe.Ran) {
+                $workflow.QualitySecondMetricName = $secondMetricName
+                $workflow.QualitySecondMetricValue = [double]$secondProbe.Metric
+                $reasons.Add(("Corroborating {0} at CRF {1}: {2:F3}" -f $secondMetricName, $workflow.FinalResolvedCRF, $secondProbe.Metric))
+            }
+        }
     }
 
     $workflow.PreflightAutoTuneReason = ($reasons -join ' | ')
@@ -3295,12 +5144,16 @@ function Get-EncodeColorProfile {
         $encodePrimaries = 'Rec.2020'
         $encodeTransfer = 'PQ'
         $encodeMatrix = 'Rec.2020 NC'
+        # These notes describe only the label. What actually happens to the
+        # metadata is decided by Resolve-HdrEncodePlan and reported through
+        # Get-HdrPlanSummary, which is the authoritative account.
         $note = if ($SourceProfile.SourceHdrFormat -eq 'HDR10+') {
-            'Source HDR10+ dynamic metadata is not preserved; encode is labeled HDR10.'
+            'Source has HDR10+ dynamic metadata; see the HDR plan for whether it was preserved.'
         } elseif ($SourceProfile.SourceHdrFormat -eq 'HLG') {
-            'Current encode path tags HLG sources as PQ/HDR10 for AV1 output.'
+            if ($PreserveHLG) { 'HLG source retains its HLG transfer function.' }
+            else { 'HLG source is being tagged as PQ/HDR10 because $PreserveHLG is disabled.' }
         } elseif ($SourceProfile.Profile -eq 'DV') {
-            'Dolby Vision metadata is not preserved by this AV1 encode path.'
+            'Dolby Vision source; the base layer is converted per the HDR plan. AV1 does not carry the DV RPU here.'
         } else {
             ''
         }
@@ -3333,6 +5186,1314 @@ function Get-EncodeColorProfile {
         Summary            = Get-ColorSummary -BitDepth $encodeBitDepth -DynamicRangeLabel $encodeDynamicRange -PrimariesLabel $encodePrimaries -TransferLabel $encodeTransfer
         Note               = $note
     }
+}
+
+# =============================================================================
+# HDR / DYNAMIC METADATA MODULE                            (requires FFmpeg 9+)
+# =============================================================================
+# Everything in this section exists to answer one question correctly:
+#
+#   "What does the display actually receive?"
+#
+# Before this module, the script tagged HDR output with primaries / transfer /
+# matrix and nothing else. That is only the *signalling*. The static HDR10
+# payload -- mastering display colour volume (ST 2086) plus MaxCLL / MaxFALL --
+# was silently dropped on every single encode, and any HDR10+ (ST 2094-40)
+# dynamic metadata went with it. A display receiving PQ/BT.2020 with no
+# mastering-display block has to fall back to its own generic tone-mapping
+# assumptions, which is the usual cause of "the AV1 version looks flatter /
+# duller than the source" on an HDR10+ TV.
+#
+# FFmpeg 9 is what makes fixing this clean: it added per-stream
+# `-mastering_display` and `-content_light` output options, so the payload can
+# be re-stated on the output stream explicitly instead of hoping it survives
+# the filter graph. It also added the `dovi_split` bitstream filter and a
+# complete Dolby Vision Profile 7 pipeline, which is what lets DV sources be
+# converted to a correct HDR10 base layer rather than skipped outright.
+#
+# Design rules followed here:
+#   1. Never assume a capability. Probe the local ffmpeg / tool binaries once,
+#      cache the answer, and degrade to the next-best path. Same pattern the
+#      script already uses for NVENC via Get-NvencEnvironment.
+#   2. Never silently lose metadata. If something cannot be carried, say so in
+#      the log row and in the console note.
+#   3. Never guess at colour volume. If the source has no mastering display
+#      block, do not invent one -- absent is better than wrong.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Chromaticity is carried in units of 0.00002 (1/50000) and luminance in units
+# of 0.0001 (1/10000) cd/m^2, per the -mastering_display option's documented
+# format string:  G(%u,%u)B(%u,%u)R(%u,%u)WP(%u,%u)L(%u,%u)
+#
+# ffprobe reports these fields as rational strings ("34000/50000"). Rather than
+# assume the denominator matches the target unit -- it usually does, but muxers
+# are free to reduce the fraction -- each value is evaluated and re-quantised.
+# -----------------------------------------------------------------------------
+$script:HdrChromaUnit    = 0.00002
+$script:HdrLuminanceUnit = 0.0001
+
+# Declared up front, not lazily on first use. This script runs under
+# Set-StrictMode -Version Latest, where *reading* a script-scope variable that
+# has never been assigned throws rather than returning $null -- so the usual
+# "if ($null -eq $script:Cache) { $script:Cache = @{} }" idiom fails on the
+# very first call it is meant to guard.
+$script:HdrToolchainCache      = $null
+$script:HdrStaticMetadataCache = @{}
+$script:QualityToolchainCache  = $null
+$script:SvtParamSupportCache   = @{}
+$script:QualityLosslessDbSentinel = 140.0
+
+# Lets a companion script that loads these functions by AST (the calibration
+# tool does) tell them where to look for hdr10plus_tool / dovi_tool, since
+# $PSScriptRoot is empty in a function that was not loaded from a file.
+$script:HdrToolSearchRoot      = $PSScriptRoot
+
+function Convert-RationalToDouble {
+    param($Value)
+
+    if ($null -eq $Value) { return $null }
+
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+
+    # "num/den" form, as emitted by ffprobe for mastering display fields.
+    if ($text -match '^\s*(-?\d+)\s*/\s*(-?\d+)\s*$') {
+        $numerator   = [double]$Matches[1]
+        $denominator = [double]$Matches[2]
+        if ($denominator -eq 0) { return $null }
+        return ($numerator / $denominator)
+    }
+
+    # Plain decimal form, as emitted for content light level fields.
+    $parsed = 0.0
+    if ([double]::TryParse($text, [System.Globalization.NumberStyles]::Float,
+                           [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+        return $parsed
+    }
+
+    return $null
+}
+
+# Convert-ToInvariantInt64 types its -Default as [int64], so passing $null to it
+# coerces to 0. That distinction matters here: Dolby Vision profile 0 and "no
+# profile reported" are different states, and conflating them would send an
+# unidentified source down the Profile-0 path. This returns a real $null.
+function Convert-ToNullableInt {
+    param($Value)
+
+    if ($null -eq $Value) { return $null }
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+
+    $parsed = 0L
+    if ([int64]::TryParse($text, [System.Globalization.NumberStyles]::Any,
+                          [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+        return [int]$parsed
+    }
+    return $null
+}
+
+function Convert-ToHdrUnits {
+    param(
+        $Value,
+        [double]$Unit
+    )
+
+    $asDouble = Convert-RationalToDouble -Value $Value
+    if ($null -eq $asDouble) { return $null }
+    if ($Unit -le 0) { return $null }
+
+    $units = [Math]::Round($asDouble / $Unit, [System.MidpointRounding]::AwayFromZero)
+    if ($units -lt 0) { return $null }
+
+    return [uint32]$units
+}
+
+# -----------------------------------------------------------------------------
+# Locates an optional external HDR tool. Mirrors the ffmpeg / ffprobe discovery
+# convention already used at the top of the script: prefer a copy sitting next
+# to the script (portable deployment), then fall back to PATH. $HdrToolsDir, if
+# set, is checked ahead of both.
+# -----------------------------------------------------------------------------
+function Get-HdrToolPath {
+    param([string]$ToolName)
+
+    $candidateDirs = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($HdrToolsDir)) { $candidateDirs.Add($HdrToolsDir) }
+    # Guarded rather than added unconditionally: $PSScriptRoot is empty in any
+    # context where this function was not loaded from a file on disk, and
+    # Join-Path throws on an empty -Path rather than returning nothing.
+    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $candidateDirs.Add($PSScriptRoot) }
+    if (-not [string]::IsNullOrWhiteSpace($script:HdrToolSearchRoot)) { $candidateDirs.Add($script:HdrToolSearchRoot) }
+
+    foreach ($dir in $candidateDirs) {
+        if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+        foreach ($ext in @('.exe', '')) {
+            $candidate = Join-Path $dir ($ToolName + $ext)
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                return (Get-Item -LiteralPath $candidate).FullName
+            }
+        }
+    }
+
+    $onPath = Get-Command $ToolName -ErrorAction SilentlyContinue
+    if ($onPath) { return $onPath.Source }
+
+    return $null
+}
+
+# -----------------------------------------------------------------------------
+# One-time capability probe of the local toolchain. Cached for the life of the
+# process because each probe spawns a subprocess and the answers cannot change
+# while the queue is running.
+#
+# What gets probed and why:
+#   StaticMetadataOptions - whether this ffmpeg exposes -mastering_display and
+#       -content_light as output options. Added in FFmpeg 9; absent in 8.x. If
+#       missing, the CPU lane can still carry the payload through
+#       -svtav1-params, but the NVENC lane cannot, so HDR jobs get steered to
+#       the CPU lane rather than silently losing colour volume.
+#   DoviSplitBsf / DoviRpuBsf - the Dolby Vision bitstream filters. dovi_split
+#       (FFmpeg 9) separates a Profile 7 dual-layer stream; dovi_rpu can strip
+#       the RPU from a single-layer stream.
+#   Hdr10PlusTool - quietvoid/hdr10plus_tool for extracting ST 2094-40 to JSON.
+#       The mainline tool reads HEVC only; AV1 injection needs a build with AV1
+#       support, which is probed separately because that determines whether the
+#       dynamic metadata can actually be put back.
+#   SvtHdr10PlusJson - whether the linked SVT-AV1 accepts hdr10plus-json, i.e.
+#       whether it is an svt-av1-hdr / SVT-AV1-PSY build compiled with
+#       enable-hdr10plus. When present, HDR10+ can be muxed in during the
+#       encode and no post-encode injection pass is needed.
+# -----------------------------------------------------------------------------
+function Get-HdrToolchainEnvironment {
+    if ($null -ne $script:HdrToolchainCache) { return $script:HdrToolchainCache }
+
+    $ffmpegHelpText = ''
+    try   { $ffmpegHelpText = (& $FfmpegPath -hide_banner -h full 2>&1 | Out-String) }
+    catch { $ffmpegHelpText = '' }
+
+    $bsfListText = ''
+    try   { $bsfListText = (& $FfmpegPath -hide_banner -bsfs 2>&1 | Out-String) }
+    catch { $bsfListText = '' }
+
+    $encoderHelpText = ''
+    try   { $encoderHelpText = (& $FfmpegPath -hide_banner -h encoder=libsvtav1 2>&1 | Out-String) }
+    catch { $encoderHelpText = '' }
+
+    # Detected with the CLI-option matcher (these are CLI options, not
+    # AVOptions), then confirmed functionally. The help text is the cheap
+    # check; ffmpeg's parser is the authority, and it settles any disagreement.
+    $supportsMasteringDisplay = Test-TextContainsCliOption -Text $ffmpegHelpText -OptionName 'mastering_display'
+    $supportsContentLight     = Test-TextContainsCliOption -Text $ffmpegHelpText -OptionName 'content_light'
+
+    # The help text says the option exists; it does not say what form ffmpeg
+    # accepts. Those are different questions, and getting the second one wrong
+    # is silent until an encode fails.
+    #
+    # Emitting "-mastering_display:v:0" -- a stream specifier the documented
+    # syntax presents as optional -- is rejected by real FFmpeg 9 builds with:
+    #
+    #   Option mastering_display:v:0 ... cannot be applied to output url ...
+    #   you are trying to apply an input option to an output file or vice versa
+    #
+    # while the bare form is accepted. So the accepted FORM is probed too, and
+    # the style that works is recorded and used when building arguments. Probing
+    # the exact string the builder emits is what keeps the two from drifting.
+    # Selecting a style requires exit code 0, which introduces a hazard: if the
+    # probe encode fails for a reason unrelated to the option, BOTH styles look
+    # unsupported and static HDR10 metadata would be dropped silently. So a
+    # control encode runs first, exactly as in Test-Av1NvencBFrameSupport. If
+    # the control cannot even complete, the probe is inconclusive and the help
+    # text decides -- with the bare form, which is the documented default.
+    $probeExtra = @('-preset', '12', '-crf', '60')
+    $controlProbe = Test-FfmpegOptionSupported -OptionArguments @() -ExtraEncoderArguments $probeExtra
+    $probeUsable = $controlProbe.Accepted
+
+    $sampleMastering = 'G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)'
+
+    $masteringStyle = 'none'
+    if ($probeUsable) {
+        foreach ($style in @('bare','stream_spec')) {
+            $optName = if ($style -eq 'bare') { '-mastering_display' } else { '-mastering_display:v:0' }
+            $probe = Test-FfmpegOptionSupported -OptionArguments @($optName, $sampleMastering) -ExtraEncoderArguments $probeExtra
+            if ($probe.Accepted) { $masteringStyle = $style; break }
+        }
+    } elseif ($supportsMasteringDisplay) {
+        $masteringStyle = 'bare'
+    }
+
+    $contentLightStyle = 'none'
+    if ($probeUsable) {
+        foreach ($style in @('bare','stream_spec')) {
+            $optName = if ($style -eq 'bare') { '-content_light' } else { '-content_light:v:0' }
+            $probe = Test-FfmpegOptionSupported -OptionArguments @($optName, '1000,400') -ExtraEncoderArguments $probeExtra
+            if ($probe.Accepted) { $contentLightStyle = $style; break }
+        }
+    } elseif ($supportsContentLight) {
+        $contentLightStyle = 'bare'
+    }
+
+    if (-not $probeUsable) {
+        Write-Warning "HDR static-metadata form probe was inconclusive (a plain test encode did not complete: $($controlProbe.Detail)). Falling back to the documented bare option form."
+    }
+
+    # A help-text match with no working form is not support.
+    $supportsMasteringDisplay = ($masteringStyle -ne 'none')
+    $supportsContentLight     = ($contentLightStyle -ne 'none')
+
+    $doviSplitBsf = $bsfListText -match '(?im)\bdovi_split\b'
+    $doviRpuBsf   = $bsfListText -match '(?im)\bdovi_rpu\b'
+
+    # SVT-AV1 forks that support HDR10+ advertise the token in the svtav1-params
+    # help text. Absence is not proof it is unsupported on every build, but it
+    # is the only signal available without running a throwaway encode, and
+    # treating absence as unsupported fails safe.
+    $svtHdr10PlusJson = ($encoderHelpText -match '(?im)hdr10plus[-_]json')
+
+    $hdr10PlusToolPath = Get-HdrToolPath -ToolName 'hdr10plus_tool'
+    $hdr10PlusAv1      = $false
+    $hdr10PlusVersion  = ''
+    if ($hdr10PlusToolPath) {
+        try {
+            $hdr10PlusVersion = ((& $hdr10PlusToolPath --version 2>&1 | Out-String)).Trim()
+            $injectHelp = (& $hdr10PlusToolPath inject --help 2>&1 | Out-String)
+            # Forks with AV1 support mention av1 / ivf in the inject help text.
+            $hdr10PlusAv1 = ($injectHelp -match '(?im)\bav1\b|\bivf\b')
+        } catch {
+            $hdr10PlusAv1 = $false
+        }
+    }
+
+    $doviToolPath = Get-HdrToolPath -ToolName 'dovi_tool'
+
+    $script:HdrToolchainCache = [ordered]@{
+        SupportsMasteringDisplayOption = [bool]$supportsMasteringDisplay
+        SupportsContentLightOption     = [bool]$supportsContentLight
+        MasteringDisplayArgStyle       = $masteringStyle      # bare | stream_spec | none
+        ContentLightArgStyle           = $contentLightStyle
+        SupportsStaticMetadataOptions  = ([bool]$supportsMasteringDisplay -and [bool]$supportsContentLight)
+        SupportsDoviSplitBsf           = [bool]$doviSplitBsf
+        SupportsDoviRpuBsf             = [bool]$doviRpuBsf
+        SupportsSvtHdr10PlusJson       = [bool]$svtHdr10PlusJson
+        Hdr10PlusToolPath              = $hdr10PlusToolPath
+        Hdr10PlusToolVersion           = $hdr10PlusVersion
+        Hdr10PlusToolSupportsAv1       = [bool]$hdr10PlusAv1
+        DoviToolPath                   = $doviToolPath
+    }
+
+    return $script:HdrToolchainCache
+}
+
+# -----------------------------------------------------------------------------
+# Reads the static HDR10 payload (mastering display colour volume + content
+# light level) for a video stream.
+#
+# This has to look in two places. When the payload lives in the container --
+# Matroska colour elements, MP4 boxes -- ffprobe reports it in the stream's
+# side_data_list. When it lives in the elementary stream as HEVC SEI, which is
+# the common case for Blu-ray remuxes, the stream-level list is null and the
+# payload only appears at frame level. The original HDR10+ detection in
+# Get-SourceProfile checked stream level only, which is why it never fired on
+# real sources.
+#
+# A single-frame probe is cheap (-read_intervals "%+#1" decodes one frame) and
+# is only run when the stream-level lookup comes up empty.
+# -----------------------------------------------------------------------------
+function Get-HdrStaticMetadata {
+    param(
+        [string]$InputPath,
+        $VideoStream
+    )
+
+    # This runs a frame-level ffprobe, which costs a subprocess and a decode.
+    # Several callers want the same answer for the same file during one job, so
+    # the result is memoised per (path, stream index). The cache is per-process
+    # and the queue re-probes on the next run, so a file edited between runs is
+    # never served a stale answer.
+    $cacheKey = "{0}|{1}" -f $InputPath, [int](Get-StreamProp $VideoStream 'index' 0)
+    if ($script:HdrStaticMetadataCache.ContainsKey($cacheKey)) {
+        return $script:HdrStaticMetadataCache[$cacheKey]
+    }
+
+    $result = [ordered]@{
+        HasMasteringDisplay = $false
+        HasContentLight     = $false
+        # Two mastering-display renderings are kept, because ffmpeg and SVT-AV1
+        # disagree about units and the difference is silent:
+        #
+        #   ffmpeg  -mastering_display : INTEGER units. Chromaticity in steps of
+        #       0.00002, luminance in steps of 0.0001 cd/m^2.
+        #       -> G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)
+        #
+        #   SVT-AV1 mastering-display : NORMALISED FLOATS. Chromaticity as actual
+        #       CIE xy coordinates in 0.0-1.0, luminance in nits.
+        #       -> G(0.265,0.690)B(0.150,0.060)R(0.680,0.320)WP(0.3127,0.3290)L(1000.0,0.0001)
+        #
+        # Feeding the integer form to SVT-AV1 does not error. It emits
+        # "Invalid mastering display info will be clipped to 0.0 to 1.0", pins
+        # every primary to 1.0, and writes a negative max_luminance -- metadata
+        # actively worse than none at all. Hence both forms, built once, here.
+        MasteringDisplay      = $null  # ffmpeg integer-unit form
+        MasteringDisplayFloat = $null  # SVT-AV1 normalised-float form
+        MaxCLL              = $null
+        MaxFALL             = $null
+        MaxCLLOriginal      = $null
+        MaxCLLClampNote     = ''
+        MasteringMaxNits    = $null
+        ContentLight        = $null    # "maxcll,maxfall" -- same for both
+        HasHDR10Plus        = $false
+        Source              = 'none'   # stream | frame | none
+        Diagnostics         = ''
+    }
+
+    function Read-SideDataCollection {
+        param($SideDataList, [string]$Origin)
+
+        $found = [ordered]@{
+            Mastering        = $null
+            MasteringFloat   = $null
+            MasteringMaxNits = $null
+            ContentLight     = $null
+            HDR10Plus        = $false
+        }
+
+        foreach ($sd in @($SideDataList)) {
+            if ($null -eq $sd) { continue }
+            $type = [string](Get-StreamProp $sd 'side_data_type' '')
+
+            if ($type -match '(?i)mastering\s*display') {
+                $green_x = Convert-ToHdrUnits (Get-StreamProp $sd 'green_x' $null) $script:HdrChromaUnit
+                $green_y = Convert-ToHdrUnits (Get-StreamProp $sd 'green_y' $null) $script:HdrChromaUnit
+                $blue_x  = Convert-ToHdrUnits (Get-StreamProp $sd 'blue_x'  $null) $script:HdrChromaUnit
+                $blue_y  = Convert-ToHdrUnits (Get-StreamProp $sd 'blue_y'  $null) $script:HdrChromaUnit
+                $red_x   = Convert-ToHdrUnits (Get-StreamProp $sd 'red_x'   $null) $script:HdrChromaUnit
+                $red_y   = Convert-ToHdrUnits (Get-StreamProp $sd 'red_y'   $null) $script:HdrChromaUnit
+                $wp_x    = Convert-ToHdrUnits (Get-StreamProp $sd 'white_point_x' $null) $script:HdrChromaUnit
+                $wp_y    = Convert-ToHdrUnits (Get-StreamProp $sd 'white_point_y' $null) $script:HdrChromaUnit
+                $lumMax  = Convert-ToHdrUnits (Get-StreamProp $sd 'max_luminance' $null) $script:HdrLuminanceUnit
+                $lumMin  = Convert-ToHdrUnits (Get-StreamProp $sd 'min_luminance' $null) $script:HdrLuminanceUnit
+
+                # All ten components are required. A partial block is worse than
+                # no block: the format string would render as G(13250,34500)B(,)
+                # and ffmpeg would reject the option outright, failing the whole
+                # encode. An incomplete set is therefore discarded, not padded.
+                #
+                # The missing count is accumulated in an explicit loop rather
+                # than with `-not ($components | Where-Object { $null -eq $_ })`.
+                # That idiom is wrong here: when exactly one component is null
+                # the pipeline yields a bare $null instead of a one-element
+                # collection, `-not $null` is $true, and the partial block would
+                # be accepted -- the single-element collapse behaviour.
+                $components = @($green_x, $green_y, $blue_x, $blue_y, $red_x, $red_y, $wp_x, $wp_y, $lumMax, $lumMin)
+                $missingCount = 0
+                foreach ($component in $components) {
+                    if ($null -eq $component) { $missingCount++ }
+                }
+
+                if ($missingCount -eq 0) {
+                    $found.Mastering = ('G({0},{1})B({2},{3})R({4},{5})WP({6},{7})L({8},{9})' -f `
+                        $green_x, $green_y, $blue_x, $blue_y, $red_x, $red_y, $wp_x, $wp_y, $lumMax, $lumMin)
+
+                    # Normalised-float form for SVT-AV1. Formatted against
+                    # InvariantCulture explicitly: on a machine with a comma
+                    # decimal separator the default would emit "0,265", which
+                    # collides with the comma that separates the x,y pair and
+                    # silently corrupts the parameter.
+                    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+                    $c = { param($units) (([double]$units * $script:HdrChromaUnit)).ToString('0.#####', $inv) }
+                    $l = { param($units) (([double]$units * $script:HdrLuminanceUnit)).ToString('0.####', $inv) }
+
+                    $found.MasteringFloat = ('G({0},{1})B({2},{3})R({4},{5})WP({6},{7})L({8},{9})' -f `
+                        (& $c $green_x), (& $c $green_y), (& $c $blue_x), (& $c $blue_y),
+                        (& $c $red_x),   (& $c $red_y),   (& $c $wp_x),   (& $c $wp_y),
+                        (& $l $lumMax),  (& $l $lumMin))
+
+                    # Kept in nits so the MaxCLL sanity check has something to
+                    # compare against without re-parsing the formatted string.
+                    $found.MasteringMaxNits = [double]$lumMax * $script:HdrLuminanceUnit
+                }
+                continue
+            }
+
+            if ($type -match '(?i)content\s*light\s*level') {
+                $maxContent = Convert-RationalToDouble (Get-StreamProp $sd 'max_content' $null)
+                $maxAverage = Convert-RationalToDouble (Get-StreamProp $sd 'max_average' $null)
+                if ($null -ne $maxContent -and $null -ne $maxAverage) {
+                    $found.ContentLight = [ordered]@{
+                        MaxCLL  = [int][Math]::Round($maxContent)
+                        MaxFALL = [int][Math]::Round($maxAverage)
+                    }
+                }
+                continue
+            }
+
+            # ST 2094-40. ffprobe has labelled this differently across versions,
+            # so match generously rather than on one exact spelling.
+            if ($type -match '(?i)HDR10\+|SMPTE\s*2094-40|Dynamic\s*HDR(\+|10\+)?') {
+                $found.HDR10Plus = $true
+                continue
+            }
+        }
+
+        return $found
+    }
+
+    # --- Pass 1: stream level (container-carried metadata) --------------------
+    $streamSideData = Get-StreamSideDataList -Stream $VideoStream
+    $fromStream = Read-SideDataCollection -SideDataList $streamSideData -Origin 'stream'
+
+    if ($fromStream.Mastering -or $fromStream.ContentLight -or $fromStream.HDR10Plus) {
+        $result.Source = 'stream'
+    }
+
+    $mastering       = $fromStream.Mastering
+    $masteringFloat  = $fromStream.MasteringFloat
+    $masteringMaxNits = $fromStream.MasteringMaxNits
+    $contentLight    = $fromStream.ContentLight
+    $hdr10Plus       = $fromStream.HDR10Plus
+
+    # --- Pass 2: frame level (SEI-carried metadata) --------------------------
+    # Run whenever anything is still missing. One frame is enough for the static
+    # payload; HDR10+ presence is also detectable from the first frame because a
+    # conformant stream carries a metadata block on every displayed frame.
+    if (-not $mastering -or -not $contentLight -or -not $hdr10Plus) {
+        try {
+            $streamIndex = [int](Get-StreamProp $VideoStream 'index' 0)
+            $frameProbeArgs = @(
+                '-v',            'error',
+                '-print_format', 'json',
+                '-show_frames',
+                '-read_intervals', '%+#1',
+                '-select_streams', "$streamIndex",
+                $InputPath
+            )
+            $frameJson = & $FfprobePath @frameProbeArgs
+            if ($frameJson) {
+                $frameProbe = ($frameJson | ConvertFrom-Json -Depth 100)
+                $frames = @(Get-OptionalProperty -InputObject $frameProbe -PropertyName 'frames' -Default @())
+                foreach ($frame in $frames) {
+                    $frameSideData = Get-OptionalProperty -InputObject $frame -PropertyName 'side_data_list' -Default $null
+                    if ($null -eq $frameSideData) { continue }
+                    $fromFrame = Read-SideDataCollection -SideDataList $frameSideData -Origin 'frame'
+                    if (-not $mastering    -and $fromFrame.Mastering)    {
+                        $mastering        = $fromFrame.Mastering
+                        $masteringFloat   = $fromFrame.MasteringFloat
+                        $masteringMaxNits = $fromFrame.MasteringMaxNits
+                        $result.Source    = 'frame'
+                    }
+                    if (-not $contentLight -and $fromFrame.ContentLight) { $contentLight = $fromFrame.ContentLight; $result.Source = 'frame' }
+                    if (-not $hdr10Plus    -and $fromFrame.HDR10Plus)    { $hdr10Plus = $true;                      $result.Source = 'frame' }
+                }
+            }
+        } catch {
+            $result.Diagnostics = "Frame-level HDR metadata probe failed: $($_.Exception.Message)"
+        }
+    }
+
+    if ($mastering) {
+        $result.HasMasteringDisplay   = $true
+        $result.MasteringDisplay      = $mastering
+        $result.MasteringDisplayFloat = $masteringFloat
+    }
+    if ($mastering -and $null -ne $masteringMaxNits) {
+        $result.MasteringMaxNits = [double]$masteringMaxNits
+    }
+
+    if ($contentLight) {
+        $result.HasContentLight = $true
+        $result.MaxCLL          = $contentLight.MaxCLL
+        $result.MaxFALL         = $contentLight.MaxFALL
+
+        # ---- MaxCLL sanity check -----------------------------------------
+        # Some masters declare a MaxCLL brighter than their own mastering
+        # display peak, which cannot be true: the content was graded on that
+        # display, so it cannot exceed it. A census of this library found 15
+        # such files, and they were not one problem but four -- placeholders
+        # near 10,000 nits, overshoots of two to six times, mild overshoots
+        # under twice, and at least one file whose PEAK is the wrong field
+        # rather than its MaxCLL (a 200-nit peak against a 574-nit MaxCLL,
+        # where clamping MaxCLL down to 200 would be the damaging edit).
+        #
+        # So the clamp is off by default, and when on it fires only where the
+        # peak is credible AND the overshoot is large. Both conditions have to
+        # hold, which is what keeps the 200-nit case out of scope.
+        if ($ClampMaxCllToMasteringPeak -and
+            $null -ne $result.MasteringMaxNits -and
+            [double]$result.MasteringMaxNits -ge [double]$ClampMaxCllMinPeakNits -and
+            [double]$result.MaxCLL -gt ([double]$result.MasteringMaxNits * [double]$ClampMaxCllMinOvershoot)) {
+
+            $clampedTo = [int][Math]::Round([double]$result.MasteringMaxNits)
+            $result.MaxCLLOriginal  = $result.MaxCLL
+            $result.MaxCLLClampNote = ('MaxCLL {0} -> {1} (mastering peak {2:F0} nits, overshoot {3:F1}x)' -f `
+                $result.MaxCLL, $clampedTo, [double]$result.MasteringMaxNits,
+                ([double]$result.MaxCLL / [double]$result.MasteringMaxNits))
+            $result.MaxCLL = $clampedTo
+        }
+
+        $result.ContentLight    = ('{0},{1}' -f $result.MaxCLL, $result.MaxFALL)
+    }
+    $result.HasHDR10Plus = [bool]$hdr10Plus
+
+    $script:HdrStaticMetadataCache[$cacheKey] = $result
+    return $result
+}
+
+# -----------------------------------------------------------------------------
+# Reads the Dolby Vision configuration record and decides what can honestly be
+# done with the source.
+#
+# The profile number is what matters, and it is the reason FFmpeg 8 output
+# "wasn't great":
+#
+#   Profile 7  - dual layer, from UHD Blu-ray. The base layer is HDR10. Split
+#                it out with dovi_split and you get a correct HDR10 encode.
+#   Profile 8  - single layer with a cross-compatibility ID. ID 1 means the base
+#                layer is already HDR10-compatible, ID 4 means HLG, ID 2 means
+#                SDR. Strip the RPU and the base layer stands on its own.
+#   Profile 5  - single layer, no backward-compatible base. The picture is in a
+#                DV-native IPT-PQ-c2 representation. Re-encoding it as if it
+#                were HDR10 is exactly what produces the washed-out, magenta /
+#                green-cast result. This cannot be fixed by tagging; it needs a
+#                real DV-to-HDR10 conversion. The script refuses rather than
+#                producing a bad file.
+# -----------------------------------------------------------------------------
+function Resolve-DolbyVisionSourcePlan {
+    param(
+        $Probe,
+        $VideoStream,
+        $HdrToolchain
+    )
+
+    $plan = [ordered]@{
+        IsDolbyVision      = $false
+        Profile            = $null
+        Level              = $null
+        BlSignalCompatId   = $null
+        RpuPresent         = $false
+        ElPresent          = $false
+        BlPresent          = $false
+        Strategy           = 'none'   # none | split_bl | strip_rpu | passthrough | unsupported
+        InputBitstreamFilter  = $null
+        TargetDynamicRange = $null    # HDR10 | HLG | SDR
+        CanConvert         = $false
+        Reason             = ''
+        Label              = ''
+    }
+
+    $dovi = $null
+    foreach ($sd in @(Get-StreamSideDataList -Stream $VideoStream)) {
+        if ($null -eq $sd) { continue }
+        $type = [string](Get-StreamProp $sd 'side_data_type' '')
+        if ($type -match '(?i)DOVI|Dolby\s*Vision') { $dovi = $sd; break }
+    }
+
+    $codecName = [string](Get-StreamProp $VideoStream 'codec_name'       '')
+    $codecTag  = [string](Get-StreamProp $VideoStream 'codec_tag_string' '')
+    $taggedDv  = ($codecName -match 'dvhe|dvav' -or $codecTag -match 'dvhe|dvav|dvh1|dav1')
+
+    if ($null -eq $dovi -and -not $taggedDv) { return $plan }
+
+    $plan.IsDolbyVision = $true
+
+    if ($null -ne $dovi) {
+        $plan.Profile          = Convert-ToNullableInt (Get-StreamProp $dovi 'dv_profile' $null)
+        $plan.Level            = Convert-ToNullableInt (Get-StreamProp $dovi 'dv_level'   $null)
+        $plan.BlSignalCompatId = Convert-ToNullableInt (Get-StreamProp $dovi 'dv_bl_signal_compatibility_id' $null)
+        $plan.RpuPresent       = [bool](Convert-ToInvariantInt64 (Get-StreamProp $dovi 'rpu_present_flag' 0) 0)
+        $plan.ElPresent        = [bool](Convert-ToInvariantInt64 (Get-StreamProp $dovi 'el_present_flag'  0) 0)
+        $plan.BlPresent        = [bool](Convert-ToInvariantInt64 (Get-StreamProp $dovi 'bl_present_flag'  0) 0)
+    }
+
+    $profileLabel = if ($null -ne $plan.Profile) { "Profile $($plan.Profile)" } else { 'Profile unknown' }
+    $compatLabel  = switch ($plan.BlSignalCompatId) {
+        1       { 'HDR10-compatible base layer' }
+        2       { 'SDR-compatible base layer' }
+        4       { 'HLG-compatible base layer' }
+        0       { 'no backward-compatible base layer' }
+        default { 'unknown base-layer compatibility' }
+    }
+    $plan.Label = "Dolby Vision $profileLabel ($compatLabel)"
+
+    switch ([int]($plan.Profile ?? -1)) {
+        7 {
+            # Dual layer. The base layer is HDR10; dovi_split isolates it.
+            if ($HdrToolchain.SupportsDoviSplitBsf) {
+                $plan.Strategy             = 'split_bl'
+                $plan.InputBitstreamFilter = 'dovi_split=bl'
+                $plan.TargetDynamicRange   = 'HDR10'
+                $plan.CanConvert           = $true
+                $plan.Reason               = 'Profile 7 dual-layer source: base layer extracted with dovi_split and encoded as HDR10.'
+            } elseif ($HdrToolchain.SupportsDoviRpuBsf) {
+                $plan.Strategy             = 'strip_rpu'
+                $plan.InputBitstreamFilter = 'dovi_rpu=strip=1'
+                $plan.TargetDynamicRange   = 'HDR10'
+                $plan.CanConvert           = $true
+                $plan.Reason               = 'Profile 7 source: dovi_split unavailable, falling back to stripping the RPU from the base layer.'
+            } else {
+                $plan.Strategy = 'unsupported'
+                $plan.Reason   = 'Profile 7 source requires the dovi_split or dovi_rpu bitstream filter (FFmpeg 9+). Neither is available in this build.'
+            }
+        }
+        8 {
+            $target = switch ($plan.BlSignalCompatId) {
+                1       { 'HDR10' }
+                4       { 'HLG' }
+                2       { 'SDR' }
+                default { $null }
+            }
+            if ($null -ne $target -and $HdrToolchain.SupportsDoviRpuBsf) {
+                $plan.Strategy             = 'strip_rpu'
+                $plan.InputBitstreamFilter = 'dovi_rpu=strip=1'
+                $plan.TargetDynamicRange   = $target
+                $plan.CanConvert           = $true
+                $plan.Reason               = "Profile 8 source with a $target-compatible base layer: RPU stripped and encoded as $target."
+            } elseif ($null -ne $target) {
+                # The base layer is already conformant; without the bsf the RPU
+                # simply is not carried into AV1, which is the desired result
+                # anyway. This is safe, unlike the Profile 5 case.
+                $plan.Strategy           = 'strip_rpu'
+                $plan.TargetDynamicRange = $target
+                $plan.CanConvert         = $true
+                $plan.Reason             = "Profile 8 source with a $target-compatible base layer: RPU is not carried into the AV1 output, base layer encoded as $target."
+            } else {
+                $plan.Strategy = 'unsupported'
+                $plan.Reason   = 'Profile 8 source reports no usable base-layer compatibility ID; refusing to guess at the transfer function.'
+            }
+        }
+        10 {
+            # Dolby Vision carried in AV1 rather than HEVC. The cross-compat IDs
+            # mean the same things as Profile 8's, and dovi_rpu operates on AV1 as
+            # well as HEVC, so 10.1 / 10.2 / 10.4 convert the same way.
+            #
+            # Such a source is already AV1, so re-encoding it to AV1 usually gains
+            # nothing and the Auto "already efficient" check normally skips it
+            # first. Handled properly here so that if one does reach this point the
+            # outcome is correct rather than an unnecessary refusal.
+            $p10Target = switch ($plan.BlSignalCompatId) {
+                1       { 'HDR10' }
+                4       { 'HLG' }
+                2       { 'SDR' }
+                default { $null }
+            }
+            if ($null -ne $p10Target) {
+                $plan.Strategy             = 'strip_rpu'
+                $plan.InputBitstreamFilter = if ($HdrToolchain.SupportsDoviRpuBsf) { 'dovi_rpu=strip=1' } else { $null }
+                $plan.TargetDynamicRange   = $p10Target
+                $plan.CanConvert           = $true
+                $plan.Reason               = "Profile 10 source (Dolby Vision in AV1) with a $p10Target-compatible base layer: RPU stripped and encoded as $p10Target. Note the source is already AV1."
+            } else {
+                $plan.Strategy = 'unsupported'
+                $plan.Reason   = 'Profile 10 source (Dolby Vision in AV1) reports no backward-compatible base layer; refusing to guess at the transfer function.'
+            }
+        }
+        5 {
+            # No honest conversion available without real DV tone mapping.
+            $plan.Strategy = 'unsupported'
+            $plan.Reason   = 'Profile 5 source has no backward-compatible base layer. Re-encoding it as HDR10 produces incorrect colour, so it is skipped rather than converted.'
+        }
+        default {
+            if ($plan.BlSignalCompatId -eq 1 -and $HdrToolchain.SupportsDoviRpuBsf) {
+                $plan.Strategy             = 'strip_rpu'
+                $plan.InputBitstreamFilter = 'dovi_rpu=strip=1'
+                $plan.TargetDynamicRange   = 'HDR10'
+                $plan.CanConvert           = $true
+                $plan.Reason               = 'Dolby Vision source reports an HDR10-compatible base layer: RPU stripped and encoded as HDR10.'
+            } else {
+                $plan.Strategy = 'unsupported'
+                $plan.Reason   = "Unrecognised Dolby Vision configuration ($profileLabel, $compatLabel); refusing to guess."
+            }
+        }
+    }
+
+    return $plan
+}
+
+# -----------------------------------------------------------------------------
+# Decides, for one source, exactly what HDR handling the encode will use. This
+# is resolved once in Get-EncodeInitialization and then consumed by every arg
+# builder, so the preflight samples and the real encode cannot drift apart --
+# which matters, because a preflight that omits HDR metadata reports a
+# different bitrate than the encode it is supposed to be predicting.
+# -----------------------------------------------------------------------------
+function Resolve-HdrEncodePlan {
+    param(
+        [string]$InputPath,
+        $Probe,
+        $VideoStream,
+        $SourceProfile,
+        [string]$EncodeMode
+    )
+
+    $toolchain = Get-HdrToolchainEnvironment
+
+    $plan = [ordered]@{
+        Toolchain            = $toolchain
+        IsHdr                = [bool]$SourceProfile.HasHDR
+        TargetDynamicRange   = 'SDR'
+        Primaries            = $null
+        Transfer             = $null
+        Matrix               = $null
+        StaticMetadata       = $null
+        CarryStaticMetadata  = $false
+        StaticMetadataRoute  = 'none'     # ffmpeg_options | svtav1_params | none
+        PreserveHDR10Plus    = $false
+        Hdr10PlusRoute       = 'none'     # svt_inline | post_inject | none
+        Hdr10PlusJsonPath    = $null
+        DolbyVision          = $null
+        InputBitstreamFilter = $null
+        RequiresCpuLane      = $false
+        RequiresCpuLaneReason = ''
+        Skip                 = $false
+        SkipReason           = ''
+        Notes                = New-Object System.Collections.Generic.List[string]
+    }
+
+    # ---- Dolby Vision ------------------------------------------------------
+    $dvPlan = Resolve-DolbyVisionSourcePlan -Probe $Probe -VideoStream $VideoStream -HdrToolchain $toolchain
+    $plan.DolbyVision = $dvPlan
+
+    if ($dvPlan.IsDolbyVision) {
+        switch ($DolbyVisionMode) {
+            'Skip' {
+                $plan.Skip       = $true
+                $plan.SkipReason = "$($dvPlan.Label): skipped because DolbyVisionMode is set to 'Skip'."
+                return $plan
+            }
+            'HDR10' {
+                if (-not $dvPlan.CanConvert) {
+                    $plan.Skip       = $true
+                    $plan.SkipReason = $dvPlan.Reason
+                    return $plan
+                }
+                $plan.InputBitstreamFilter = $dvPlan.InputBitstreamFilter
+                $plan.Notes.Add($dvPlan.Reason)
+            }
+            'Passthrough' {
+                # AV1 can carry a DV RPU, but only Profile 10, and nothing in
+                # this pipeline produces a conformant P10 stream. Rather than
+                # emit a file that claims DV and is not, fall back to the
+                # base-layer conversion and say so.
+                if (-not $dvPlan.CanConvert) {
+                    $plan.Skip       = $true
+                    $plan.SkipReason = $dvPlan.Reason
+                    return $plan
+                }
+                $plan.InputBitstreamFilter = $dvPlan.InputBitstreamFilter
+                $plan.Notes.Add("Dolby Vision passthrough into AV1 is not produced by this pipeline; $($dvPlan.Reason)")
+            }
+        }
+    }
+
+    # ---- Transfer / primaries / matrix -------------------------------------
+    # HLG is the case the old code got wrong: it tagged every HDR source as PQ,
+    # so an HLG broadcast capture came out claiming smpte2084 and displayed
+    # far too dark. HLG is now preserved as HLG.
+    $sourceTransfer = [string]$SourceProfile.SourceTransfer
+    $isHlgSource = ($sourceTransfer -match 'arib-std-b67') -or ($dvPlan.TargetDynamicRange -eq 'HLG')
+
+    if ($dvPlan.IsDolbyVision -and $dvPlan.TargetDynamicRange -eq 'SDR') {
+        $plan.TargetDynamicRange = 'SDR'
+        $plan.Primaries = 'bt709'
+        $plan.Transfer  = 'bt709'
+        $plan.Matrix    = 'bt709'
+    } elseif ($isHlgSource -and $PreserveHLG) {
+        $plan.TargetDynamicRange = 'HLG'
+        $plan.Primaries = 'bt2020'
+        $plan.Transfer  = 'arib-std-b67'
+        $plan.Matrix    = 'bt2020nc'
+        $plan.IsHdr     = $true
+    } elseif ($SourceProfile.HasHDR -or $dvPlan.TargetDynamicRange -eq 'HDR10') {
+        $plan.TargetDynamicRange = 'HDR10'
+        $plan.Primaries = 'bt2020'
+        $plan.Transfer  = 'smpte2084'
+        $plan.Matrix    = 'bt2020nc'
+        $plan.IsHdr     = $true
+    } else {
+        $plan.TargetDynamicRange = 'SDR'
+        $plan.Primaries = if (-not [string]::IsNullOrWhiteSpace($SourceProfile.SourcePrimaries)) { $SourceProfile.SourcePrimaries } else { 'bt709' }
+        $plan.Transfer  = if (-not [string]::IsNullOrWhiteSpace($SourceProfile.SourceTransfer))  { $SourceProfile.SourceTransfer  } else { 'bt709' }
+        $plan.Matrix    = if (-not [string]::IsNullOrWhiteSpace($SourceProfile.SourceMatrix))    { $SourceProfile.SourceMatrix    } else { 'bt709' }
+    }
+
+    if (-not $plan.IsHdr) { return $plan }
+
+    # ---- Static HDR10 payload ---------------------------------------------
+    $static = Get-HdrStaticMetadata -InputPath $InputPath -VideoStream $VideoStream
+    $plan.StaticMetadata = $static
+
+    if ($PreserveHdrStaticMetadata -and ($static.HasMasteringDisplay -or $static.HasContentLight)) {
+        if ($toolchain.SupportsStaticMetadataOptions) {
+            $plan.CarryStaticMetadata = $true
+            $plan.StaticMetadataRoute = 'ffmpeg_options'
+        } elseif ($EncodeMode -ne 'nvenc') {
+            $plan.CarryStaticMetadata = $true
+            $plan.StaticMetadataRoute = 'svtav1_params'
+            $plan.Notes.Add('FFmpeg build lacks -mastering_display / -content_light; carrying static HDR10 metadata through svtav1-params instead.')
+        } else {
+            $plan.RequiresCpuLane       = $true
+            $plan.RequiresCpuLaneReason = 'NVENC cannot carry static HDR10 metadata on this FFmpeg build (-mastering_display unavailable).'
+            $plan.Notes.Add($plan.RequiresCpuLaneReason)
+        }
+    } elseif ($PreserveHdrStaticMetadata) {
+        $plan.Notes.Add('Source carries no mastering-display or content-light metadata; none is invented for the output.')
+    }
+
+    # Surfaced as a note, not silently: a metadata value the script changed on
+    # the user's behalf is exactly the kind of edit that should be visible in
+    # the log and on screen rather than discovered later.
+    if ($null -ne $plan.StaticMetadata) {
+        $clampNote = [string](Get-OptionalProperty -InputObject $plan.StaticMetadata -PropertyName 'MaxCLLClampNote' -Default '')
+        if (-not [string]::IsNullOrWhiteSpace($clampNote)) {
+            $plan.Notes.Add($clampNote)
+        }
+    }
+
+    # ---- HDR10+ dynamic metadata ------------------------------------------
+    $wantHdr10Plus = switch ("$PreserveHDR10Plus") {
+        'Auto'  { $static.HasHDR10Plus }
+        'True'  { $static.HasHDR10Plus }
+        default { $false }
+    }
+
+    if ($wantHdr10Plus) {
+        # The inline route runs inside SVT-AV1, so it does not exist on the NVENC
+        # lane. Rather than set a flag nobody enforces and then silently drop the
+        # metadata, fall through to post-encode injection when this job is
+        # already committed to NVENC, and only give up if that is unavailable too.
+        $inlineAvailable = $toolchain.SupportsSvtHdr10PlusJson -and $toolchain.Hdr10PlusToolPath -and ($EncodeMode -ne 'nvenc')
+
+        if ($EncodeMode -eq 'nvenc' -and $toolchain.SupportsSvtHdr10PlusJson) {
+            $plan.RequiresCpuLane       = $true
+            $plan.RequiresCpuLaneReason = 'HDR10+ can be carried inline only by the SVT-AV1 (CPU) lane; the Nvidia lane needs post-encode injection.'
+        }
+
+        if ($inlineAvailable) {
+            $plan.PreserveHDR10Plus = $true
+            $plan.Hdr10PlusRoute    = 'svt_inline'
+        } elseif ($toolchain.Hdr10PlusToolPath -and $toolchain.Hdr10PlusToolSupportsAv1) {
+            $plan.PreserveHDR10Plus = $true
+            $plan.Hdr10PlusRoute    = 'post_inject'
+            $plan.Notes.Add('HDR10+ metadata will be re-injected into the finished AV1 stream after encoding.')
+        } else {
+            $missing = if (-not $toolchain.Hdr10PlusToolPath) {
+                'hdr10plus_tool was not found next to the script or on PATH'
+            } else {
+                'the available hdr10plus_tool build does not support AV1, and the linked SVT-AV1 does not accept hdr10plus-json'
+            }
+            $plan.Notes.Add("Source has HDR10+ dynamic metadata but it cannot be preserved: $missing. Output will be correctly-tagged static HDR10.")
+        }
+    }
+
+    return $plan
+}
+
+# -----------------------------------------------------------------------------
+# Emits the HDR-related output arguments. Shared by the software lane, the
+# NVENC lane, and the preflight sampler so all three agree.
+#
+# Note on -svtav1-params: ffmpeg treats it as a single AVOption, so passing it
+# twice means the second occurrence wins and the first is silently discarded.
+# Film grain and HDR metadata therefore have to be merged into one string,
+# which is why this returns the params rather than appending them directly.
+# -----------------------------------------------------------------------------
+function Get-HdrSvtAv1ParamPairs {
+    param($HdrPlan)
+
+    $pairs = New-Object System.Collections.Generic.List[string]
+
+    if ($null -eq $HdrPlan) { return ,$pairs }
+    if (-not $HdrPlan.IsHdr) { return ,$pairs }
+    if ($HdrPlan.StaticMetadataRoute -ne 'svtav1_params') { return ,$pairs }
+
+    $static = $HdrPlan.StaticMetadata
+    if ($null -eq $static) { return ,$pairs }
+
+    # SVT-AV1 takes the normalised-float form, NOT ffmpeg's integer units.
+    # Read through Get-OptionalProperty rather than direct property access: under
+    # Set-StrictMode -Version Latest a missing key on an ordered dictionary
+    # throws, and this can be handed a plan built by an older code path.
+    $masteringFloat = Get-OptionalProperty -InputObject $static -PropertyName 'MasteringDisplayFloat' -Default $null
+    $hasMastering   = Get-OptionalProperty -InputObject $static -PropertyName 'HasMasteringDisplay' -Default $false
+    $hasContent     = Get-OptionalProperty -InputObject $static -PropertyName 'HasContentLight' -Default $false
+    $contentLight   = Get-OptionalProperty -InputObject $static -PropertyName 'ContentLight' -Default $null
+
+    if ($hasMastering -and -not [string]::IsNullOrWhiteSpace($masteringFloat)) {
+        $pairs.Add("mastering-display=$masteringFloat")
+    }
+    if ($hasContent -and -not [string]::IsNullOrWhiteSpace($contentLight)) {
+        $pairs.Add("content-light=$contentLight")
+    }
+
+    return ,$pairs
+}
+
+function Add-HdrOutputArguments {
+    param(
+        [System.Collections.Generic.List[string]]$ArgumentList,
+        $HdrPlan,
+        $SourceProfile
+    )
+
+    # Fall back to the pre-existing behaviour if no plan was resolved, so the
+    # arg builders stay callable in isolation.
+    if ($null -eq $HdrPlan) {
+        if ($SourceProfile -and $SourceProfile.HasHDR) {
+            $ArgumentList.AddRange([string[]]@('-color_primaries', 'bt2020', '-color_trc', 'smpte2084', '-colorspace', 'bt2020nc'))
+        }
+        return
+    }
+
+    $ArgumentList.AddRange([string[]]@(
+        '-color_primaries', $HdrPlan.Primaries,
+        '-color_trc',       $HdrPlan.Transfer,
+        '-colorspace',      $HdrPlan.Matrix
+    ))
+
+    if (-not $HdrPlan.IsHdr) { return }
+
+    if ($HdrPlan.CarryStaticMetadata -and $HdrPlan.StaticMetadataRoute -eq 'ffmpeg_options') {
+        $static = $HdrPlan.StaticMetadata
+        $tc = $HdrPlan.Toolchain
+
+        # Option name comes from the probed style, not from an assumption. See
+        # Get-HdrToolchainEnvironment: ":v:0" is rejected by real FFmpeg 9
+        # builds even though the documented syntax shows the specifier as
+        # optional. Defaults to the bare form, which is the one that works.
+        $mdStyle = Get-OptionalProperty -InputObject $tc -PropertyName 'MasteringDisplayArgStyle' -Default 'bare'
+        $clStyle = Get-OptionalProperty -InputObject $tc -PropertyName 'ContentLightArgStyle'     -Default 'bare'
+
+        if ($static.HasMasteringDisplay -and $mdStyle -ne 'none') {
+            $opt = if ($mdStyle -eq 'stream_spec') { '-mastering_display:v:0' } else { '-mastering_display' }
+            $ArgumentList.AddRange([string[]]@($opt, $static.MasteringDisplay))
+        }
+        if ($static.HasContentLight -and $clStyle -ne 'none') {
+            $opt = if ($clStyle -eq 'stream_spec') { '-content_light:v:0' } else { '-content_light' }
+            $ArgumentList.AddRange([string[]]@($opt, $static.ContentLight))
+        }
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Extracts ST 2094-40 metadata from the source into a JSON sidecar.
+#
+# hdr10plus_tool reads an HEVC elementary stream, so the video track is
+# demuxed to Annex B and piped in. Failure is non-fatal: the encode continues
+# without dynamic metadata and the reason is recorded.
+# -----------------------------------------------------------------------------
+function Export-HDR10PlusMetadata {
+    param(
+        [string]$InputPath,
+        $VideoStream,
+        $HdrPlan
+    )
+
+    $toolchain = $HdrPlan.Toolchain
+    if (-not $toolchain.Hdr10PlusToolPath) {
+        return [ordered]@{ Success = $false; Path = $null; Reason = 'hdr10plus_tool not available.' }
+    }
+
+    $codecName = [string](Get-StreamProp $VideoStream 'codec_name' '')
+    if ($codecName -notmatch '(?i)hevc|h265') {
+        return [ordered]@{ Success = $false; Path = $null; Reason = "HDR10+ extraction requires an HEVC source; this source is '$codecName'." }
+    }
+
+    $jsonPath = Join-Path $PreflightDir ("hdr10plus_{0}.json" -f [Guid]::NewGuid().ToString('N'))
+    $streamIndex = [int](Get-StreamProp $VideoStream 'index' 0)
+
+    try {
+        # ffmpeg writes the Annex B elementary stream to stdout; hdr10plus_tool
+        # reads it from stdin ("-") and writes the JSON sidecar.
+        $ffmpegArgs = @(
+            '-hide_banner', '-loglevel', 'error',
+            '-i', $InputPath,
+            '-map', "0:$streamIndex",
+            '-c:v', 'copy',
+            '-bsf:v', 'hevc_mp4toannexb',
+            '-f', 'hevc', 'pipe:1'
+        )
+
+        & $FfmpegPath @ffmpegArgs 2>$null |
+            & $toolchain.Hdr10PlusToolPath extract -o $jsonPath - 2>$null
+
+        if ((Test-Path -LiteralPath $jsonPath) -and ((Get-Item -LiteralPath $jsonPath).Length -gt 0)) {
+            return [ordered]@{ Success = $true; Path = $jsonPath; Reason = 'HDR10+ metadata extracted to JSON sidecar.' }
+        }
+
+        if (Test-Path -LiteralPath $jsonPath) {
+            Remove-Item -LiteralPath $jsonPath -Force -ErrorAction SilentlyContinue
+        }
+        return [ordered]@{ Success = $false; Path = $null; Reason = 'hdr10plus_tool produced no metadata for this source.' }
+    } catch {
+        if (Test-Path -LiteralPath $jsonPath) {
+            Remove-Item -LiteralPath $jsonPath -Force -ErrorAction SilentlyContinue
+        }
+        return [ordered]@{ Success = $false; Path = $null; Reason = "HDR10+ extraction failed: $($_.Exception.Message)" }
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Re-injects HDR10+ metadata into a finished AV1 file.
+#
+# Used only on the post_inject route, i.e. when the encoder could not carry the
+# metadata itself. The video track is demuxed to a raw AV1 stream, the metadata
+# OBUs are inserted, and the result is remuxed against the original output so
+# audio, subtitles, and chapters are preserved untouched.
+#
+# The original file is only replaced once every step has succeeded.
+# -----------------------------------------------------------------------------
+function Import-HDR10PlusMetadata {
+    param(
+        [string]$EncodedPath,
+        [string]$JsonPath,
+        $HdrPlan
+    )
+
+    $toolchain = $HdrPlan.Toolchain
+    if (-not $toolchain.Hdr10PlusToolPath -or -not $toolchain.Hdr10PlusToolSupportsAv1) {
+        return [ordered]@{ Success = $false; Reason = 'No AV1-capable hdr10plus_tool available for injection.' }
+    }
+    if (-not (Test-Path -LiteralPath $JsonPath)) {
+        return [ordered]@{ Success = $false; Reason = 'HDR10+ JSON sidecar is missing.' }
+    }
+
+    $workId      = [Guid]::NewGuid().ToString('N')
+    $rawAv1      = Join-Path $PreflightDir ("hdr10plus_bl_{0}.obu"  -f $workId)
+    $injectedAv1 = Join-Path $PreflightDir ("hdr10plus_inj_{0}.obu" -f $workId)
+    $remuxed     = Join-Path $PreflightDir ("hdr10plus_mux_{0}.mkv" -f $workId)
+
+    try {
+        # 1. Demux the AV1 video track to a raw OBU stream.
+        $extractArgs = @(
+            '-hide_banner', '-loglevel', 'error', '-y',
+            '-i', $EncodedPath,
+            '-map', '0:v:0',
+            '-c:v', 'copy',
+            '-f', 'obu', $rawAv1
+        )
+        & $FfmpegPath @extractArgs
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $rawAv1)) {
+            return [ordered]@{ Success = $false; Reason = 'Could not demux the AV1 stream for HDR10+ injection.' }
+        }
+
+        # 2. Insert the metadata OBUs.
+        & $toolchain.Hdr10PlusToolPath inject -i $rawAv1 -j $JsonPath -o $injectedAv1 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $injectedAv1)) {
+            return [ordered]@{ Success = $false; Reason = 'hdr10plus_tool injection failed.' }
+        }
+
+        # 3. Remux: injected video + every non-video stream from the encode.
+        $remuxArgs = @(
+            '-hide_banner', '-loglevel', 'error', '-y',
+            '-i', $injectedAv1,
+            '-i', $EncodedPath,
+            '-map', '0:v:0',
+            '-map', '1:a?',
+            '-map', '1:s?',
+            '-map_chapters', '1',
+            '-c', 'copy',
+            $remuxed
+        )
+        & $FfmpegPath @remuxArgs
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $remuxed)) {
+            return [ordered]@{ Success = $false; Reason = 'Remux after HDR10+ injection failed.' }
+        }
+
+        # 4. Sanity check before replacing anything: the remux should be within a
+        #    few percent of the encode. A wildly different size means something
+        #    went wrong and the original is left alone.
+        $originalSize = (Get-Item -LiteralPath $EncodedPath).Length
+        $remuxedSize  = (Get-Item -LiteralPath $remuxed).Length
+        if ($originalSize -gt 0) {
+            $ratio = $remuxedSize / [double]$originalSize
+            if ($ratio -lt 0.90 -or $ratio -gt 1.10) {
+                return [ordered]@{
+                    Success = $false
+                    Reason  = ("HDR10+ injection produced an unexpected output size ({0:P1} of the encode); keeping the un-injected file." -f $ratio)
+                }
+            }
+        }
+
+        Move-Item -LiteralPath $remuxed -Destination $EncodedPath -Force
+        return [ordered]@{ Success = $true; Reason = 'HDR10+ dynamic metadata injected into the AV1 output.' }
+    } catch {
+        return [ordered]@{ Success = $false; Reason = "HDR10+ injection failed: $($_.Exception.Message)" }
+    } finally {
+        foreach ($tmp in @($rawAv1, $injectedAv1, $remuxed)) {
+            if ($tmp -and (Test-Path -LiteralPath $tmp)) {
+                Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Human-readable one-line summary of what the HDR plan will actually do, for
+# the console and the session log.
+# -----------------------------------------------------------------------------
+function Get-HdrPlanSummary {
+    param($HdrPlan)
+
+    if ($null -eq $HdrPlan) { return 'HDR plan unavailable.' }
+    if (-not $HdrPlan.IsHdr) { return "SDR passthrough ($($HdrPlan.Primaries)/$($HdrPlan.Transfer))" }
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    $parts.Add($HdrPlan.TargetDynamicRange)
+
+    if ($HdrPlan.CarryStaticMetadata) {
+        $static = $HdrPlan.StaticMetadata
+        $bits = New-Object System.Collections.Generic.List[string]
+        if ($static.HasMasteringDisplay) { $bits.Add('mastering display') }
+        if ($static.HasContentLight)     { $bits.Add("MaxCLL $($static.MaxCLL) / MaxFALL $($static.MaxFALL)") }
+        $parts.Add(($bits -join ' + '))
+    } else {
+        $parts.Add('no static colour volume')
+    }
+
+    if ($HdrPlan.PreserveHDR10Plus) {
+        $parts.Add("HDR10+ preserved ($($HdrPlan.Hdr10PlusRoute -replace '_','-'))")
+    } elseif ($HdrPlan.StaticMetadata -and $HdrPlan.StaticMetadata.HasHDR10Plus) {
+        $parts.Add('HDR10+ present but not preserved')
+    }
+
+    if ($HdrPlan.DolbyVision -and $HdrPlan.DolbyVision.IsDolbyVision) {
+        $parts.Add("from $($HdrPlan.DolbyVision.Label)")
+    }
+
+    return ($parts -join ' | ')
+}
+
+# -----------------------------------------------------------------------------
+# Flattens the HDR plan into the log columns. Kept as one helper so every row
+# that reports HDR reports it identically, and so adding a column later means
+# touching one place instead of every Write-LogRow call site.
+# -----------------------------------------------------------------------------
+function Get-HdrLogFields {
+    param($Init)
+
+    $empty = [ordered]@{
+        SourceHdrFormat    = ''
+        HdrTargetFormat    = ''
+        HdrStaticMetadata  = ''
+        HdrMaxCLL          = ''
+        HdrMaxFALL         = ''
+        HdrHDR10PlusSource = ''
+        HdrHDR10PlusOutput = ''
+        DolbyVisionProfile = ''
+        DolbyVisionStrategy = ''
+        HdrPlanSummary     = ''
+        MaxCllClamped      = ''
+    }
+
+    if ($null -eq $Init) { return $empty }
+
+    $plan = Get-OptionalProperty -InputObject $Init -PropertyName 'HdrPlan' -Default $null
+    if ($null -eq $plan) { return $empty }
+
+    $sourceProfile = Get-OptionalProperty -InputObject $Init -PropertyName 'SourceProfile' -Default $null
+    $static = $plan.StaticMetadata
+    $dv     = $plan.DolbyVision
+
+    return [ordered]@{
+        SourceHdrFormat    = if ($sourceProfile) { $sourceProfile.SourceHdrFormat } else { '' }
+        HdrTargetFormat    = $plan.TargetDynamicRange
+        HdrStaticMetadata  = if ($plan.CarryStaticMetadata -and $static -and $static.HasMasteringDisplay) { $static.MasteringDisplay } else { '' }
+        HdrMaxCLL          = if ($plan.CarryStaticMetadata -and $static -and $static.HasContentLight) { $static.MaxCLL } else { '' }
+        HdrMaxFALL         = if ($plan.CarryStaticMetadata -and $static -and $static.HasContentLight) { $static.MaxFALL } else { '' }
+        HdrHDR10PlusSource = if ($static) { "$($static.HasHDR10Plus)" } else { '' }
+        HdrHDR10PlusOutput = if ($plan.PreserveHDR10Plus) { $plan.Hdr10PlusRoute } else { 'none' }
+        DolbyVisionProfile = if ($dv -and $dv.IsDolbyVision -and $null -ne $dv.Profile) { $dv.Profile } else { '' }
+        DolbyVisionStrategy = if ($dv -and $dv.IsDolbyVision) { $dv.Strategy } else { '' }
+        HdrPlanSummary     = Get-HdrPlanSummary -HdrPlan $plan
+        MaxCllClamped      = if ($static) { [string](Get-OptionalProperty -InputObject $static -PropertyName 'MaxCLLClampNote' -Default '') } else { '' }
+    }
+}
+
+function Add-HdrLogFields {
+    param(
+        [hashtable]$Row,
+        $Init
+    )
+
+    foreach ($kv in (Get-HdrLogFields -Init $Init).GetEnumerator()) {
+        $Row[$kv.Key] = $kv.Value
+    }
+    return $Row
+}
+
+# -----------------------------------------------------------------------------
+# Log fields for the measured-quality columns.
+#
+# Written with the same "every shape carries every field" discipline as the HDR
+# fields: the workflow object is built at three different places in this script,
+# and under StrictMode a reader that finds a property on one shape and not
+# another is a hard error rather than a blank cell.
+# -----------------------------------------------------------------------------
+function Get-QualityLogFields {
+    param($Init)
+
+    $empty = [ordered]@{
+        QualityMetric            = ''
+        QualityMode              = ''
+        QualityThreshold         = ''
+        QualityMeasured          = ''
+        QualityAnchorCRF         = ''
+        QualityAnchorMetric      = ''
+        QualityTransparencyMet   = ''
+        QualityProbeCount        = ''
+        QualityCrfDelta          = ''
+        QualitySecondMetric      = ''
+        QualitySecondMetricValue = ''
+        SvtEfficiencyParams      = ''
+    }
+
+    if ($null -eq $Init) { return $empty }
+
+    $workflow = Get-OptionalProperty -InputObject $Init -PropertyName 'PreflightWorkflow' -Default $null
+    if ($null -eq $workflow) { return $empty }
+
+    # Recomputed rather than carried on $Init: the support probe is cached, so
+    # this is free, and it records what was actually emitted rather than what
+    # some earlier stage believed would be.
+    $efficiency = ''
+    if ([string](Get-OptionalProperty -InputObject $Init -PropertyName 'ResolvedEncodeLane' -Default '') -ne 'Nvidia') {
+        $sp = Get-OptionalProperty -InputObject $Init -PropertyName 'SourceProfile' -Default $null
+        $efficiency = ((Get-SvtAv1EfficiencyParamPairs -SourceProfile $sp -FrameRate ([double](Get-OptionalProperty -InputObject $sp -PropertyName 'FrameRate' -Default 0.0))) -join ':')
+    }
+    $empty.SvtEfficiencyParams = $efficiency
+
+    $search = Get-OptionalProperty -InputObject $workflow -PropertyName 'QualitySearch' -Default $null
+    if ($null -eq $search -or -not $search.Ran) { return $empty }
+
+    $secondName  = [string](Get-OptionalProperty -InputObject $workflow -PropertyName 'QualitySecondMetricName' -Default '')
+    $secondValue = [double](Get-OptionalProperty -InputObject $workflow -PropertyName 'QualitySecondMetricValue' -Default 0.0)
+
+    return [ordered]@{
+        QualityMetric            = [string]$search.MetricName
+        QualityMode              = [string]$search.Mode
+        QualityThreshold         = ("{0:F3}" -f [double]$search.Threshold)
+        QualityMeasured          = ("{0:F3}" -f [double]$search.Metric)
+        QualityAnchorCRF         = if ($search.Mode -eq 'Anchor') { "$($search.AnchorCRF)" } else { '' }
+        QualityAnchorMetric      = if ($search.Mode -eq 'Anchor') { ("{0:F3}" -f [double]$search.AnchorMetric) } else { '' }
+        QualityTransparencyMet   = "$($search.TransparencyMet)"
+        QualityProbeCount        = "$($search.ProbeCount)"
+        QualityCrfDelta          = "$([int]$search.ChosenCRF - [int]$search.StartCRF)"
+        QualitySecondMetric      = $secondName
+        QualitySecondMetricValue = if ([string]::IsNullOrWhiteSpace($secondName)) { '' } else { ("{0:F3}" -f $secondValue) }
+        SvtEfficiencyParams      = $efficiency
+    }
+}
+
+function Add-QualityLogFields {
+    param(
+        [hashtable]$Row,
+        $Init
+    )
+
+    foreach ($kv in (Get-QualityLogFields -Init $Init).GetEnumerator()) {
+        $Row[$kv.Key] = $kv.Value
+    }
+    return $Row
 }
 
 function Get-BppTier {
@@ -3605,7 +6766,7 @@ function Select-Streams {
 #   is the correct signalling for HDR10 and HDR10+ in an MKV container.
 # =============================================================================
 function Get-SourceProfile {
-    param($Probe, $VideoStream)
+    param($Probe, $VideoStream, [string]$InputPath = '')
 
     # Dolby Vision detection. Evaluated per-stream rather than as a single
     # pipeline expression because the side_data_list check requires a variable
@@ -3639,13 +6800,24 @@ function Get-SourceProfile {
     $matrix    = [string](Get-StreamProp $VideoStream 'color_space'     '')
     $bitDepth  = Get-VideoBitDepth -Stream $VideoStream
 
-    $videoSideData = Get-StreamSideDataList -Stream $VideoStream
-    if ($videoSideData.Count -gt 0) {
-        foreach ($sd in $videoSideData) {
-            $sideDataType = [string](Get-StreamProp $sd 'side_data_type' '')
-            if ($sideDataType -match 'HDR10\+|SMPTE2094-40|Dynamic HDR') {
-                $hasHDR10Plus = $true
-                break
+    # HDR10+ detection used to scan the *stream-level* side_data_list only. For
+    # the sources that matter here -- HEVC Blu-ray remuxes, where the metadata
+    # lives in SEI rather than in container elements -- that list is empty, so
+    # the check never fired and every HDR10+ source was silently treated as
+    # plain HDR10. Get-HdrStaticMetadata checks stream level and then frame
+    # level, and caches the result so this costs one probe per file.
+    if (-not [string]::IsNullOrWhiteSpace($InputPath)) {
+        $staticProbe = Get-HdrStaticMetadata -InputPath $InputPath -VideoStream $VideoStream
+        $hasHDR10Plus = $staticProbe.HasHDR10Plus
+    } else {
+        $videoSideData = Get-StreamSideDataList -Stream $VideoStream
+        if ($videoSideData.Count -gt 0) {
+            foreach ($sd in $videoSideData) {
+                $sideDataType = [string](Get-StreamProp $sd 'side_data_type' '')
+                if ($sideDataType -match 'HDR10\+|SMPTE2094-40|Dynamic HDR') {
+                    $hasHDR10Plus = $true
+                    break
+                }
             }
         }
     }
@@ -3687,6 +6859,11 @@ function Get-SourceProfile {
         SourceTransferLabel = $sourceTransferLabel
         SourceMatrixLabel   = $sourceMatrixLabel
         SourceColorSummary  = Get-ColorSummary -BitDepth $bitDepth -DynamicRangeLabel $sourceHdrFormat -PrimariesLabel $sourcePrimariesLabel -TransferLabel $sourceTransferLabel
+        # Carried here so the keyframe-interval calculation works from the real
+        # frame rate. Without it the seconds-to-frames conversion silently fell
+        # back to 24 fps, which is right for film and wrong for 25 and 30 fps
+        # material -- a 10-second setting becoming 8 seconds without saying so.
+        FrameRate           = [double](Get-FrameRate -Stream $VideoStream)
     }
 }
 
@@ -4141,8 +7318,19 @@ function Get-EncodeInitialization {
         [string]$LaneSuitability = '',
         [string]$CpuOnlyReason = '',
         [bool]$NvidiaFallbackAllowed = $true,
-        [bool]$HeldForCpuLane = $false
+        [bool]$HeldForCpuLane = $false,
+        [string]$AutoCRFOffsetOverrideValue = '',
+        [string]$TargetGiBPerHourOverrideValue = ''
     )
+
+    # A per-job override beats the global setting. Empty means "no override",
+    # which is distinct from "0" -- 0 is a real, explicitly-pinned value that
+    # the Balanced tier uses to mean "no bias, and do not defer to the global".
+    $effectiveAutoCRFOffset = if (-not [string]::IsNullOrWhiteSpace($AutoCRFOffsetOverrideValue)) {
+        $AutoCRFOffsetOverrideValue
+    } else {
+        $AutoCRFOffset
+    }
 
     $sourceItem = Get-Item -LiteralPath $InputPath
     $sourceSizeGiB = [Math]::Round(($sourceItem.Length / 1GB), 3)
@@ -4152,7 +7340,7 @@ function Get-EncodeInitialization {
 
     $probe         = Invoke-FfprobeJson -InputPath $InputPath
     $selected      = Select-Streams     -Probe $probe
-    $sourceProfile = Get-SourceProfile  -Probe $probe -VideoStream $selected.Video
+    $sourceProfile = Get-SourceProfile  -Probe $probe -VideoStream $selected.Video -InputPath $InputPath
     $encodeColorProfile = Get-EncodeColorProfile -SourceProfile $sourceProfile
     $sourceFormat  = Get-OptionalProperty -InputObject $probe -PropertyName 'format' -Default ([PSCustomObject]@{})
     $sourceDuration = Convert-ToInvariantDouble (Get-OptionalProperty $sourceFormat 'duration' 0) 0.0
@@ -4161,7 +7349,17 @@ function Get-EncodeInitialization {
     $selectedAudioSummary = Format-StreamSummary -Streams @($selected.MainAudio, $selected.FallbackAudio)
     $selectedSubtitleSummary = Format-StreamSummary -Streams @($selected.MainSub, $selected.SdhSub)
     $copiedStreamsEstimate = Get-CopiedStreamsSizeEstimate -Streams @($selected.MainAudio, $selected.FallbackAudio, $selected.MainSub, $selected.SdhSub) -DurationSec $sourceDuration
-    $copiedStreamsEstimate = Get-CopiedStreamsSizeEstimate -Streams @($selected.MainAudio, $selected.FallbackAudio, $selected.MainSub, $selected.SdhSub) -DurationSec $sourceDuration
+
+    # Resolve the HDR plan once, here, and hand it to every downstream consumer
+    # (preflight sampler, both argument builders, the log row). Resolving it in
+    # one place is what keeps the preflight samples and the real encode from
+    # drifting apart.
+    $hdrPlan = Resolve-HdrEncodePlan `
+        -InputPath $InputPath `
+        -Probe $probe `
+        -VideoStream $selected.Video `
+        -SourceProfile $sourceProfile `
+        -EncodeMode $EncodeMode
 
     $tempOutput  = Get-TempOutputPath  -InputPath $InputPath
     $finalOutput = Get-FinalOutputPath -InputPath $InputPath
@@ -4184,7 +7382,13 @@ function Get-EncodeInitialization {
         throw "Final output path already exists and is not the source file: $finalOutput. Remove it manually before re-encoding."
     }
 
-    if ($sourceProfile.HasDV -and $SkipDolbyVisionSources) {
+    # Dolby Vision sources are no longer skipped wholesale. Resolve-HdrEncodePlan
+    # decides per source whether a correct conversion exists: Profile 7 and 8
+    # convert cleanly to HDR10 (or HLG), while Profile 5 has no HDR10-compatible
+    # base layer and is still refused, because re-tagging it produces visibly
+    # wrong colour rather than an imperfect-but-watchable file.
+    if ($hdrPlan.Skip) {
+        Write-SessionTextLogMessage -Level Warn -Message ("HDR plan skip | {0} | {1}" -f $displayInputName, $hdrPlan.SkipReason)
         return [ordered]@{
             EarlyExit = 'SKIPPED_DV'
             Row = @{
@@ -4238,9 +7442,19 @@ function Get-EncodeInitialization {
                 NvencCapacitySource = if ($NvencEnvironment) { $NvencEnvironment.CapacitySource } else { "" }
                 DetectedGpuName   = if ($NvencEnvironment) { $NvencEnvironment.GpuName } else { "" }
                 FilmGrainDisabledReason = ""
+                SourceHdrFormat   = $sourceProfile.SourceHdrFormat
+                HdrTargetFormat   = ""
+                HdrStaticMetadata = ""
+                HdrMaxCLL         = ""
+                HdrMaxFALL        = ""
+                HdrHDR10PlusSource = ""
+                HdrHDR10PlusOutput = ""
+                DolbyVisionProfile = if ($hdrPlan.DolbyVision) { $hdrPlan.DolbyVision.Profile } else { "" }
+                DolbyVisionStrategy = if ($hdrPlan.DolbyVision) { $hdrPlan.DolbyVision.Strategy } else { "" }
+                HdrPlanSummary    = Get-HdrPlanSummary -HdrPlan $hdrPlan
                 FfmpegPath        = $FfmpegPath
                 FfprobePath       = $FfprobePath
-                Notes             = "Dolby Vision source skipped by policy."
+                Notes             = $hdrPlan.SkipReason
             }
         }
     }
@@ -4254,7 +7468,7 @@ function Get-EncodeInitialization {
         -ConfiguredCRF $CRF `
         -ConfiguredPreset $Preset `
         -ConfiguredFilmGrain $FilmGrain `
-        -ConfiguredAutoCRFOffset $AutoCRFOffset
+        -ConfiguredAutoCRFOffset $effectiveAutoCRFOffset
 
     if ($autoSettings.Skip) {
         return [ordered]@{
@@ -4336,6 +7550,9 @@ function Get-EncodeInitialization {
         WasPreflightRetuned = $false
         WasSkippedByPreflight = $false
         SkipStatus = ''
+        QualitySearch = $null
+        QualitySecondMetricName = ''
+        QualitySecondMetricValue = 0.0
     }
     if ($EncodeMode -eq 'nvenc') {
         if (-not $NvencEnvironment) {
@@ -4357,6 +7574,33 @@ function Get-EncodeInitialization {
         }
     }
 
+    # HDR10+ metadata is extracted before preflight for two reasons: the inline
+    # SVT-AV1 route needs the JSON sidecar to exist when the encoder starts, and
+    # extracting it now means a source whose metadata turns out to be unreadable
+    # is reported before hours of encoding rather than after.
+    if ($hdrPlan.PreserveHDR10Plus) {
+        $hdr10PlusExport = Export-HDR10PlusMetadata -InputPath $InputPath -VideoStream $selected.Video -HdrPlan $hdrPlan
+        if ($hdr10PlusExport.Success) {
+            $hdrPlan.Hdr10PlusJsonPath = $hdr10PlusExport.Path
+            Write-SessionTextLogMessage -Level Info -Message ("HDR10+ extracted | {0} | {1}" -f $displayInputName, $hdr10PlusExport.Reason)
+        } else {
+            # Extraction failed: fall back to static HDR10 rather than starting
+            # an encode that claims dynamic metadata it does not have.
+            $hdrPlan.PreserveHDR10Plus = $false
+            $hdrPlan.Hdr10PlusRoute    = 'none'
+            $hdrPlan.Notes.Add("HDR10+ not preserved: $($hdr10PlusExport.Reason)")
+            Write-Warning "HDR10+ extraction failed for $displayInputName -- continuing as static HDR10. $($hdr10PlusExport.Reason)"
+            Write-SessionTextLogMessage -Level Warn -Message ("HDR10+ extraction failed | {0} | {1}" -f $displayInputName, $hdr10PlusExport.Reason)
+        }
+    }
+
+    $hdrPlanSummary = Get-HdrPlanSummary -HdrPlan $hdrPlan
+    Write-Host ("HDR: {0}" -f $hdrPlanSummary) -ForegroundColor DarkCyan
+    Write-SessionTextLogMessage -Level Info -Message ("HDR plan | {0} | {1}" -f $displayInputName, $hdrPlanSummary)
+    foreach ($hdrNote in $hdrPlan.Notes) {
+        Write-SessionTextLogMessage -Level Info -Message ("HDR note | {0}" -f $hdrNote)
+    }
+
     $preflightWorkflow = Invoke-PreflightAutoTuneWorkflow `
         -InputPath $InputPath `
         -Selected $selected `
@@ -4368,7 +7612,9 @@ function Get-EncodeInitialization {
         -InitialResolvedCRF ([int]$autoSettings.CRF) `
         -InitialResolvedPreset ([int]$autoSettings.Preset) `
         -InitialResolvedFilmGrain $effectiveFilmGrain `
-        -NvencEnvironment $NvencEnvironment
+        -NvencEnvironment $NvencEnvironment `
+        -HdrPlan $hdrPlan `
+        -TargetGiBPerHourOverrideValue $TargetGiBPerHourOverrideValue
 
     $preflightEstimate = $preflightWorkflow.FinalPreflight
     $effectiveFilmGrain = [int]$preflightWorkflow.FinalResolvedFilmGrain
@@ -4376,17 +7622,33 @@ function Get-EncodeInitialization {
         $nvencSettings = $preflightWorkflow.FinalNvencSettings
     }
 
-    if ($preflightEstimate.Ran) {
-        Write-Host ("Preflight estimate: {0:F2} GiB (projected savings {1:F1}%)" -f $preflightEstimate.EstimatedFinalSizeGiB, $preflightEstimate.EstimatedSavingsPercent) -ForegroundColor DarkCyan
-        Write-SessionTextLogMessage -Level Info -Message ("Preflight estimate | {0} | {1:F2} GiB | savings {2:F1}%" -f $displayInputName, $preflightEstimate.EstimatedFinalSizeGiB, $preflightEstimate.EstimatedSavingsPercent)
-        if ($preflightWorkflow.WasSkippedByPreflight) {
-            Write-Host "Decision: skipped (estimated output exceeds threshold)" -ForegroundColor Yellow
-            Write-SessionTextLogMessage -Level Warn -Message ("Preflight decision | skipped | {0} | estimated output exceeds threshold" -f $displayInputName)
-            return [ordered]@{
-                EarlyExit = 'PRECHECK_SKIPPED_UNFAVORABLE'
-                Row = @{
+    # The skip decision is checked BEFORE the "did the size estimate run?"
+    # branch, and deliberately so. The quality-targeted search can refuse a
+    # file before any size projection happens -- if no CRF in range is visually
+    # transparent there is nothing worth projecting. Leaving this check nested
+    # inside "if the estimate ran" would silently drop that refusal and encode
+    # the file anyway at reduced quality, which is the single outcome the
+    # feature exists to prevent.
+    if ($preflightWorkflow.WasSkippedByPreflight) {
+        $skipStatus = if ([string]::IsNullOrWhiteSpace($preflightWorkflow.SkipStatus)) { 'PRECHECK_SKIPPED_UNFAVORABLE' } else { [string]$preflightWorkflow.SkipStatus }
+        $skipMessage = if ($skipStatus -eq 'PRECHECK_SKIPPED_QUALITY_FLOOR') {
+            'no CRF in the permitted range stayed visually transparent; source left untouched'
+        } else {
+            'estimated output exceeds threshold'
+        }
+        Write-Host ("Decision: skipped ({0})" -f $skipMessage) -ForegroundColor Yellow
+        Write-SessionTextLogMessage -Level Warn -Message ("Preflight decision | skipped | {0} | {1}" -f $displayInputName, $skipMessage)
+
+        $skipHdrFields = Get-HdrLogFields -Init ([ordered]@{ HdrPlan = $hdrPlan; SourceProfile = $sourceProfile })
+        $skipQualityFields = Get-QualityLogFields -Init ([ordered]@{
+            PreflightWorkflow  = $preflightWorkflow
+            SourceProfile      = $sourceProfile
+            ResolvedEncodeLane = $resolvedEncodeLane
+        })
+
+        $skipRow = @{
                     Timestamp         = (Get-Date).ToString("s")
-                    Status            = "PRECHECK_SKIPPED_UNFAVORABLE"
+                    Status            = $skipStatus
                     InputPath         = $InputPath
                     OutputPath        = ""
                     SourceSizeGiB     = $sourceSizeGiB
@@ -4400,9 +7662,9 @@ function Get-EncodeInitialization {
                     HasDV             = $sourceProfile.HasDV
                     SelectedAudio     = $selectedAudioSummary
                     SelectedSubtitles = $selectedSubtitleSummary
-                    EstimatedFinalSizeGiB = [Math]::Round($preflightEstimate.EstimatedFinalSizeGiB, 3)
-                    EstimatedSavingsPercent = [Math]::Round($preflightEstimate.EstimatedSavingsPercent, 2)
-                    EstimatedOutputGiBPerHour = [Math]::Round($preflightEstimate.EstimatedOutputGiBPerHour, 3)
+                    EstimatedFinalSizeGiB = if ($preflightEstimate.Ran) { [Math]::Round($preflightEstimate.EstimatedFinalSizeGiB, 3) } else { "" }
+                    EstimatedSavingsPercent = if ($preflightEstimate.Ran) { [Math]::Round($preflightEstimate.EstimatedSavingsPercent, 2) } else { "" }
+                    EstimatedOutputGiBPerHour = if ($preflightEstimate.Ran) { [Math]::Round($preflightEstimate.EstimatedOutputGiBPerHour, 3) } else { "" }
                     InitialResolvedCRF = $preflightWorkflow.InitialResolvedCRF
                     InitialResolvedPreset = $preflightWorkflow.InitialResolvedPreset
                     InitialResolvedFilmGrain = $preflightWorkflow.InitialResolvedFilmGrain
@@ -4457,9 +7719,22 @@ function Get-EncodeInitialization {
                     FfmpegPath        = $FfmpegPath
                     FfprobePath       = $FfprobePath
                     Notes             = $preflightWorkflow.PreflightAutoTuneReason
-                }
-            }
         }
+
+        # A skip row that does not say what the metadata and the measurement
+        # were is a skip nobody can audit later.
+        foreach ($kv in $skipHdrFields.GetEnumerator())     { $skipRow[$kv.Key] = $kv.Value }
+        foreach ($kv in $skipQualityFields.GetEnumerator()) { $skipRow[$kv.Key] = $kv.Value }
+
+        return [ordered]@{
+            EarlyExit = $skipStatus
+            Row       = $skipRow
+        }
+    }
+
+    if ($preflightEstimate.Ran) {
+        Write-Host ("Preflight estimate: {0:F2} GiB (projected savings {1:F1}%)" -f $preflightEstimate.EstimatedFinalSizeGiB, $preflightEstimate.EstimatedSavingsPercent) -ForegroundColor DarkCyan
+        Write-SessionTextLogMessage -Level Info -Message ("Preflight estimate | {0} | {1:F2} GiB | savings {2:F1}%" -f $displayInputName, $preflightEstimate.EstimatedFinalSizeGiB, $preflightEstimate.EstimatedSavingsPercent)
 
         if ($preflightEstimate.WarningTriggered) {
             Write-Host ("Warning: projected output is {0:F1}% of source size." -f $preflightEstimate.EstimatedPctOfSource) -ForegroundColor Yellow
@@ -4482,6 +7757,8 @@ function Get-EncodeInitialization {
         Selected                = $selected
         SourceProfile           = $sourceProfile
         EncodeColorProfile      = $encodeColorProfile
+        HdrPlan                 = $hdrPlan
+        HdrPlanSummary          = $hdrPlanSummary
         SelectedAudioSummary    = $selectedAudioSummary
         SelectedSubtitleSummary = $selectedSubtitleSummary
         CopiedStreamsEstimate   = $copiedStreamsEstimate
@@ -4517,8 +7794,16 @@ function Resolve-EncoderLane {
         [string]$EncoderPreferenceValue,
         [bool]$CpuLaneAvailable = $true,
         [bool]$NvidiaLaneAvailable = $false,
-        $NvencEnvironment = $null
+        $NvencEnvironment = $null,
+        [string]$AutoCRFOffsetOverrideValue = '',
+        [string]$TargetGiBPerHourOverrideValue = ''
     )
+
+    $effectiveAutoCRFOffset = if (-not [string]::IsNullOrWhiteSpace($AutoCRFOffsetOverrideValue)) {
+        $AutoCRFOffsetOverrideValue
+    } else {
+        $AutoCRFOffset
+    }
 
     if ($EncoderPreferenceValue -eq 'CPU') {
         if (-not $CpuLaneAvailable) {
@@ -4532,7 +7817,7 @@ function Resolve-EncoderLane {
         return [pscustomobject][ordered]@{
             Ready  = $true
             Reason = 'Encoder preference forced the CPU lane.'
-            Init   = (Get-EncodeInitialization -InputPath $InputPath -EncodeMode 'software' -EncoderPreferenceValue $EncoderPreferenceValue -LaneSelectionReason 'forced CPU lane by encoder preference')
+            Init   = (Get-EncodeInitialization -InputPath $InputPath -EncodeMode 'software' -EncoderPreferenceValue $EncoderPreferenceValue -LaneSelectionReason 'forced CPU lane by encoder preference' -AutoCRFOffsetOverrideValue $AutoCRFOffsetOverrideValue -TargetGiBPerHourOverrideValue $TargetGiBPerHourOverrideValue)
         }
     }
 
@@ -4551,7 +7836,7 @@ function Resolve-EncoderLane {
         return [pscustomobject][ordered]@{
             Ready  = $true
             Reason = 'Encoder preference forced the Nvidia lane.'
-            Init   = (Get-EncodeInitialization -InputPath $InputPath -EncodeMode 'nvenc' -NvencEnvironment $NvencEnvironment -EncoderPreferenceValue $EncoderPreferenceValue -LaneSelectionReason 'forced Nvidia lane by encoder preference')
+            Init   = (Get-EncodeInitialization -InputPath $InputPath -EncodeMode 'nvenc' -NvencEnvironment $NvencEnvironment -EncoderPreferenceValue $EncoderPreferenceValue -LaneSelectionReason 'forced Nvidia lane by encoder preference' -AutoCRFOffsetOverrideValue $AutoCRFOffsetOverrideValue -TargetGiBPerHourOverrideValue $TargetGiBPerHourOverrideValue)
         }
     }
 
@@ -4567,7 +7852,7 @@ function Resolve-EncoderLane {
         return [pscustomobject][ordered]@{
             Ready  = $true
             Reason = 'Nvidia lane unavailable; using CPU lane.'
-            Init   = (Get-EncodeInitialization -InputPath $InputPath -EncodeMode 'software' -EncoderPreferenceValue $EncoderPreferenceValue -LaneSelectionReason 'Nvidia lane unavailable; using CPU lane')
+            Init   = (Get-EncodeInitialization -InputPath $InputPath -EncodeMode 'software' -EncoderPreferenceValue $EncoderPreferenceValue -LaneSelectionReason 'Nvidia lane unavailable; using CPU lane' -AutoCRFOffsetOverrideValue $AutoCRFOffsetOverrideValue -TargetGiBPerHourOverrideValue $TargetGiBPerHourOverrideValue)
         }
     }
 
@@ -4583,7 +7868,7 @@ function Resolve-EncoderLane {
         -ConfiguredCRF $CRF `
         -ConfiguredPreset $Preset `
         -ConfiguredFilmGrain $FilmGrain `
-        -ConfiguredAutoCRFOffset $AutoCRFOffset
+        -ConfiguredAutoCRFOffset $effectiveAutoCRFOffset
     $laneSuitability = Get-EncoderLaneSuitability -SourceProfile $sourceProfile -AutoSettings $autoSettings
     $hint = [pscustomobject][ordered]@{
         Lane   = $laneSuitability.PreferredLane
@@ -4641,7 +7926,9 @@ function Resolve-EncoderLane {
             -LaneSelectionReason $alternateReason `
             -LaneSuitability $laneSuitability.Suitability `
             -CpuOnlyReason $laneSuitability.CpuOnlyReason `
-            -NvidiaFallbackAllowed $laneSuitability.NvidiaFallbackAllowed
+            -NvidiaFallbackAllowed $laneSuitability.NvidiaFallbackAllowed `
+            -AutoCRFOffsetOverrideValue $AutoCRFOffsetOverrideValue `
+        -TargetGiBPerHourOverrideValue $TargetGiBPerHourOverrideValue
 
         if ($alternateLane -eq 'Nvidia') {
             $nvencFallback = Test-NvencFallbackSuitable -LaneSuitability $laneSuitability -Init $alternateInit
@@ -4658,7 +7945,7 @@ function Resolve-EncoderLane {
             }
         }
 
-        if ($alternateInit.EarlyExit -eq 'PRECHECK_SKIPPED_UNFAVORABLE') {
+        if ($alternateInit.EarlyExit -like 'PRECHECK_SKIPPED*') {
             return [pscustomobject][ordered]@{
                 Ready                 = $false
                 Reason                = "$alternateReason; alternate $alternateLane lane preflight was unfavorable, waiting for preferred $preferredLane lane"
@@ -4690,9 +7977,11 @@ function Resolve-EncoderLane {
         -LaneSelectionReason $hint.Reason `
         -LaneSuitability $laneSuitability.Suitability `
         -CpuOnlyReason $laneSuitability.CpuOnlyReason `
-        -NvidiaFallbackAllowed $laneSuitability.NvidiaFallbackAllowed
+        -NvidiaFallbackAllowed $laneSuitability.NvidiaFallbackAllowed `
+        -AutoCRFOffsetOverrideValue $AutoCRFOffsetOverrideValue `
+        -TargetGiBPerHourOverrideValue $TargetGiBPerHourOverrideValue
 
-    if ($firstInit.EarlyExit -ne 'PRECHECK_SKIPPED_UNFAVORABLE') {
+    if ($firstInit.EarlyExit -notlike 'PRECHECK_SKIPPED*') {
         return [pscustomobject][ordered]@{
             Ready                 = $true
             Reason                = $hint.Reason
@@ -4740,7 +8029,9 @@ function Resolve-EncoderLane {
         -LaneSelectionReason $alternateReason `
         -LaneSuitability $laneSuitability.Suitability `
         -CpuOnlyReason $laneSuitability.CpuOnlyReason `
-        -NvidiaFallbackAllowed $laneSuitability.NvidiaFallbackAllowed
+        -NvidiaFallbackAllowed $laneSuitability.NvidiaFallbackAllowed `
+        -AutoCRFOffsetOverrideValue $AutoCRFOffsetOverrideValue `
+        -TargetGiBPerHourOverrideValue $TargetGiBPerHourOverrideValue
 
     if ($alternateLane -eq 'Nvidia') {
         $nvencFallback = Test-NvencFallbackSuitable -LaneSuitability $laneSuitability -Init $alternateInit
@@ -4757,7 +8048,7 @@ function Resolve-EncoderLane {
         }
     }
 
-    if ($alternateInit.EarlyExit -eq 'PRECHECK_SKIPPED_UNFAVORABLE') {
+    if ($alternateInit.EarlyExit -like 'PRECHECK_SKIPPED*') {
         if ($alternateLane -eq 'Nvidia') {
             return [pscustomobject][ordered]@{
                 Ready                 = $false
@@ -4846,10 +8137,23 @@ function Test-SufficientDiskSpace {
         [double]$MultiplierRequired = 2.0
     )
 
-    $drive = Split-Path -Qualifier $TargetDirectory
-    $disk  = Get-PSDrive -Name ($drive.TrimEnd(':')) -ErrorAction SilentlyContinue
+    # Split-Path -Qualifier THROWS when the path has no drive qualifier, and the
+    # existing "UNC or unmapped drive -- skip check" guard below never got the
+    # chance to run. A UNC target such as \\server\share\Media therefore failed
+    # the disk-space check with "does not have a qualifier specified" instead of
+    # skipping it. Same for any non-Windows path.
+    #
+    # A space check that cannot determine free space should decline to block the
+    # encode, not abort it.
+    $drive = $null
+    try   { $drive = Split-Path -Qualifier $TargetDirectory -ErrorAction Stop }
+    catch { return $true }   # no qualifier (UNC, or a non-Windows path) -- skip check.
 
-    if (-not $disk) { return $true }   # UNC or unmapped drive -- skip check.
+    if ([string]::IsNullOrWhiteSpace($drive)) { return $true }
+
+    $disk = Get-PSDrive -Name ($drive.TrimEnd(':')) -ErrorAction SilentlyContinue
+    if (-not $disk) { return $true }   # unmapped drive -- skip check.
+    if ($null -eq $disk.Free) { return $true }   # provider reports no free-space figure.
 
     $requiredBytes = [long]($SourceSizeBytes * $MultiplierRequired)
     $freeBytes     = $disk.Free
@@ -5250,10 +8554,19 @@ function Build-SoftwareFfmpegArgs {
     $sourceProfile = $Init.SourceProfile
     $encodeColorProfile = $Init.EncodeColorProfile
 
+    $hdrPlan = Get-OptionalProperty -InputObject $Init -PropertyName 'HdrPlan' -Default $null
+
     $ffArgs = New-Object System.Collections.Generic.List[string]
+    $ffArgs.AddRange([string[]]@('-hide_banner', '-y'))
+
+    # Dolby Vision base-layer extraction has to happen on the *input* side, so
+    # the decoder is handed a clean single-layer HDR10 stream. For a Profile 7
+    # source this is dovi_split=bl; for Profile 8 it is dovi_rpu=strip=1.
+    if ($null -ne $hdrPlan -and -not [string]::IsNullOrWhiteSpace($hdrPlan.InputBitstreamFilter)) {
+        $ffArgs.AddRange([string[]]@('-bsf:v', $hdrPlan.InputBitstreamFilter))
+    }
+
     $ffArgs.AddRange([string[]]@(
-        '-hide_banner',
-        '-y',
         '-i', $Init.InputPath,
         '-map', "0:$($selected.Video.index)",
         '-map', "0:$($selected.MainAudio.index)"
@@ -5273,17 +8586,52 @@ function Build-SoftwareFfmpegArgs {
         '-pix_fmt', 'yuv420p10le'
     ))
 
+    # -svtav1-params is a single AVOption: passing it twice means the second
+    # occurrence wins and the first is silently discarded. Film grain, HDR
+    # static metadata, and HDR10+ therefore all have to be merged into one
+    # colon-separated string rather than appended as separate arguments.
+    $svtParams = New-Object System.Collections.Generic.List[string]
+
     if ([int]$Init.EffectiveFilmGrain -gt 0) {
-        $ffArgs.AddRange([string[]]@('-svtav1-params', "film-grain=$($Init.EffectiveFilmGrain)`:film-grain-denoise=0"))
+        $svtParams.Add("film-grain=$($Init.EffectiveFilmGrain)")
+        # denoise=0 adds synthetic grain on top of the grain that was coded, so
+        # it preserves the look and saves almost nothing -- measured here, film
+        # grain 0 -> 16 at fixed CRF moved the file by under 1%. denoise=1 is
+        # where the size win lives, at the cost of replacing the original grain
+        # rather than reproducing it. Off by default; see the film grain note.
+        $svtParams.Add(("film-grain-denoise={0}" -f $(if ($SoftwareFilmGrainDenoise) { 1 } else { 0 })))
     }
 
-    if ($sourceProfile.HasHDR) {
-        $ffArgs.AddRange([string[]]@(
-            '-color_primaries', 'bt2020',
-            '-color_trc', 'smpte2084',
-            '-colorspace', 'bt2020nc'
-        ))
+    # Core pinning so concurrent CPU encodes contend less. Only emitted when more
+    # than one is actually running -- pinning a lone encode just starves it.
+    if ($SoftwarePinCores -gt 0 -and $CpuMaxParallel -gt 1) {
+        $svtParams.Add("pin=$SoftwarePinCores")
     }
+
+    # Compression-efficiency settings, each verified against the encoder first.
+    # These are the same pairs the preflight samples and the quality probes
+    # used, so the CRF the search measured is the CRF this encode delivers.
+    foreach ($pair in (Get-SvtAv1EfficiencyParamPairs -SourceProfile $sourceProfile -AutoSettings (Get-OptionalProperty -InputObject $Init -PropertyName 'AutoSettings' -Default $null) -FrameRate ([double](Get-OptionalProperty -InputObject $sourceProfile -PropertyName 'FrameRate' -Default 0.0)))) {
+        $svtParams.Add($pair)
+    }
+
+    foreach ($pair in (Get-HdrSvtAv1ParamPairs -HdrPlan $hdrPlan)) { $svtParams.Add($pair) }
+
+    # HDR10+ carried inline by an svt-av1-hdr / SVT-AV1-PSY build compiled with
+    # enable-hdr10plus. This is the preferred route because it avoids a whole
+    # extra demux/inject/remux pass over the finished file.
+    if ($null -ne $hdrPlan -and $hdrPlan.PreserveHDR10Plus -and
+        $hdrPlan.Hdr10PlusRoute -eq 'svt_inline' -and
+        -not [string]::IsNullOrWhiteSpace($hdrPlan.Hdr10PlusJsonPath)) {
+        $svtParams.Add("hdr10plus-json=$($hdrPlan.Hdr10PlusJsonPath)")
+    }
+
+    if ($svtParams.Count -gt 0) {
+        $ffArgs.AddRange([string[]]@('-svtav1-params', ($svtParams -join ':')))
+    }
+
+    Add-SvtAv1DolbyVisionSuppression -ArgumentList $ffArgs -HdrPlan $hdrPlan
+    Add-HdrOutputArguments -ArgumentList $ffArgs -HdrPlan $hdrPlan -SourceProfile $sourceProfile
 
     $ffArgs.AddRange([string[]]@('-c:a', 'copy'))
     if ($selected.MainSub -or $selected.SdhSub) { $ffArgs.AddRange([string[]]@('-c:s', 'copy')) }
@@ -5334,12 +8682,20 @@ function Build-NvencFfmpegArgs {
     $encodeColorProfile = $Init.EncodeColorProfile
     $nvencSettings = $Init.NvencSettings
 
+    $hdrPlan = Get-OptionalProperty -InputObject $Init -PropertyName 'HdrPlan' -Default $null
+
     $ffArgs = New-Object System.Collections.Generic.List[string]
     $ffArgs.Add('-hide_banner')
     $ffArgs.Add('-y')
 
     if ($nvencSettings.DecodePath -eq 'cuda') {
         $ffArgs.AddRange([string[]]@('-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'))
+    }
+
+    # Same Dolby Vision base-layer handling as the software lane: applied on the
+    # input so the decoder never sees the enhancement layer or the RPU.
+    if ($null -ne $hdrPlan -and -not [string]::IsNullOrWhiteSpace($hdrPlan.InputBitstreamFilter)) {
+        $ffArgs.AddRange([string[]]@('-bsf:v', $hdrPlan.InputBitstreamFilter))
     }
 
     $ffArgs.AddRange([string[]]@(
@@ -5382,8 +8738,21 @@ function Build-NvencFfmpegArgs {
     if ($NvencEnvironment.SupportsSpatialAQ)  { $ffArgs.AddRange([string[]]@('-spatial-aq', '1')) }
     if ($NvencEnvironment.SupportsTemporalAQ) { $ffArgs.AddRange([string[]]@('-temporal-aq', '1')) }
     if ($NvencEnvironment.SupportsAQStrength) { $ffArgs.AddRange([string[]]@('-aq-strength', '8')) }
-    if ($NvencEnvironment.SupportsBRefMode)   { $ffArgs.AddRange([string[]]@('-b_ref_mode', 'middle')) }
     if ($NvencEnvironment.SupportsMultipass)  { $ffArgs.AddRange([string[]]@('-multipass', 'fullres')) }
+
+    # FFmpeg 9 exposes AV1 hierarchical B-frames in NVENC. On Ada (RTX 40-series)
+    # this is a straight compression win at the same CQ: a pyramid B reference
+    # structure with more B-frames between anchors costs nothing in encode time
+    # on dedicated silicon. Older builds only understood b_ref_mode, so the
+    # depth options are probed rather than assumed.
+    if ($NvencEnvironment.SupportsBRefMode) { $ffArgs.AddRange([string[]]@('-b_ref_mode', 'middle')) }
+    # FFmpeg 9's AV1 NVENC hierarchical B-frames are driven by these two
+    # existing options together -- there is no separate switch for the feature.
+    # -b_ref_mode middle is what makes the structure a pyramid rather than a
+    # flat run of disposable B-frames.
+    if ($NvencEnvironment.SupportsBFrames -and $nvencSettings.BFrames -gt 0) {
+        $ffArgs.AddRange([string[]]@('-bf', "$($nvencSettings.BFrames)"))
+    }
 
     if ($NvencEnvironment.SupportsSplitEncode -and -not $NvencAllowSplitFrame) {
         $ffArgs.AddRange([string[]]@('-split_encode_mode', 'disabled'))
@@ -5394,15 +8763,12 @@ function Build-NvencFfmpegArgs {
         $ffArgs.AddRange([string[]]@('-highbitdepth', '1'))
     }
 
-    $primaries = if (-not [string]::IsNullOrWhiteSpace($sourceProfile.SourcePrimaries)) { $sourceProfile.SourcePrimaries } elseif ($sourceProfile.HasHDR) { 'bt2020' } else { 'bt709' }
-    $transfer  = if (-not [string]::IsNullOrWhiteSpace($sourceProfile.SourceTransfer))  { $sourceProfile.SourceTransfer  } elseif ($sourceProfile.HasHDR) { 'smpte2084' } else { 'bt709' }
-    $matrix    = if (-not [string]::IsNullOrWhiteSpace($sourceProfile.SourceMatrix))    { $sourceProfile.SourceMatrix    } elseif ($sourceProfile.HasHDR) { 'bt2020nc' } else { 'bt709' }
-
-    $ffArgs.AddRange([string[]]@(
-        '-color_primaries', $primaries,
-        '-color_trc',       $transfer,
-        '-colorspace',      $matrix
-    ))
+    # Colour signalling and the static HDR10 payload now come from the resolved
+    # HDR plan rather than being re-derived here. The old inline derivation
+    # copied the source transfer verbatim, which meant an HLG source was tagged
+    # HLG on this lane but PQ on the software lane -- the two lanes disagreed
+    # about the same file. Add-HdrOutputArguments is the single source of truth.
+    Add-HdrOutputArguments -ArgumentList $ffArgs -HdrPlan $hdrPlan -SourceProfile $sourceProfile
 
     $ffArgs.AddRange([string[]]@('-c:a', 'copy'))
     if ($selected.MainSub -or $selected.SdhSub) { $ffArgs.AddRange([string[]]@('-c:s', 'copy')) }
@@ -5541,7 +8907,7 @@ function Write-LaneProgressUI {
 
     $lines = [System.Collections.Generic.List[string]]::new()
     $lines.Add($topBorder)
-    $lines.Add((Row "Encoder preference: $($Summary.EncoderPreference)  |  CPU active: $($Summary.CpuActive)/1  |  Nvidia active: $($Summary.NvidiaActive)/$($Summary.NvidiaCapacity)" $cMeta))
+    $lines.Add((Row "Encoder preference: $($Summary.EncoderPreference)  |  CPU active: $($Summary.CpuActive)/$CpuMaxParallel  |  Nvidia active: $($Summary.NvidiaActive)/$($Summary.NvidiaCapacity)" $cMeta))
     $lines.Add((Row (Get-QueueControlStateText) $cMeta))
     if ($NvencEnvironment) {
         $lines.Add((Row "GPU: $($NvencEnvironment.GpuName)  |  NVENC engines: $($NvencEnvironment.NvencEngineCount)  |  Nvidia capacity: $($NvencEnvironment.MaxParallel) ($($NvencEnvironment.CapacitySource))" $cMeta))
@@ -5665,6 +9031,10 @@ function Complete-LaneWorker {
     $liveEstimate = Update-LiveEstimateState -State $tracked.Shared -SourceDurationSec $init.SourceDurationSec -SourceSizeBytes $init.SourceItem.Length
     $isNvenc = ($init.ResolvedEncodeLane -eq 'Nvidia')
 
+    $hdrPlan = Get-OptionalProperty -InputObject $init -PropertyName 'HdrPlan' -Default $null
+    $hdrLogFields = Get-HdrLogFields -Init $init
+    $qualityLogFields = Get-QualityLogFields -Init $init
+
     $notesList = [System.Collections.Generic.List[string]]::new()
     if ($init.AutoSettings.BitrateReason) { $notesList.Add($init.AutoSettings.BitrateReason) }
     if ($init.LaneSelectionReason) { $notesList.Add($init.LaneSelectionReason) }
@@ -5674,6 +9044,9 @@ function Complete-LaneWorker {
     if ($isNvenc -and $init.NvencSettings.Reason) { $notesList.Add($init.NvencSettings.Reason) }
     if ($isNvenc -and $init.NvencSettings.TuneReason) { $notesList.Add($init.NvencSettings.TuneReason) }
     if ($tracked.WorkerPriorityReason) { $notesList.Add($tracked.WorkerPriorityReason) }
+    if ($null -ne $hdrPlan) {
+        foreach ($hdrNote in $hdrPlan.Notes) { $notesList.Add($hdrNote) }
+    }
 
     if ($ffExit -ne 0) {
         if ($tracked.Shared.LogLines.Count -gt 0) {
@@ -5750,6 +9123,29 @@ function Complete-LaneWorker {
             NvencCapacitySource = if ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.CapacitySource } else { "" }
             DetectedGpuName   = if ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.GpuName } else { "" }
             FilmGrainDisabledReason = $init.FilmGrainDisabledReason
+            SourceHdrFormat   = $hdrLogFields.SourceHdrFormat
+            HdrTargetFormat   = $hdrLogFields.HdrTargetFormat
+            HdrStaticMetadata = $hdrLogFields.HdrStaticMetadata
+            HdrMaxCLL         = $hdrLogFields.HdrMaxCLL
+            HdrMaxFALL        = $hdrLogFields.HdrMaxFALL
+            HdrHDR10PlusSource = $hdrLogFields.HdrHDR10PlusSource
+            HdrHDR10PlusOutput = $hdrLogFields.HdrHDR10PlusOutput
+            DolbyVisionProfile = $hdrLogFields.DolbyVisionProfile
+            DolbyVisionStrategy = $hdrLogFields.DolbyVisionStrategy
+            HdrPlanSummary    = $hdrLogFields.HdrPlanSummary
+            MaxCllClamped            = $hdrLogFields.MaxCllClamped
+            QualityMetric            = $qualityLogFields.QualityMetric
+            QualityMode              = $qualityLogFields.QualityMode
+            QualityThreshold         = $qualityLogFields.QualityThreshold
+            QualityMeasured          = $qualityLogFields.QualityMeasured
+            QualityAnchorCRF         = $qualityLogFields.QualityAnchorCRF
+            QualityAnchorMetric      = $qualityLogFields.QualityAnchorMetric
+            QualityTransparencyMet   = $qualityLogFields.QualityTransparencyMet
+            QualityProbeCount        = $qualityLogFields.QualityProbeCount
+            QualityCrfDelta          = $qualityLogFields.QualityCrfDelta
+            QualitySecondMetric      = $qualityLogFields.QualitySecondMetric
+            QualitySecondMetricValue = $qualityLogFields.QualitySecondMetricValue
+            SvtEfficiencyParams      = $qualityLogFields.SvtEfficiencyParams
             FfmpegPath        = $FfmpegPath
             FfprobePath       = $FfprobePath
             Notes             = ($notesList -join ' | ')
@@ -5759,6 +9155,32 @@ function Complete-LaneWorker {
 
     if (-not (Test-Path -LiteralPath $init.TempOutput)) {
         throw "Temporary output was not created: $($init.TempOutput)"
+    }
+
+    # HDR10+ re-injection, for the post_inject route only. This runs on the temp
+    # output before any of the validation below, so a failed injection is caught
+    # by the same duration and size checks as the encode itself, and before the
+    # file is ever moved over the original.
+    #
+    # Deliberately non-fatal: a correctly-tagged static HDR10 file is a good
+    # outcome, so if injection fails the encode is kept and the loss is recorded
+    # rather than throwing away hours of work.
+    if ($null -ne $hdrPlan -and $hdrPlan.PreserveHDR10Plus -and $hdrPlan.Hdr10PlusRoute -eq 'post_inject') {
+        $injection = Import-HDR10PlusMetadata -EncodedPath $init.TempOutput -JsonPath $hdrPlan.Hdr10PlusJsonPath -HdrPlan $hdrPlan
+        $notesList.Add($injection.Reason)
+        if ($injection.Success) {
+            Write-SessionTextLogMessage -Level Info -Message ("HDR10+ injected | {0}" -f $init.DisplayOutputName)
+        } else {
+            $hdrLogFields.HdrHDR10PlusOutput = 'failed'
+            Write-Warning "HDR10+ injection failed for $($init.DisplayOutputName): $($injection.Reason)"
+            Write-SessionTextLogMessage -Level Warn -Message ("HDR10+ injection failed | {0} | {1}" -f $init.DisplayOutputName, $injection.Reason)
+        }
+    }
+
+    # The HDR10+ JSON sidecar has served its purpose either way.
+    if ($null -ne $hdrPlan -and -not [string]::IsNullOrWhiteSpace($hdrPlan.Hdr10PlusJsonPath) -and
+        (Test-Path -LiteralPath $hdrPlan.Hdr10PlusJsonPath)) {
+        Remove-Item -LiteralPath $hdrPlan.Hdr10PlusJsonPath -Force -ErrorAction SilentlyContinue
     }
 
     $outProbe       = Invoke-FfprobeJson -InputPath $init.TempOutput
@@ -5869,6 +9291,29 @@ function Complete-LaneWorker {
         NvencCapacitySource = if ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.CapacitySource } else { "" }
         DetectedGpuName   = if ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.GpuName } else { "" }
         FilmGrainDisabledReason = $init.FilmGrainDisabledReason
+        SourceHdrFormat   = $hdrLogFields.SourceHdrFormat
+        HdrTargetFormat   = $hdrLogFields.HdrTargetFormat
+        HdrStaticMetadata = $hdrLogFields.HdrStaticMetadata
+        HdrMaxCLL         = $hdrLogFields.HdrMaxCLL
+        HdrMaxFALL        = $hdrLogFields.HdrMaxFALL
+        HdrHDR10PlusSource = $hdrLogFields.HdrHDR10PlusSource
+        HdrHDR10PlusOutput = $hdrLogFields.HdrHDR10PlusOutput
+        DolbyVisionProfile = $hdrLogFields.DolbyVisionProfile
+        DolbyVisionStrategy = $hdrLogFields.DolbyVisionStrategy
+        HdrPlanSummary    = $hdrLogFields.HdrPlanSummary
+        MaxCllClamped            = $hdrLogFields.MaxCllClamped
+        QualityMetric            = $qualityLogFields.QualityMetric
+        QualityMode              = $qualityLogFields.QualityMode
+        QualityThreshold         = $qualityLogFields.QualityThreshold
+        QualityMeasured          = $qualityLogFields.QualityMeasured
+        QualityAnchorCRF         = $qualityLogFields.QualityAnchorCRF
+        QualityAnchorMetric      = $qualityLogFields.QualityAnchorMetric
+        QualityTransparencyMet   = $qualityLogFields.QualityTransparencyMet
+        QualityProbeCount        = $qualityLogFields.QualityProbeCount
+        QualityCrfDelta          = $qualityLogFields.QualityCrfDelta
+        QualitySecondMetric      = $qualityLogFields.QualitySecondMetric
+        QualitySecondMetricValue = $qualityLogFields.QualitySecondMetricValue
+        SvtEfficiencyParams      = $qualityLogFields.SvtEfficiencyParams
         FfmpegPath        = $FfmpegPath
         FfprobePath       = $FfprobePath
         Notes             = ($notesList -join ' | ')
@@ -6080,13 +9525,15 @@ function Invoke-NvencQueueProcessing {
                 Move-Item -LiteralPath $nextJob.FullName -Destination $workingJobPath -Force
 
                 $job = Get-Content -LiteralPath $workingJobPath -Raw | ConvertFrom-Json
-                $init = Get-EncodeInitialization -InputPath $job.InputPath -EncodeMode 'nvenc' -NvencEnvironment $NvencEnvironment
+                $jobOffsetOverride = [string](Get-OptionalProperty -InputObject $job -PropertyName 'AutoCRFOffsetOverride' -Default '')
+                $jobTargetOverride = [string](Get-OptionalProperty -InputObject $job -PropertyName 'TargetGiBPerHourOverride' -Default '')
+                $init = Get-EncodeInitialization -InputPath $job.InputPath -EncodeMode 'nvenc' -NvencEnvironment $NvencEnvironment -AutoCRFOffsetOverrideValue $jobOffsetOverride -TargetGiBPerHourOverrideValue $jobTargetOverride
 
                 if ($init.EarlyExit) {
                     $row = $init.Row
                     $row.NvencWorkerCountAtStart = $NvencEnvironment.MaxParallel
                     Write-LogRow $row
-                    if ($init.EarlyExit -like 'AUTO_SKIPPED*' -or $init.EarlyExit -eq 'SKIPPED_DV' -or $init.EarlyExit -eq 'PRECHECK_SKIPPED_UNFAVORABLE') {
+                    if ($init.EarlyExit -like 'AUTO_SKIPPED*' -or $init.EarlyExit -eq 'SKIPPED_DV' -or $init.EarlyExit -like 'PRECHECK_SKIPPED*') {
                         $summary.Skipped++
                     } else {
                         $summary.Failed++
@@ -6209,7 +9656,7 @@ function Invoke-AutoEncoderLaneQueueProcessing {
         $pendingJobs = @(Get-ChildItem -LiteralPath $QueuePendingDir -Filter *.json -File -ErrorAction SilentlyContinue | Sort-Object CreationTimeUtc)
 
         while (-not $script:QueueShutdownRequested -and $pendingJobs.Count -gt 0) {
-            $cpuAvailable = (@($activeWorkers | Where-Object { $_.Init.ResolvedEncodeLane -eq 'CPU' }).Count -lt 1)
+            $cpuAvailable = (@($activeWorkers | Where-Object { $_.Init.ResolvedEncodeLane -eq 'CPU' }).Count -lt $CpuMaxParallel)
             $nvidiaAvailable = (@($activeWorkers | Where-Object { $_.Init.ResolvedEncodeLane -eq 'Nvidia' }).Count -lt $nvidiaCapacity)
             if (-not $cpuAvailable -and -not $nvidiaAvailable) { break }
 
@@ -6220,6 +9667,8 @@ function Invoke-AutoEncoderLaneQueueProcessing {
                 try {
                     $job = Get-Content -LiteralPath $nextJob.FullName -Raw | ConvertFrom-Json
                     $resolution = Resolve-EncoderLane `
+                        -AutoCRFOffsetOverrideValue ([string](Get-OptionalProperty -InputObject $job -PropertyName 'AutoCRFOffsetOverride' -Default '')) `
+                        -TargetGiBPerHourOverrideValue ([string](Get-OptionalProperty -InputObject $job -PropertyName 'TargetGiBPerHourOverride' -Default '')) `
                         -InputPath $job.InputPath `
                         -EncoderPreferenceValue 'Auto' `
                         -CpuLaneAvailable $cpuAvailable `
@@ -6241,9 +9690,17 @@ function Invoke-AutoEncoderLaneQueueProcessing {
 
                     if ($resolution.Init.EarlyExit) {
                         $row = $resolution.Init.Row
-                        $row.NvencWorkerCountAtStart = if ($resolution.Init.ResolvedEncodeLane -eq 'Nvidia' -and $NvencEnvironment) { $NvencEnvironment.MaxParallel } else { "" }
+                        # The early-exit object is @{ EarlyExit; Row } and has no
+                        # ResolvedEncodeLane of its own -- reading it threw
+                        # "The property 'ResolvedEncodeLane' cannot be found on
+                        # this object", turning every legitimate skip into a
+                        # FAILED row. The lane is recorded on the Row, and it is
+                        # read defensively because Set-StrictMode -Version Latest
+                        # throws on a missing hashtable key too.
+                        $rowLane = [string](Get-OptionalProperty -InputObject $row -PropertyName 'ResolvedEncodeLane' -Default '')
+                        $row.NvencWorkerCountAtStart = if ($rowLane -eq 'Nvidia' -and $NvencEnvironment) { $NvencEnvironment.MaxParallel } else { "" }
                         Write-LogRow $row
-                        if ($resolution.Init.EarlyExit -like 'AUTO_SKIPPED*' -or $resolution.Init.EarlyExit -eq 'SKIPPED_DV' -or $resolution.Init.EarlyExit -eq 'PRECHECK_SKIPPED_UNFAVORABLE') {
+                        if ($resolution.Init.EarlyExit -like 'AUTO_SKIPPED*' -or $resolution.Init.EarlyExit -eq 'SKIPPED_DV' -or $resolution.Init.EarlyExit -like 'PRECHECK_SKIPPED*') {
                             $summary.Skipped++
                         } else {
                             $summary.Failed++
@@ -6423,7 +9880,16 @@ function Invoke-AutoEncoderLaneQueueProcessing {
 #  14.  Log SUCCESS to encode_log.csv.
 # =============================================================================
 function Invoke-EncodeJob {
-    param([string]$InputPath)
+    param(
+        [string]$InputPath,
+        [string]$AutoCRFOffsetOverrideValue = ''
+    )
+
+    $effectiveAutoCRFOffset = if (-not [string]::IsNullOrWhiteSpace($AutoCRFOffsetOverrideValue)) {
+        $AutoCRFOffsetOverrideValue
+    } else {
+        $AutoCRFOffset
+    }
 
     $stopwatch     = [System.Diagnostics.Stopwatch]::StartNew()
     $sourceItem    = Get-Item -LiteralPath $InputPath
@@ -6434,7 +9900,7 @@ function Invoke-EncodeJob {
 
     $probe         = Invoke-FfprobeJson -InputPath $InputPath
     $selected      = Select-Streams     -Probe $probe
-    $sourceProfile = Get-SourceProfile  -Probe $probe -VideoStream $selected.Video
+    $sourceProfile = Get-SourceProfile  -Probe $probe -VideoStream $selected.Video -InputPath $InputPath
     $encodeColorProfile = Get-EncodeColorProfile -SourceProfile $sourceProfile
     $sourceFormat  = Get-OptionalProperty -InputObject $probe -PropertyName 'format' -Default ([PSCustomObject]@{})
     $sourceDuration = Convert-ToInvariantDouble (Get-OptionalProperty $sourceFormat 'duration' 0) 0.0
@@ -6443,8 +9909,19 @@ function Invoke-EncodeJob {
     $selectedAudioSummary = Format-StreamSummary -Streams @($selected.MainAudio, $selected.FallbackAudio)
     $selectedSubtitleSummary = Format-StreamSummary -Streams @($selected.MainSub, $selected.SdhSub)
 
-    if ($sourceProfile.HasDV -and $SkipDolbyVisionSources) {
-        Write-Warning "Skipping Dolby Vision source (preserve manually): $InputPath"
+    # Same HDR resolution as the lane-based path, so this serial fallback path
+    # produces byte-identical output decisions rather than quietly reverting to
+    # the old tag-only behaviour.
+    $hdrPlan = Resolve-HdrEncodePlan `
+        -InputPath $InputPath `
+        -Probe $probe `
+        -VideoStream $selected.Video `
+        -SourceProfile $sourceProfile `
+        -EncodeMode 'software'
+
+    if ($hdrPlan.Skip) {
+        Write-Warning "Skipping source: $($hdrPlan.SkipReason)"
+        Write-Warning "  $InputPath"
 
         $stopwatch.Stop()
         Write-LogRow @{
@@ -6492,9 +9969,14 @@ function Invoke-EncodeJob {
             NvencCapacitySource = ""
             DetectedGpuName   = ""
             FilmGrainDisabledReason = ""
+            SourceHdrFormat   = $sourceProfile.SourceHdrFormat
+            HdrTargetFormat   = ""
+            DolbyVisionProfile = if ($hdrPlan.DolbyVision) { $hdrPlan.DolbyVision.Profile } else { "" }
+            DolbyVisionStrategy = if ($hdrPlan.DolbyVision) { $hdrPlan.DolbyVision.Strategy } else { "" }
+            HdrPlanSummary    = Get-HdrPlanSummary -HdrPlan $hdrPlan
             FfmpegPath        = $FfmpegPath
             FfprobePath       = $FfprobePath
-            Notes             = "Dolby Vision source skipped by policy."
+            Notes             = $hdrPlan.SkipReason
         }
         return
     }
@@ -6508,7 +9990,7 @@ function Invoke-EncodeJob {
         -ConfiguredCRF $CRF `
         -ConfiguredPreset $Preset `
         -ConfiguredFilmGrain $FilmGrain `
-        -ConfiguredAutoCRFOffset $AutoCRFOffset
+        -ConfiguredAutoCRFOffset $effectiveAutoCRFOffset
 
     $resolvedCRF = [int]$autoSettings.CRF
     $resolvedPreset = [int]$autoSettings.Preset
@@ -6532,6 +10014,9 @@ function Invoke-EncodeJob {
         WasPreflightRetuned = $false
         WasSkippedByPreflight = $false
         SkipStatus = ''
+        QualitySearch = $null
+        QualitySecondMetricName = ''
+        QualitySecondMetricValue = 0.0
     }
 
     if ($autoSettings.Skip) {
@@ -6595,6 +10080,13 @@ function Invoke-EncodeJob {
     $tempOutput  = Get-TempOutputPath  -InputPath $InputPath
     $finalOutput = Get-FinalOutputPath -InputPath $InputPath
     $displayOutputName = [System.IO.Path]::GetFileName($finalOutput)
+    # Pre-existing bug, unrelated to the FFmpeg 9 work: $displayInputName was
+    # read further down (in the Write-SessionEncodeStart banner) but never
+    # assigned anywhere in this function. Under Set-StrictMode -Version Latest
+    # that is a hard error -- "the variable cannot be retrieved because it has
+    # not been set" -- so this serial path threw as soon as it reached the
+    # banner. Its sibling $displayOutputName was assigned here all along.
+    $displayInputName  = [System.IO.Path]::GetFileName($InputPath)
 
     # Guard against silently overwriting a prior encode that has the same base
     # name as the source when the source is not itself an MKV.
@@ -6610,6 +10102,22 @@ function Invoke-EncodeJob {
         Remove-Item -LiteralPath $tempOutput -Force
     }
 
+    if ($hdrPlan.PreserveHDR10Plus) {
+        $hdr10PlusExport = Export-HDR10PlusMetadata -InputPath $InputPath -VideoStream $selected.Video -HdrPlan $hdrPlan
+        if ($hdr10PlusExport.Success) {
+            $hdrPlan.Hdr10PlusJsonPath = $hdr10PlusExport.Path
+        } else {
+            $hdrPlan.PreserveHDR10Plus = $false
+            $hdrPlan.Hdr10PlusRoute    = 'none'
+            $hdrPlan.Notes.Add("HDR10+ not preserved: $($hdr10PlusExport.Reason)")
+            Write-Warning "HDR10+ extraction failed -- continuing as static HDR10. $($hdr10PlusExport.Reason)"
+        }
+    }
+
+    $hdrPlanSummary = Get-HdrPlanSummary -HdrPlan $hdrPlan
+    Write-Host ("HDR: {0}" -f $hdrPlanSummary) -ForegroundColor DarkCyan
+    Write-SessionTextLogMessage -Level Info -Message ("HDR plan | {0}" -f $hdrPlanSummary)
+
     $preflightWorkflow = Invoke-PreflightAutoTuneWorkflow `
         -InputPath $InputPath `
         -Selected $selected `
@@ -6620,7 +10128,8 @@ function Invoke-EncodeJob {
         -AutoSettings $autoSettings `
         -InitialResolvedCRF $resolvedCRF `
         -InitialResolvedPreset $resolvedPreset `
-        -InitialResolvedFilmGrain $resolvedFilmGrain
+        -InitialResolvedFilmGrain $resolvedFilmGrain `
+        -HdrPlan $hdrPlan
 
     $preflightEstimate = $preflightWorkflow.FinalPreflight
     $resolvedCRF = [int]$preflightWorkflow.FinalResolvedCRF
@@ -6716,9 +10225,16 @@ function Invoke-EncodeJob {
 
     # ── Build ffmpeg argument list ────────────────────────────────────────────
     $ffArgs = New-Object System.Collections.Generic.List[string]
+    $ffArgs.AddRange([string[]]@("-hide_banner", "-y"))
+
+    # Dolby Vision base-layer extraction, applied on the input so the decoder is
+    # handed a clean single-layer HDR10 stream (dovi_split=bl for Profile 7,
+    # dovi_rpu=strip=1 for Profile 8).
+    if (-not [string]::IsNullOrWhiteSpace($hdrPlan.InputBitstreamFilter)) {
+        $ffArgs.AddRange([string[]]@('-bsf:v', $hdrPlan.InputBitstreamFilter))
+    }
+
     $ffArgs.AddRange([string[]]@(
-        "-hide_banner",
-        "-y",
         "-i", $InputPath,
         "-map", "0:$($selected.Video.index)",
         "-map", "0:$($selected.MainAudio.index)"
@@ -6741,27 +10257,43 @@ function Invoke-EncodeJob {
         "-pix_fmt", "yuv420p10le"
     ))
 
-    # Film grain synthesis: pass the parameter to SVT-AV1 only when enabled.
-    # -svtav1-params is a catch-all for encoder-specific options not exposed as
-    # top-level ffmpeg flags. Multiple params can be chained with colons, e.g.
-    # "film-grain=10:film-grain-denoise=0". film-grain-denoise=0 tells the
-    # encoder to synthesise grain at decode time WITHOUT pre-denoising the source
-    # first -- generally preferred when the source grain is already well-behaved
-    # and you do not want to alter the underlying image texture.
+    # Encoder-specific options are chained with colons into a single
+    # -svtav1-params. It must be a single occurrence: ffmpeg treats it as one
+    # AVOption, so a second -svtav1-params silently discards the first.
+    #
+    # film-grain-denoise=0 tells the encoder to synthesise grain at decode time
+    # WITHOUT pre-denoising the source -- preferred when the source grain is
+    # already well-behaved and the underlying image texture should be left alone.
+    $svtParams = New-Object System.Collections.Generic.List[string]
     if ($resolvedFilmGrain -gt 0) {
-        $ffArgs.AddRange([string[]]@("-svtav1-params", "film-grain=$resolvedFilmGrain`:film-grain-denoise=0"))
+        $svtParams.Add("film-grain=$resolvedFilmGrain")
+        $svtParams.Add(("film-grain-denoise={0}" -f $(if ($SoftwareFilmGrainDenoise) { 1 } else { 0 })))
+    }
+    # Core pinning so concurrent CPU encodes contend less. Only emitted when more
+    # than one is actually running -- pinning a lone encode just starves it.
+    if ($SoftwarePinCores -gt 0 -and $CpuMaxParallel -gt 1) {
+        $svtParams.Add("pin=$SoftwarePinCores")
     }
 
-    if ($sourceProfile.HasHDR) {
-        # smpte2084 (PQ) is the correct transfer function for both HDR10 and HDR10+.
-        # HLG sources are also flagged HasHDR; tagging them smpte2084 is a known
-        # trade-off when repackaging into AV1/MKV without tone-mapping.
-        $ffArgs.AddRange([string[]]@(
-            "-color_primaries", "bt2020",
-            "-color_trc",       "smpte2084",
-            "-colorspace",      "bt2020nc"
-        ))
+    foreach ($pair in (Get-SvtAv1EfficiencyParamPairs -SourceProfile $sourceProfile -FrameRate ([double](Get-OptionalProperty -InputObject $sourceProfile -PropertyName 'FrameRate' -Default 0.0)))) {
+        $svtParams.Add($pair)
     }
+
+    foreach ($pair in (Get-HdrSvtAv1ParamPairs -HdrPlan $hdrPlan)) { $svtParams.Add($pair) }
+    if ($hdrPlan.PreserveHDR10Plus -and $hdrPlan.Hdr10PlusRoute -eq 'svt_inline' -and
+        -not [string]::IsNullOrWhiteSpace($hdrPlan.Hdr10PlusJsonPath)) {
+        $svtParams.Add("hdr10plus-json=$($hdrPlan.Hdr10PlusJsonPath)")
+    }
+    if ($svtParams.Count -gt 0) {
+        $ffArgs.AddRange([string[]]@('-svtav1-params', ($svtParams -join ':')))
+    }
+
+    # Colour signalling plus the static HDR10 payload (mastering display colour
+    # volume and MaxCLL/MaxFALL). Previously this wrote only the three colour
+    # tags and always claimed smpte2084, which mislabelled HLG sources as PQ and
+    # dropped the colour volume entirely.
+    Add-SvtAv1DolbyVisionSuppression -ArgumentList $ffArgs -HdrPlan $hdrPlan
+    Add-HdrOutputArguments -ArgumentList $ffArgs -HdrPlan $hdrPlan -SourceProfile $sourceProfile
 
     $ffArgs.AddRange([string[]]@("-c:a", "copy"))
 
@@ -6864,6 +10396,16 @@ function Invoke-EncodeJob {
         GrainClass   = $autoSettings.GrainClass
         GrainScore   = $autoSettings.GrainScore
         WasAutoSkipped = $false
+        SourceHdrFormat = $sourceProfile.SourceHdrFormat
+        HdrTargetFormat = $hdrPlan.TargetDynamicRange
+        HdrStaticMetadata = if ($hdrPlan.CarryStaticMetadata -and $hdrPlan.StaticMetadata -and $hdrPlan.StaticMetadata.HasMasteringDisplay) { $hdrPlan.StaticMetadata.MasteringDisplay } else { '' }
+        HdrMaxCLL    = if ($hdrPlan.CarryStaticMetadata -and $hdrPlan.StaticMetadata -and $hdrPlan.StaticMetadata.HasContentLight) { $hdrPlan.StaticMetadata.MaxCLL } else { '' }
+        HdrMaxFALL   = if ($hdrPlan.CarryStaticMetadata -and $hdrPlan.StaticMetadata -and $hdrPlan.StaticMetadata.HasContentLight) { $hdrPlan.StaticMetadata.MaxFALL } else { '' }
+        HdrHDR10PlusSource = if ($hdrPlan.StaticMetadata) { "$($hdrPlan.StaticMetadata.HasHDR10Plus)" } else { '' }
+        HdrHDR10PlusOutput = $hdr10PlusOutputState
+        DolbyVisionProfile = if ($hdrPlan.DolbyVision -and $hdrPlan.DolbyVision.IsDolbyVision -and $null -ne $hdrPlan.DolbyVision.Profile) { $hdrPlan.DolbyVision.Profile } else { '' }
+        DolbyVisionStrategy = if ($hdrPlan.DolbyVision -and $hdrPlan.DolbyVision.IsDolbyVision) { $hdrPlan.DolbyVision.Strategy } else { '' }
+        HdrPlanSummary = $hdrPlanSummary
         NvencWorkerCountAtStart = ''
         NvencEngineCountDetected = ''
         NvencCapacitySource = ''
@@ -7103,6 +10645,28 @@ function Invoke-EncodeJob {
 
     if (-not (Test-Path -LiteralPath $tempOutput)) {
         throw "Temporary output was not created: $tempOutput"
+    }
+
+    # ── HDR10+ re-injection (post_inject route only) ──────────────────────────
+    # Runs before the validation below so a bad injection is caught by the same
+    # duration and size checks as the encode itself. Non-fatal by design: a
+    # correctly-tagged static HDR10 file is still a good result.
+    $hdr10PlusOutputState = if ($hdrPlan.PreserveHDR10Plus) { $hdrPlan.Hdr10PlusRoute } else { 'none' }
+    if ($hdrPlan.PreserveHDR10Plus -and $hdrPlan.Hdr10PlusRoute -eq 'post_inject') {
+        $injection = Import-HDR10PlusMetadata -EncodedPath $tempOutput -JsonPath $hdrPlan.Hdr10PlusJsonPath -HdrPlan $hdrPlan
+        if ($injection.Success) {
+            Write-SessionTextLogMessage -Level Info -Message ("HDR10+ injected | {0}" -f $tempOutput)
+        } else {
+            $hdr10PlusOutputState = 'failed'
+            $hdrPlan.Notes.Add($injection.Reason)
+            Write-Warning "HDR10+ injection failed: $($injection.Reason)"
+            Write-SessionTextLogMessage -Level Warn -Message ("HDR10+ injection failed | {0}" -f $injection.Reason)
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($hdrPlan.Hdr10PlusJsonPath) -and
+        (Test-Path -LiteralPath $hdrPlan.Hdr10PlusJsonPath)) {
+        Remove-Item -LiteralPath $hdrPlan.Hdr10PlusJsonPath -Force -ErrorAction SilentlyContinue
     }
 
     # ── Duration sanity check ─────────────────────────────────────────────────
@@ -7386,7 +10950,8 @@ function Invoke-QueueProcessing {
 
         try {
             $job = Get-Content -LiteralPath $workingJobPath -Raw | ConvertFrom-Json
-            Invoke-EncodeJob -InputPath $job.InputPath
+            Invoke-EncodeJob -InputPath $job.InputPath `
+                -AutoCRFOffsetOverrideValue ([string](Get-OptionalProperty -InputObject $job -PropertyName 'AutoCRFOffsetOverride' -Default ''))
         }
         catch {
             $message = $_.Exception.Message
@@ -7603,7 +11168,7 @@ try {
     }
 
     if ($InputPaths -and $InputPaths.Count -gt 0) {
-        Add-QueueInputs -Paths $InputPaths
+        Add-QueueInputs -Paths $InputPaths -AutoCRFOffsetOverrideValue $AutoCRFOffsetOverride -TargetGiBPerHourOverrideValue $TargetGiBPerHourOverride
     }
 
     if (-not $hasLock) {
