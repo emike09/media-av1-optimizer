@@ -48,7 +48,16 @@ param(
     # Explicit output-rate target in GiB/hr for this drop, supplied by
     # Media2AV1Queue-Interactive.ps1. Beats both the resolution ladder and the
     # source-rate cap. Empty means "decide normally".
-    [string]$TargetGiBPerHourOverride = ''
+    [string]$TargetGiBPerHourOverride = '',
+
+    # Encoder lane for this drop, supplied by Media2AV1Queue-Interactive.ps1.
+    # Auto | CPU | Nvidia, or empty to defer to the $EncoderPreference setting.
+    #
+    # Attached to each queued job rather than held in a global, for the same
+    # reason as the CRF override: a drop queued as CPU must still encode on the
+    # CPU lane when a worker picks it up later, possibly alongside jobs from a
+    # different drop that asked for something else.
+    [string]$EncoderPreferenceOverride = ''
 )
 
 Set-StrictMode -Version Latest
@@ -2648,7 +2657,8 @@ function Add-QueueInputs {
     param(
         [string[]]$Paths,
         [string]$AutoCRFOffsetOverrideValue = '',
-        [string]$TargetGiBPerHourOverrideValue = ''
+        [string]$TargetGiBPerHourOverrideValue = '',
+        [string]$EncoderPreferenceOverrideValue = ''
     )
 
     $existing = Get-ExistingQueuedPaths
@@ -2688,6 +2698,7 @@ function Add-QueueInputs {
             QueueKey    = $key
             AutoCRFOffsetOverride = $AutoCRFOffsetOverrideValue
             TargetGiBPerHourOverride = $TargetGiBPerHourOverrideValue
+            EncoderPreferenceOverride = $EncoderPreferenceOverrideValue
         } | ConvertTo-Json -Depth 4
 
         Set-Content -LiteralPath $jobPath -Value $job -Encoding UTF8
@@ -7788,6 +7799,56 @@ function Get-EncodeInitialization {
     }
 }
 
+# -----------------------------------------------------------------------------
+# The lane preference for one queued job.
+#
+# A job carries an override only when the drop explicitly asked for one. With no
+# override the configured $EncoderPreference applies, so an ordinary drag-drop
+# behaves exactly as it did before per-drop lane selection existed.
+#
+# Read through Get-OptionalProperty because jobs queued by an older version of
+# this script have no EncoderPreferenceOverride property at all, and under
+# StrictMode reading a missing property is a hard error rather than $null.
+# -----------------------------------------------------------------------------
+function Resolve-JobEncoderPreference {
+    param($Job)
+
+    $override = [string](Get-OptionalProperty -InputObject $Job -PropertyName 'EncoderPreferenceOverride' -Default '')
+    if ([string]::IsNullOrWhiteSpace($override)) { return $EncoderPreference }
+
+    switch ($override.Trim().ToLowerInvariant()) {
+        'cpu'    { return 'CPU' }
+        'nvidia' { return 'Nvidia' }
+        'auto'   { return 'Auto' }
+        default  { return $EncoderPreference }
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Whether anything in the pending queue asks for a lane other than the one the
+# configured $EncoderPreference would run.
+#
+# This matters because $EncoderPreference does not just bias a decision -- it
+# selects which queue-processing loop runs for the whole session. Only the Auto
+# lane scheduler reads a per-job preference; the CPU and Nvidia loops each drive
+# one lane and cannot honour a job that asked for the other. So if any queued
+# job disagrees with the global setting, the session has to run the scheduler
+# that can actually act on it, or the setting is accepted and then ignored.
+# -----------------------------------------------------------------------------
+function Test-QueueHasLanePreferenceConflict {
+    $pending = @(Get-ChildItem -LiteralPath $QueuePendingDir -Filter *.json -File -ErrorAction SilentlyContinue)
+    foreach ($jobFile in $pending) {
+        try {
+            $job = Get-Content -LiteralPath $jobFile.FullName -Raw | ConvertFrom-Json
+        } catch {
+            continue
+        }
+        $preference = Resolve-JobEncoderPreference -Job $job
+        if ($preference -ne $EncoderPreference) { return $true }
+    }
+    return $false
+}
+
 function Resolve-EncoderLane {
     param(
         [string]$InputPath,
@@ -7823,7 +7884,15 @@ function Resolve-EncoderLane {
 
     if ($EncoderPreferenceValue -eq 'Nvidia') {
         if (-not $NvencEnvironment) {
-            throw "EncoderPreference='Nvidia' requires a usable NVIDIA AV1 NVENC environment."
+            # Reachable now that a single drop can ask for the Nvidia lane on a
+            # machine where the configured preference never probed for one.
+            # Falling back with a logged reason is right; throwing here would
+            # take down the whole queue over one job's preference.
+            return [pscustomobject][ordered]@{
+                Ready  = $true
+                Reason = 'Nvidia lane was requested but no usable AV1 NVENC environment was found; using the CPU lane.'
+                Init   = (Get-EncodeInitialization -InputPath $InputPath -EncodeMode 'software' -EncoderPreferenceValue 'CPU' -LaneSelectionReason 'requested Nvidia lane unavailable; fell back to CPU lane' -AutoCRFOffsetOverrideValue $AutoCRFOffsetOverrideValue -TargetGiBPerHourOverrideValue $TargetGiBPerHourOverrideValue)
+            }
         }
         if (-not $NvidiaLaneAvailable) {
             return [pscustomobject][ordered]@{
@@ -9666,11 +9735,18 @@ function Invoke-AutoEncoderLaneQueueProcessing {
                 $workingJobPath = $null
                 try {
                     $job = Get-Content -LiteralPath $nextJob.FullName -Raw | ConvertFrom-Json
+                    # Per-job lane preference. This used to be hard-coded to
+                    # 'Auto' here, which meant a drop that asked for a specific
+                    # lane was silently scheduled by the automatic logic anyway.
+                    # A job with no override falls back to the configured
+                    # $EncoderPreference, so plain drag-drops are unchanged.
+                    $jobLanePreference = Resolve-JobEncoderPreference -Job $job
+
                     $resolution = Resolve-EncoderLane `
                         -AutoCRFOffsetOverrideValue ([string](Get-OptionalProperty -InputObject $job -PropertyName 'AutoCRFOffsetOverride' -Default '')) `
                         -TargetGiBPerHourOverrideValue ([string](Get-OptionalProperty -InputObject $job -PropertyName 'TargetGiBPerHourOverride' -Default '')) `
                         -InputPath $job.InputPath `
-                        -EncoderPreferenceValue 'Auto' `
+                        -EncoderPreferenceValue $jobLanePreference `
                         -CpuLaneAvailable $cpuAvailable `
                         -NvidiaLaneAvailable $nvidiaAvailable `
                         -NvencEnvironment $NvencEnvironment
@@ -9882,7 +9958,11 @@ function Invoke-AutoEncoderLaneQueueProcessing {
 function Invoke-EncodeJob {
     param(
         [string]$InputPath,
-        [string]$AutoCRFOffsetOverrideValue = ''
+        [string]$AutoCRFOffsetOverrideValue = '',
+        # This loop accepted the CRF override but not the size target, so the
+        # interactive "Target GiB/hr" tier was stored on the job and then
+        # dropped on the floor whenever $EncoderPreference was 'CPU'.
+        [string]$TargetGiBPerHourOverrideValue = ''
     )
 
     $effectiveAutoCRFOffset = if (-not [string]::IsNullOrWhiteSpace($AutoCRFOffsetOverrideValue)) {
@@ -10129,7 +10209,8 @@ function Invoke-EncodeJob {
         -InitialResolvedCRF $resolvedCRF `
         -InitialResolvedPreset $resolvedPreset `
         -InitialResolvedFilmGrain $resolvedFilmGrain `
-        -HdrPlan $hdrPlan
+        -HdrPlan $hdrPlan `
+        -TargetGiBPerHourOverrideValue $TargetGiBPerHourOverrideValue
 
     $preflightEstimate = $preflightWorkflow.FinalPreflight
     $resolvedCRF = [int]$preflightWorkflow.FinalResolvedCRF
@@ -10925,7 +11006,7 @@ function Invoke-QueueProcessing {
         }
     }
 
-    switch ($EncoderPreference) {
+    switch ($script:QueueLoopPreference) {
         'Nvidia' {
             Invoke-NvencQueueProcessing -NvencEnvironment $script:NvencEnvironment
             return
@@ -10951,7 +11032,8 @@ function Invoke-QueueProcessing {
         try {
             $job = Get-Content -LiteralPath $workingJobPath -Raw | ConvertFrom-Json
             Invoke-EncodeJob -InputPath $job.InputPath `
-                -AutoCRFOffsetOverrideValue ([string](Get-OptionalProperty -InputObject $job -PropertyName 'AutoCRFOffsetOverride' -Default ''))
+                -AutoCRFOffsetOverrideValue ([string](Get-OptionalProperty -InputObject $job -PropertyName 'AutoCRFOffsetOverride' -Default '')) `
+                -TargetGiBPerHourOverrideValue ([string](Get-OptionalProperty -InputObject $job -PropertyName 'TargetGiBPerHourOverride' -Default ''))
         }
         catch {
             $message = $_.Exception.Message
@@ -11088,6 +11170,18 @@ $Preset    = Resolve-ConfigValue -Name 'Preset'    -Value $Preset    -Minimum 0 
 $FilmGrain = Resolve-ConfigValue -Name 'FilmGrain' -Value $FilmGrain -Minimum 0 -Maximum 50
 $AutoCRFOffset = Resolve-OffsetConfigValue -Name 'AutoCRFOffset' -Value $AutoCRFOffset
 $EncoderPreference = Resolve-EncoderPreferenceConfigValue -Name 'EncoderPreference' -Value $EncoderPreference
+
+# Validated rather than trusted. A typo here would otherwise be stored on every
+# job in the drop and then quietly ignored at scheduling time, which is exactly
+# how the interactive quality tiers used to fail.
+if (-not [string]::IsNullOrWhiteSpace($EncoderPreferenceOverride)) {
+    $EncoderPreferenceOverride = switch ($EncoderPreferenceOverride.Trim().ToLowerInvariant()) {
+        'cpu'    { 'CPU' }
+        'nvidia' { 'Nvidia' }
+        'auto'   { 'Auto' }
+        default  { throw "EncoderPreferenceOverride must be Auto, CPU, or Nvidia (got '$EncoderPreferenceOverride')." }
+    }
+}
 $SoftwareEncodePriority = Resolve-ProcessPriorityConfigValue -Name 'SoftwareEncodePriority' -Value $SoftwareEncodePriority
 $HardwareEncodePriority = Resolve-ProcessPriorityConfigValue -Name 'HardwareEncodePriority' -Value $HardwareEncodePriority
 $ScriptProcessPriority = Resolve-ProcessPriorityConfigValue -Name 'ScriptProcessPriority' -Value $ScriptProcessPriority
@@ -11137,14 +11231,31 @@ if ($scriptPriorityResolution.Warning) {
 
 Update-LogSchemaIfNeeded
 
+# ---- Which queue loop this session runs ---------------------------------
+# $EncoderPreference selects the processing loop, not just a bias, and only the
+# Auto lane scheduler reads a per-job lane preference. So when this drop -- or
+# anything already sitting in the queue -- asks for a lane the configured loop
+# cannot serve, the session runs the Auto scheduler instead. Jobs without an
+# override still resolve to $EncoderPreference inside that scheduler, so a plain
+# drag-drop behaves exactly as before.
+$script:QueueLoopPreference = $EncoderPreference
+$laneOverrideInPlay = (-not [string]::IsNullOrWhiteSpace($EncoderPreferenceOverride) -and $EncoderPreferenceOverride -ne $EncoderPreference)
+if (-not $laneOverrideInPlay) {
+    $laneOverrideInPlay = Test-QueueHasLanePreferenceConflict
+}
+if ($laneOverrideInPlay -and $EncoderPreference -ne 'Auto') {
+    $script:QueueLoopPreference = 'Auto'
+    Write-Host ("Encoder preference is '{0}', but a queued drop asked for a different lane. Using the automatic lane scheduler so both are honoured." -f $EncoderPreference) -ForegroundColor DarkCyan
+}
+
 $script:NvencEnvironment = $null
-if ($EncoderPreference -eq 'Nvidia') {
+if ($script:QueueLoopPreference -eq 'Nvidia') {
     $script:NvencEnvironment = Get-NvencEnvironment
     $startupTuneResolution = Resolve-NvencTune -ConfiguredNvencTune $NvencTune -NvencEnvironment $script:NvencEnvironment
     if ($startupTuneResolution.Warning) {
         Write-Warning $startupTuneResolution.Warning
     }
-} elseif ($EncoderPreference -eq 'Auto') {
+} elseif ($script:QueueLoopPreference -eq 'Auto') {
     $script:NvencEnvironment = Try-Get-NvencEnvironment
     if ($script:NvencEnvironment) {
         $startupTuneResolution = Resolve-NvencTune -ConfiguredNvencTune $NvencTune -NvencEnvironment $script:NvencEnvironment
@@ -11168,7 +11279,7 @@ try {
     }
 
     if ($InputPaths -and $InputPaths.Count -gt 0) {
-        Add-QueueInputs -Paths $InputPaths -AutoCRFOffsetOverrideValue $AutoCRFOffsetOverride -TargetGiBPerHourOverrideValue $TargetGiBPerHourOverride
+        Add-QueueInputs -Paths $InputPaths -AutoCRFOffsetOverrideValue $AutoCRFOffsetOverride -TargetGiBPerHourOverrideValue $TargetGiBPerHourOverride -EncoderPreferenceOverrideValue $EncoderPreferenceOverride
     }
 
     if (-not $hasLock) {

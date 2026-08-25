@@ -12,11 +12,14 @@
 # used interchangeably with the original silent drag-drop workflow, and both
 # can have jobs in flight / pending at the same time.
 #
-# The choice made here either nudges the existing AutoCRFOffset dial or sets an
-# explicit output-rate target (GiB/hr) for the files in this drop. All of the Auto-mode intelligence in the main script
-# (preflight estimation, grain scoring, NVENC/CPU lane selection, etc.) still
-# runs exactly as it does today -- this just biases the CRF target up or down
-# before that logic kicks in.
+# Two questions are asked: how to trade size against quality, and which encoder
+# lane to use. Both answers apply only to the files in this drop.
+#
+# The first either nudges the existing AutoCRFOffset dial or sets an explicit
+# output-rate target (GiB/hr). The second picks the CPU or Nvidia lane, or
+# leaves the choice to the automatic per-file logic. Everything else in the
+# main script (preflight estimation, quality measurement, grain scoring, HDR
+# handling) still runs exactly as it does today.
 #
 # This script does not duplicate any encoding logic. It only prompts, expands
 # folders into files, and then re-invokes Media2AV1Queue.ps1 in this same
@@ -194,6 +197,56 @@ if ($choice -eq '5') {
     }
 }
 
+# ------------------------------------------------------------------------
+# Encoder lane
+# ------------------------------------------------------------------------
+# Separate question from the quality tier, because they are genuinely
+# independent: wanting a smaller file says nothing about whether you are in a
+# hurry. Option 1 sends no override at all, so an unattended drop behaves
+# exactly like a plain drag-drop onto Media2AV1Queue.bat.
+Write-Host ""
+Write-Host "Which encoder should this drop use?" -ForegroundColor White
+Write-Host ""
+Write-Host "  [1] Auto   - let the built-in logic pick a lane per file." -ForegroundColor White
+Write-Host "  [2] CPU    - SVT-AV1. Best compression and quality. Slower." -ForegroundColor White
+Write-Host "  [3] NVENC  - av1_nvenc on the GPU. Much faster, larger files at similar quality." -ForegroundColor White
+Write-Host ""
+Write-Host "  Auto keeps both lanes busy and holds difficult sources back for the CPU," -ForegroundColor DarkGray
+Write-Host "  which is usually the best answer for a mixed batch." -ForegroundColor DarkGray
+Write-Host ""
+
+$laneChoices = @('1', '2', '3')
+$laneChoice = $null
+while ($null -eq $laneChoice) {
+    $laneResponse = Read-Host "Enter 1-3 (default 1 / Auto)"
+    if ([string]::IsNullOrWhiteSpace($laneResponse)) {
+        $laneChoice = '1'
+        break
+    }
+    $laneResponse = $laneResponse.Trim()
+    if ($laneChoices -contains $laneResponse) {
+        $laneChoice = $laneResponse
+        break
+    }
+    Write-Host "Please enter 1, 2, or 3." -ForegroundColor Yellow
+}
+
+# Option 1 deliberately sends nothing rather than the string 'Auto'. The main
+# script treats an absent override as "use whatever $EncoderPreference is set
+# to", so someone who has pinned CPU in the config keeps CPU without having to
+# say so again on every drop.
+$encoderOverride = switch ($laneChoice) {
+    '1' { $null }
+    '2' { 'CPU' }
+    '3' { 'Nvidia' }
+}
+
+$laneName = switch ($laneChoice) {
+    '1' { 'Auto (decide per file)' }
+    '2' { 'CPU / SVT-AV1' }
+    '3' { 'NVENC / av1_nvenc' }
+}
+
 $tierName = switch ($choice) {
     '1' { 'Auto' }
     '2' { 'Aggressive' }
@@ -215,7 +268,12 @@ $offsetOverride = switch ($choice) {
 }
 
 Write-Host ""
-Write-Host "Selected: $tierName" -ForegroundColor Green
+Write-Host "Selected: $tierName  |  Encoder: $laneName" -ForegroundColor Green
+if ($null -ne $encoderOverride) {
+    Write-Host "Encoder lane for this drop: $encoderOverride" -ForegroundColor Green
+    Write-Host "If this differs from the EncoderPreference setting, the queue switches to the" -ForegroundColor DarkGray
+    Write-Host "automatic lane scheduler so both this drop and any others are honoured." -ForegroundColor DarkGray
+}
 if ($null -ne $targetRate) {
     Write-Host "Output rate target for this drop: $targetRate GiB/hr" -ForegroundColor Green
     Write-Host "This overrides both the resolution ladder and the source-rate cap." -ForegroundColor DarkGray
@@ -246,6 +304,9 @@ if ($null -ne $offsetOverride) {
 }
 if ($null -ne $targetRate) {
     $mainScriptArgs['TargetGiBPerHourOverride'] = $targetRate
+}
+if ($null -ne $encoderOverride) {
+    $mainScriptArgs['EncoderPreferenceOverride'] = $encoderOverride
 }
 
 try {

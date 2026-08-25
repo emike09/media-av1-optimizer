@@ -153,13 +153,27 @@ You can also run the batch file with no dropped files to resume an existing queu
 Media2AV1Queue-Interactive.bat
 ```
 
-Prompts for a quality tier per drop:
+Asks two questions per drop. Both answers apply only to the files in that drop, and both are stored on each queued job — so a drop queued as "Quality on CPU" still encodes that way when a worker picks it up later, alongside jobs from a different drop that asked for something else.
+
+**Quality tier:**
 
 | Tier | Effect |
 |---|---|
 | Auto | Full automatic behaviour |
 | Aggressive / Balanced / Quality | Applies a CRF bias to this drop |
 | Target | Prompts for an explicit GiB/hr target for this drop, overriding both the ladder and the source-rate cap |
+
+**Encoder lane:**
+
+| Choice | Effect |
+|---|---|
+| Auto | Sends no override — defers to whatever `$EncoderPreference` is set to |
+| CPU | Forces SVT-AV1 for this drop. Best compression and quality, slower |
+| NVENC | Forces `av1_nvenc` for this drop. Much faster, larger files at similar quality |
+
+`$EncoderPreference` selects the whole queue-processing loop, not just a per-file bias, and only the automatic lane scheduler reads a per-job preference. So if a drop asks for a lane the configured loop cannot serve, the session switches to the automatic scheduler and says so — jobs without an override still resolve to `$EncoderPreference` inside it, so a plain drag-drop is unchanged.
+
+If the Nvidia lane is requested on a machine with no usable NVENC environment, that job falls back to CPU with the reason logged rather than taking down the queue.
 
 ### CLI
 
